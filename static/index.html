@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>邻里停 · 社区公益智能寻位</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Sticky Frosted Glass Header (Apple HIG) -->
+  <header class="glass-header">
+    <div class="header-inner">
+      <div class="brand">
+        <div class="app-glyph" aria-hidden="true">
+          <svg viewBox="0 0 28 28" fill="none">
+            <rect width="28" height="28" rx="7" fill="#0071E3"/>
+            <path d="M9.5 19.5V8.5H14.8C17.2 8.5 18.8 9.9 18.8 12.1C18.8 14.3 17.2 15.7 14.8 15.7H12.1V19.5H9.5ZM12.1 13.6H14.5C15.6 13.6 16.3 13 16.3 12.1C16.3 11.2 15.6 10.6 14.5 10.6H12.1V13.6Z" fill="white"/>
+          </svg>
+        </div>
+        <div class="brand-copy">
+          <h1 id="communityTitle">邻里停</h1>
+          <span class="brand-sub">原图零落盘 · 透视自适应 · 社区公益寻位</span>
+        </div>
+      </div>
+
+      <nav class="segmented-nav" role="tablist" aria-label="功能切换">
+        <button class="tab-btn active" data-tab="driver" role="tab">寻位导览</button>
+        <button class="tab-btn" data-tab="calibrate" role="tab">空间标定</button>
+        <button class="tab-btn" data-tab="lab" role="tab">抓拍测试</button>
+      </nav>
+
+      <div class="header-actions">
+        <div class="telemetry-capsule" title="隐私四不原则审计：所有抓拍仅在内存裁切后即刻销毁">
+          <span>落盘 <strong id="statDisk">0</strong></span>
+          <span class="divider"></span>
+          <span>内存帧 <strong id="statRam">0</strong></span>
+          <span class="divider"></span>
+          <span>空余 <strong id="statTotalFree" class="accent-green">-</strong></span>
+        </div>
+
+        <button id="btnOpenModelModal" class="model-pill-btn" type="button">
+          <span id="modelStatusDot" class="status-dot dot-idle"></span>
+          <span id="modelStatusText">配置 Azure 模型</span>
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <!-- ==================== TAB 1: DRIVER GUIDANCE ==================== -->
+    <section id="tab-driver" class="tab-panel active">
+      <div class="bento-driver">
+        <!-- Left Column: Voice Guidance & Concurrency Dispatch -->
+        <div class="bento-card">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">CarPlay &amp; 小程序体验</span>
+              <h2>进门免手语音寻位</h2>
+            </div>
+            <label class="apple-toggle">
+              <input type="checkbox" id="ttsEnabled" checked />
+              <span class="toggle-label">语音播报</span>
+            </label>
+          </div>
+
+          <div class="field-grid-2">
+            <div class="field">
+              <label for="unitSelect">目的地单元</label>
+              <select id="unitSelect"></select>
+            </div>
+            <div class="field">
+              <label for="vehicleTypeSelect">车辆尺寸</label>
+              <select id="vehicleTypeSelect">
+                <option value="sedan">标准轿车 / 紧凑型</option>
+                <option value="suv">中大型 SUV（过滤迷你转角位）</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="action-stack">
+            <button id="btnRecommendPrimary" class="btn-apple btn-apple-primary btn-apple-lg" type="button">
+              刚进大门 · 推荐离家最近空位
+            </button>
+            <button id="btnRecommendSecondCar" class="btn-apple btn-apple-tinted" type="button" title="模拟同单元第2辆车紧随进门，验证180秒在途软锁自动分流">
+              模拟同单元后车进门（验证防抢位分流）
+            </button>
+          </div>
+
+          <div id="voiceResultBox" class="transcript-card hidden">
+            <div class="transcript-header">
+              <span class="wave-badge">语音播报已就绪</span>
+            </div>
+            <p id="voiceText" class="transcript-body"></p>
+            <div id="recMeta" class="transcript-foot"></div>
+          </div>
+
+          <div class="inset-group">
+            <div class="inset-head">
+              <h3>在途软锁队列（180 秒预占防撞车）</h3>
+              <button id="btnClearLocks" class="link-btn" type="button">清空队列</button>
+            </div>
+            <div id="softLocksList" class="locks-container">当前无在途车辆，全部空位开放推荐</div>
+          </div>
+
+          <div class="inset-group shortcut-box">
+            <div class="inset-head">
+              <h3>Siri / iOS 快捷指令直连地址</h3>
+              <button id="btnCopySiri" class="link-btn" type="button">复制链接</button>
+            </div>
+            <code id="siriEndpointCode">GET /api/recommend/voice?unit_id=3-1&amp;vehicle_type=sedan</code>
+          </div>
+        </div>
+
+        <!-- Right Column: Privacy-Safe Architectural Site Map -->
+        <div class="bento-card">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">零实景监控 · 隐私脱敏视图</span>
+              <h2>小区车位实时态势平面图</h2>
+            </div>
+            <button id="btnRefreshOverview" class="btn-apple btn-apple-secondary btn-apple-sm" type="button">刷新</button>
+          </div>
+
+          <div class="legend-strip">
+            <span><i class="swatch sw-free"></i>空闲可停</span>
+            <span><i class="swatch sw-occupied"></i>已停车辆</span>
+            <span><i class="swatch sw-blocked"></i>锥桶/异物占道</span>
+            <span><i class="swatch sw-pending"></i>双帧防抖确认中</span>
+            <span><i class="swatch sw-lock"></i>在途软锁</span>
+          </div>
+
+          <div class="site-map-frame">
+            <svg id="communitySvg" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
+
+          <div id="zoneCardsGrid" class="zone-bento-grid"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2: PERSPECTIVE & IRREGULAR CALIBRATION ==================== -->
+    <section id="tab-calibrate" class="tab-panel">
+      <div class="bento-calibrate">
+        <div class="bento-card">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">单应性透视几何 &amp; 异形掩码引擎</span>
+              <h2>机位视野空间标定台</h2>
+            </div>
+            <div class="head-btn-row">
+              <label class="btn-apple btn-apple-secondary btn-apple-sm file-trigger">
+                载入基准照片
+                <input type="file" id="calibImageInput" accept="image/*" hidden />
+              </label>
+              <button id="btnGenDemoScene" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">恢复俯拍示意底图</button>
+            </div>
+          </div>
+
+          <div class="calib-segmented">
+            <button class="mode-btn active" data-mode="perspective_row" type="button">连排透视切分（4角生成斜梯形）</button>
+            <button class="mode-btn" data-mode="irregular_poly" type="button">异形独立车位（多边形/迷你位）</button>
+            <button class="mode-btn" data-mode="elastic_strip" type="button">无划线弹性带（按米测算）</button>
+            <button class="mode-btn" data-mode="edit_vertices" type="button">拖拽微调顶点</button>
+          </div>
+
+          <div id="ctrlPerspective" class="calib-toolbar">
+            <span class="toolbar-hint">依次点击一整排车位外沿 <strong>4 个角点</strong>，系统自动按远近透视收缩切分：</span>
+            <div class="toolbar-controls">
+              <label>车位数
+                <input type="number" id="rowSpotCount" value="5" min="1" max="25" class="input-compact" />
+              </label>
+              <label>方向
+                <select id="rowDirection" class="select-compact">
+                  <option value="auto">自动识别长边</option>
+                  <option value="along_01">沿 点1→点2 切分</option>
+                  <option value="along_12">沿 点2→点3 切分</option>
+                </select>
+              </label>
+              <label title="1.00 为精确针孔透视矩阵，广角畸变时可微调远近疏密">透视补偿 γ
+                <input type="range" id="rowGamma" min="0.55" max="1.65" step="0.05" value="1.00" />
+                <strong id="rowGammaVal">1.00</strong>
+              </label>
+              <button id="btnCommitRow" class="btn-apple btn-apple-primary btn-apple-sm" type="button" disabled>生成连排车位</button>
+              <button id="btnCancelDraft" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">重绘</button>
+            </div>
+          </div>
+
+          <div id="ctrlIrregular" class="calib-toolbar hidden">
+            <span class="toolbar-hint">围绕转角或避树车位依次点击 <strong>3 个及以上角点</strong>：</span>
+            <div class="toolbar-controls">
+              <label class="apple-check">
+                <input type="checkbox" id="irrCompactOnly" /> 标记为「紧凑小车位」（SUV 自动过滤）
+              </label>
+              <button id="btnFinishIrregular" class="btn-apple btn-apple-primary btn-apple-sm" type="button" disabled>完成异形车位</button>
+              <button id="btnCancelIrregular" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">取消</button>
+            </div>
+          </div>
+
+          <div id="ctrlElastic" class="calib-toolbar hidden">
+            <span class="toolbar-hint">沿路侧无划线自由顺停带点击 <strong>4 个外角点</strong>（结合 Azure 多模态识别剩余可停车数）：</span>
+            <div class="toolbar-controls">
+              <label>物理总长 (米)
+                <input type="number" id="stripMeters" value="18.0" min="5.5" max="80" step="0.5" class="input-compact" />
+              </label>
+              <button id="btnFinishElastic" class="btn-apple btn-apple-primary btn-apple-sm" type="button" disabled>添加弹性顺停带</button>
+              <button id="btnCancelElastic" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">取消</button>
+            </div>
+          </div>
+
+          <div id="ctrlEditVertices" class="calib-toolbar hidden">
+            <span class="toolbar-hint">按住画布上任意车位的圆点手柄即可独立拖拽微调，适配立柱、树坑或斜马路牙子。</span>
+          </div>
+
+          <div class="canvas-stage">
+            <canvas id="calibCanvas" width="1280" height="720"></canvas>
+          </div>
+        </div>
+
+        <aside class="bento-card inspector-card">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">机位与区域绑定</span>
+              <h2>标定清单</h2>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="calibCameraSelect">当前相机机位</label>
+            <select id="calibCameraSelect"></select>
+          </div>
+
+          <div class="field">
+            <label for="calibZoneSelect">所属小区片区</label>
+            <select id="calibZoneSelect"></select>
+          </div>
+
+          <details class="apple-disclosure">
+            <summary>新增窗台志愿者 / 补盲机位</summary>
+            <div class="disclosure-body">
+              <input type="text" id="newCamId" placeholder="机位代号，如 CAM_2F_01" />
+              <input type="text" id="newCamName" placeholder="描述，如 2号楼301窗台俯拍" />
+              <button id="btnCreateCamera" class="btn-apple btn-apple-secondary btn-apple-sm" type="button">添加机位</button>
+            </div>
+          </details>
+
+          <div class="list-header-bar">
+            <span>已框选区域 (<strong id="calibSpotCount">0</strong>)</span>
+            <button id="btnClearAllSpots" class="link-btn danger-link" type="button">清空全部</button>
+          </div>
+
+          <div id="calibSpotList" class="calib-spot-list"></div>
+
+          <button id="btnSaveCalibration" class="btn-apple btn-apple-primary btn-full" type="button">
+            保存标定配置
+          </button>
+          <p id="calibSaveMsg" class="feedback-note"></p>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 3: SNAPSHOT TEST LAB ==================== -->
+    <section id="tab-lab" class="tab-panel">
+      <div class="bento-lab">
+        <div class="bento-card">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">上传生成图像验证闭环</span>
+              <h2>抓拍识别与防抖实验室</h2>
+            </div>
+            <button id="btnResetSeed" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">重置演示数据</button>
+          </div>
+
+          <div class="field-grid-2">
+            <div class="field">
+              <label for="labCameraSelect">接收抓拍的目标机位</label>
+              <select id="labCameraSelect"></select>
+            </div>
+            <div class="field">
+              <label for="labDebounceMode">状态机确认模式</label>
+              <select id="labDebounceMode">
+                <option value="debounce">生产双帧防抖（首帧待确认，复核帧翻转）</option>
+                <option value="instant">单帧直通验证（上传单张测试图立即生效）</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="options-row">
+            <label class="apple-check" title="在双帧防抖模式下模拟已过10秒窗口，方便连续上传第2张图立即完成防抖确认">
+              <input type="checkbox" id="labSimTimeOffset" /> 模拟时间推进 +10 秒（用于复核帧立即通过防抖）
+            </label>
+            <label class="apple-check">
+              <input type="checkbox" id="labForceReanalyze" checked /> 强制执行视觉推理（忽略静止帧差缓存）
+            </label>
+          </div>
+
+          <div id="labDropzone" class="apple-dropzone">
+            <input type="file" id="labImageInput" accept="image/*" hidden />
+            <div class="dropzone-icon" aria-hidden="true">
+              <svg width="34" height="34" viewBox="0 0 24 24" fill="none">
+                <path d="M12 16V4M12 4L7.5 8.5M12 4L16.5 8.5M4 16.5V18.5C4 19.6 4.9 20.5 6 20.5H18C19.1 20.5 20 19.6 20 18.5V16.5" stroke="#0071E3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <p class="dropzone-title">拖入或选择 AI 生成的停车场测试图</p>
+            <p class="dropzone-sub">服务端仅在内存中完成透视裁切与识别，原图 0 字节落盘</p>
+            <button id="btnPickLabImage" class="btn-apple btn-apple-primary" type="button">选择图片上传测试</button>
+          </div>
+
+          <div class="quick-synth-row">
+            <span>内置基准场景自检：</span>
+            <button class="chip-btn synth-btn" data-scene="all_empty" type="button">空场基准帧</button>
+            <button class="chip-btn synth-btn" data-scene="mixed_cars_cone" type="button">停 2 车 + 锥桶占道帧</button>
+            <button class="chip-btn synth-btn" data-scene="passing_car" type="button">过路车瞬态干扰帧</button>
+          </div>
+
+          <div id="labPreviewWrap" class="lab-stage-wrap hidden">
+            <div class="inset-head">
+              <h3>识别叠加回显（仅当前浏览器本地渲染）</h3>
+              <span id="labTimingBadge" class="meta-pill"></span>
+            </div>
+            <div class="canvas-stage">
+              <canvas id="labResultCanvas" width="960" height="540"></canvas>
+            </div>
+          </div>
+
+          <div id="labReportsWrap" class="lab-table-section hidden">
+            <h3>逐车位三级漏斗与状态机流转报告</h3>
+            <div class="apple-table-wrap">
+              <table class="apple-table">
+                <thead>
+                  <tr>
+                    <th>车位</th>
+                    <th>形态</th>
+                    <th>帧差</th>
+                    <th>推理引擎</th>
+                    <th>视觉观测</th>
+                    <th>状态机决策</th>
+                    <th>依据说明</th>
+                  </tr>
+                </thead>
+                <tbody id="labReportTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <aside class="bento-card inspector-card">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">模型与硬件接入</span>
+              <h2>运行引擎概览</h2>
+            </div>
+          </div>
+
+          <div id="labCurrentModelCard" class="inset-group model-summary-card">
+            <div class="inset-head">
+              <h3>多模态辅助识别引擎</h3>
+              <span id="labModeBadge" class="mini-tag">混合模式</span>
+            </div>
+            <p id="labModelSummaryText" class="muted-p">尚未配置 Azure AI Foundry 密钥，当前使用本地 OpenCV 几何与色彩引擎。</p>
+            <button id="btnLabOpenModelSettings" class="btn-apple btn-apple-tinted btn-full" type="button">
+              打开 Azure AI Foundry 模型设置
+            </button>
+          </div>
+
+          <div class="inset-group">
+            <h3>测试闭环建议步骤</h3>
+            <ol class="guide-steps">
+              <li>点击右上角<strong>「配置 Azure 模型」</strong>填入 Azure AI Foundry 的 Target URI 与 Key，点「测试连接」。</li>
+              <li>若用自定义生成的停车场图片，先在<strong>「空间标定」</strong>载入该图框选车位并保存。</li>
+              <li>回到本页上传「有车/无车/雪糕桶」变化图，观察识别报告与<strong>「寻位导览」</strong>语音推荐变化。</li>
+            </ol>
+          </div>
+
+          <div class="inset-group">
+            <h3>实体相机免开发接入参数</h3>
+            <ul class="spec-list">
+              <li><span>FTP 内存接收</span><code id="ftpInfoHost">127.0.0.1:2121</code></li>
+              <li><span>FTP 凭证</span><code>camera / parking2026</code></li>
+              <li><span>上传目录规则</span><code>/CAM_3F_WIN/</code></li>
+              <li><span>HTTP 直传</span><code>POST /api/cameras/{id}/snapshot</code></li>
+            </ul>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <!-- ==================== APPLE SHEET MODAL: AZURE AI FOUNDRY SETTINGS ==================== -->
+  <div id="modelModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div id="modelModalBackdrop" class="modal-backdrop"></div>
+    <div class="modal-sheet">
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow">Multimodal Vision Engine</span>
+          <h2 id="modalTitle">配置多模态辅助识别模型</h2>
+        </div>
+        <button id="btnCloseModelModal" class="icon-close-btn" type="button" aria-label="关闭">✕</button>
+      </div>
+
+      <div class="sheet-body">
+        <div class="field">
+          <label for="vlmPresetSelect">模型服务平台预设</label>
+          <select id="vlmPresetSelect">
+            <option value="azure_foundry">Azure AI Foundry — OpenAI / Cognitive 部署 (推荐)</option>
+            <option value="azure_ai_services">Azure AI Foundry — Serverless Models (services.ai.azure.com)</option>
+            <option value="openai">OpenAI 官方 API</option>
+            <option value="qwen">阿里云百炼 Qwen-VL</option>
+            <option value="gemini">Google Gemini Flash</option>
+            <option value="ollama">本地 Ollama (离线免密钥)</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="vlmModeSelect">多模态介入策略</label>
+          <select id="vlmModeSelect">
+            <option value="hybrid">智能混合漏斗：本地 OpenCV 快筛 + 低置信度/异物/弹性带交由 Azure 仲裁</option>
+            <option value="always_vlm">全量多模态识别：所有画面变化车位全部调用 Azure 模型判定（推荐测试期开启）</option>
+            <option value="local_only">纯本地引擎：仅使用本地 OpenCV，不发起云端模型调用</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="vlmBaseUrl">Azure AI Foundry Target URI 或 Endpoint</label>
+          <input
+            type="text"
+            id="vlmBaseUrl"
+            placeholder="可直接粘贴完整 Target URI，或 https://<resource>.openai.azure.com"
+          />
+          <span class="field-caption">
+            支持直接粘贴 Azure AI Foundry 部署详情页完整的 <code>Target URI</code>（含 <code>?api-version=...</code>），或仅填资源根域名自动拼接。
+          </span>
+        </div>
+
+        <div class="field-grid-3">
+          <div class="field">
+            <label for="vlmModel">Deployment / 模型名称</label>
+            <input type="text" id="vlmModel" placeholder="例如 gpt-4o / gpt-4.1-mini" />
+          </div>
+          <div class="field">
+            <label for="vlmApiVersion">API Version</label>
+            <input type="text" id="vlmApiVersion" placeholder="2024-12-01-preview" />
+          </div>
+          <div class="field">
+            <label for="vlmAuthMode">认证方式</label>
+            <select id="vlmAuthMode">
+              <option value="auto">自动适配 (api-key / Bearer)</option>
+              <option value="api-key">Header: api-key</option>
+              <option value="bearer">Authorization: Bearer</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="vlmApiKey">
+            API Key 密钥 <span id="apiKeyStatus" class="saved-key-pill"></span>
+          </label>
+          <div class="key-input-group">
+            <input
+              type="password"
+              id="vlmApiKey"
+              placeholder="粘贴 Azure AI Foundry 密钥（留空保存则保留现有密钥）"
+            />
+            <button id="btnToggleKeyVis" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">显示</button>
+          </div>
+        </div>
+
+        <div class="field-grid-2">
+          <div class="field">
+            <label for="cfgDebounceSec">双帧防抖确认窗口（秒）</label>
+            <input type="number" id="cfgDebounceSec" value="8" min="0" max="60" step="1" />
+          </div>
+          <div class="field">
+            <label for="cfgSoftLockSec">在途软锁保留时长（秒）</label>
+            <input type="number" id="cfgSoftLockSec" value="180" min="0" max="600" step="10" />
+          </div>
+        </div>
+
+        <div id="vlmTestResultBox" class="test-result-banner hidden"></div>
+        <p id="cfgSaveMsg" class="feedback-note"></p>
+      </div>
+
+      <div class="sheet-footer">
+        <button id="btnTestVlm" class="btn-apple btn-apple-secondary" type="button">发送测试图验证连通性</button>
+        <button id="btnSaveConfig" class="btn-apple btn-apple-primary" type="button">保存配置</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -50,6 +50,83 @@ class VisionPipeline:
                 for k in [k for k in self._prev_signatures if k.startswith(prefix)]:
                     self._prev_signatures.pop(k, None)
 
+    def prime_reference_signatures(self, camera_id: str, spot_sigs: Dict[str, np.ndarray]) -> None:
+        with self._lock:
+            for spot_id, sig in spot_sigs.items():
+                if isinstance(sig, np.ndarray) and sig.shape == (32, 32):
+                    self._prev_signatures[f"{camera_id}::{spot_id}"] = sig.copy()
+
+    @staticmethod
+    def _align_to_reference_template(
+        full_img: np.ndarray,
+        template_gray_b64: Optional[str],
+        cal_w: int,
+        cal_h: int,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Compensate minor wind/window-mount camera shake against the saved Reference Template
+        using ORB keypoints + RANSAC Homography in low-res grayscale (<8ms CPU).
+        """
+        if not template_gray_b64:
+            return full_img, {"active": False, "aligned": False, "shift_px": 0.0}
+
+        try:
+            ref_bytes = base64.b64decode(template_gray_b64)
+            ref_small = cv2.imdecode(np.frombuffer(ref_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if ref_small is None:
+                return full_img, {"active": False, "aligned": False, "shift_px": 0.0}
+
+            rh, rw = ref_small.shape[:2]
+            cur_small = cv2.resize(cv2.cvtColor(full_img, cv2.COLOR_BGR2GRAY), (rw, rh))
+
+            orb = cv2.ORB_create(nfeatures=380)
+            kp1, des1 = orb.detectAndCompute(cur_small, None)
+            kp2, des2 = orb.detectAndCompute(ref_small, None)
+            if des1 is None or des2 is None or len(kp1) < 20 or len(kp2) < 20:
+                return full_img, {"active": True, "aligned": False, "shift_px": 0.0}
+
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            matches = sorted(matcher.match(des1, des2), key=lambda m: m.distance)[:90]
+            if len(matches) < 18:
+                return full_img, {"active": True, "aligned": False, "shift_px": 0.0}
+
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+            H_small, inliers = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.5)
+            inlier_cnt = int(np.sum(inliers)) if inliers is not None else 0
+            if H_small is None or inlier_cnt < 16:
+                return full_img, {"active": True, "aligned": False, "shift_px": 0.0}
+
+            det = float(np.linalg.det(H_small[:2, :2]))
+            if not (0.86 <= det <= 1.16):
+                return full_img, {"active": True, "aligned": False, "shift_px": 0.0}
+
+            corners = np.float32([[[0, 0]], [[rw, 0]], [[rw, rh]], [[0, rh]]])
+            warped_corners = cv2.perspectiveTransform(corners, H_small)
+            corner_disp = np.linalg.norm(warped_corners - corners, axis=2)
+            mean_disp_small = float(np.mean(corner_disp))
+            max_disp_small = float(np.max(corner_disp))
+
+            # Reject wild false homographies (>8.5% frame jump) and skip sub-pixel noise (<1.2px)
+            if max_disp_small > max(rw, rh) * 0.085:
+                return full_img, {"active": True, "aligned": False, "shift_px": 0.0}
+
+            h_img, w_img = full_img.shape[:2]
+            scale_back = w_img / max(1.0, float(rw))
+            shift_full_px = round(mean_disp_small * scale_back, 2)
+            if shift_full_px < 1.4:
+                return full_img, {"active": True, "aligned": False, "shift_px": shift_full_px}
+
+            S_down = np.array([[rw / w_img, 0, 0], [0, rh / h_img, 0], [0, 0, 1]], dtype=np.float64)
+            S_up = np.array([[cal_w / rw, 0, 0], [0, cal_h / rh, 0], [0, 0, 1]], dtype=np.float64)
+            H_full = S_up @ H_small @ S_down
+            aligned = cv2.warpPerspective(
+                full_img, H_full, (cal_w, cal_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+            )
+            return aligned, {"active": True, "aligned": True, "shift_px": shift_full_px, "inliers": inlier_cnt}
+        except Exception:
+            return full_img, {"active": True, "aligned": False, "shift_px": 0.0}
+
     def process_snapshot_bytes(
         self,
         camera_id: str,
@@ -68,14 +145,19 @@ class VisionPipeline:
         cfg = config_manager.get()
         now = simulated_timestamp if simulated_timestamp is not None else time.time()
 
-        cam = self.db.get_camera(camera_id)
+        cam = self.db.get_camera(camera_id, include_blobs=True)
         if not cam:
             raise ValueError(f"未找到相机配置: {camera_id}")
 
-        spots = self.db.list_spots(camera_id=camera_id)
-        # Scale spot polygons proportionally if uploaded test image resolution differs from calibration resolution
+        spots = self.db.list_spots(camera_id=camera_id, include_signatures=True)
         cal_w = max(1, int(cam.get("image_width") or w_img))
         cal_h = max(1, int(cam.get("image_height") or h_img))
+
+        full_img, tpl_align_info = self._align_to_reference_template(
+            full_img, cam.get("template_gray_b64"), cal_w, cal_h
+        )
+        h_img, w_img = full_img.shape[:2]
+        # Scale spot polygons proportionally if uploaded test image resolution differs from calibration resolution
         sx = w_img / cal_w
         sy = h_img / cal_h
 
@@ -150,9 +232,24 @@ class VisionPipeline:
                 self._prev_signatures[sig_key] = small_gray
                 self.privacy_stats["fast_lane_inferences"] += 1
 
-            # Stage 2: Fast-lane local OpenCV analysis
+            # Stage 2: Fast-lane local OpenCV analysis (+ Reference Template empty-stall baseline if available)
+            ref_sig_arr: Optional[np.ndarray] = None
+            if sp.get("ref_free_sig_b64"):
+                try:
+                    raw_sig = base64.b64decode(sp["ref_free_sig_b64"])
+                    if len(raw_sig) == 1024:
+                        ref_sig_arr = np.frombuffer(raw_sig, dtype=np.uint8).reshape((32, 32))
+                except Exception:
+                    ref_sig_arr = None
+
             fast_res = self._analyze_patch_fast_opencv(
-                patch, mask, spot_type=sp["spot_type"], total_meters=float(sp["total_meters"]), car_len_m=car_len_m
+                patch,
+                mask,
+                spot_type=sp["spot_type"],
+                total_meters=float(sp["total_meters"]),
+                car_len_m=car_len_m,
+                ref_free_sig=ref_sig_arr,
+                small_gray=small_gray,
             )
 
             final_obs = fast_res
@@ -199,6 +296,18 @@ class VisionPipeline:
                 now=now,
             )
 
+            # Self-learn empty reference baseline when an uncalibrated/initially-occupied spot becomes FREE
+            if (
+                sp["spot_type"] != "elastic_strip"
+                and not sp.get("ref_free_sig_b64")
+                and fsm_res["committed_status"] == "FREE"
+                and final_obs["confidence"] >= 0.88
+            ):
+                self.db.update_spot_state(
+                    sp["spot_id"],
+                    {"ref_free_sig_b64": base64.b64encode(small_gray.tobytes()).decode("ascii")},
+                )
+
             spot_reports.append(
                 {
                     "spot_id": sp["spot_id"],
@@ -223,6 +332,7 @@ class VisionPipeline:
             "raw_image_retained_on_disk": False,
             "instant_confirm_mode": instant_mode,
             "debounce_seconds": debounce_sec,
+            "template_alignment": tpl_align_info,
             "reports": spot_reports,
         }
 
@@ -233,6 +343,8 @@ class VisionPipeline:
         spot_type: str = "standard",
         total_meters: float = 5.2,
         car_len_m: float = 5.2,
+        ref_free_sig: Optional[np.ndarray] = None,
+        small_gray: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         if spot_type == "elastic_strip":
             return self._analyze_elastic_strip_opencv(patch_bgr, total_meters, car_len_m)
@@ -292,12 +404,29 @@ class VisionPipeline:
             + 0.12 * min(1.2, high_sat_ratio / 0.20)
         )
 
-        metrics = {
+        metrics: Dict[str, Any] = {
             "car_score": round(car_score, 3),
             "edge_ratio": round(edge_ratio, 3),
             "intensity_spread": round(intensity_spread, 3),
             "cone_ratio": round(cone_ratio, 3),
         }
+
+        # Reference-Template Baseline Boost: compare zero-mean normalized 32x32 texture to known empty stall
+        if ref_free_sig is not None:
+            cur_32 = (
+                small_gray
+                if small_gray is not None
+                else cv2.resize(cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY), (32, 32))
+            )
+            c_norm = cur_32.astype(np.float32) - float(np.mean(cur_32))
+            r_norm = ref_free_sig.astype(np.float32) - float(np.mean(ref_free_sig))
+            ref_delta = float(np.mean(np.abs(c_norm - r_norm)) / 255.0)
+            metrics["ref_delta"] = round(ref_delta, 3)
+            if ref_delta < 0.055 and cone_ratio < 0.025:
+                car_score *= 0.68
+            elif ref_delta > 0.145 and car_score >= 0.40:
+                car_score = max(car_score, 0.58 + min(0.30, (ref_delta - 0.145) * 1.4))
+            metrics["car_score"] = round(car_score, 3)
 
         # Detect small traffic cone / yellow lock occupying 2.5%~22% of empty pavement
         if 0.025 <= cone_ratio <= 0.24 and car_score < 0.72:
@@ -494,18 +623,20 @@ class VisionPipeline:
         prompt_text: str,
         image_data_uri: str,
         max_tokens: int = 240,
+        reasoning_effort: str = "low",
+        timeout_override: Optional[float] = None,
     ) -> Tuple[Optional[str], Optional[str], str]:
         url, api_style, primary_headers, fallback_headers = self.resolve_vlm_request_target(vlm_cfg)
         if not vlm_cfg.get("base_url", "").strip():
             return None, "未填写 Endpoint / Target URI", url
 
-        timeout = float(vlm_cfg.get("timeout_seconds", 30))
+        timeout = float(timeout_override or vlm_cfg.get("timeout_seconds", 30))
         model_name = str(vlm_cfg.get("model", "gpt-4o")).strip()
 
         if api_style == "responses":
             payload: Dict[str, Any] = {
                 "model": model_name,
-                "reasoning": {"effort": "low"},
+                "reasoning": {"effort": reasoning_effort},
                 "max_output_tokens": max(max_tokens, 1024),
                 "input": [
                     {

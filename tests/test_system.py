@@ -229,6 +229,128 @@ class CommunityParkingSystemTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_reference_image_auto_calibration_and_template_persistence(self) -> None:
+        ctx = ParkingAppContext(database=self.db)
+        srv = create_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+
+        try:
+            config_manager.update(
+                {
+                    "vlm": {
+                        "mode": "hybrid",
+                        "base_url": "https://mock-foundry.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview",
+                        "api_key": "test-resp-key",
+                        "model": "gpt-6.1-sol",
+                    }
+                }
+            )
+
+            # Build synthetic 800x800 perspective parking lot image with white stall lines & 1 parked car + blue plate
+            lot_img = np.full((800, 800, 3), 88, dtype=np.uint8)
+            cv2.line(lot_img, (40, 520), (760, 520), (242, 242, 242), 5)  # Front white stall line
+            dividers = [(110, 60), (275, 250), (435, 440), (600, 635), (725, 765)]
+            for xt, xb in dividers:
+                cv2.line(lot_img, (xt, 380), (xb, 520), (242, 242, 242), 5)
+
+            # Draw synthetic parked car + vivid blue plate in stall 01
+            cv2.rectangle(lot_img, (95, 395), (235, 505), (235, 235, 240), -1)
+            cv2.rectangle(lot_img, (138, 482), (192, 498), (215, 85, 15), -1)  # Blue BGR plate
+            for sx in range(143, 188, 7):
+                cv2.line(lot_img, (sx, 485), (sx, 495), (250, 250, 250), 2)
+
+            ok, jpg_buf = cv2.imencode(".jpg", lot_img)
+            self.assertTrue(ok)
+            b64_img = "data:image/jpeg;base64," + base64.b64encode(jpg_buf.tobytes()).decode("ascii")
+
+            mock_vlm_cal_json = json.dumps(
+                {
+                    "scene_summary": "测试楼栋前4个连排透视车位",
+                    "building_hint": "3栋",
+                    "spots": [
+                        {
+                            "label": "01",
+                            "spot_type": "standard",
+                            "polygon_1000": [[135, 475], [340, 475], [310, 648], [75, 648]],
+                            "initial_status": "OCCUPIED",
+                            "confidence": 0.96,
+                            "reason": "白色轿车停放",
+                        },
+                        {
+                            "label": "02",
+                            "spot_type": "standard",
+                            "polygon_1000": [[340, 475], [545, 475], [550, 648], [310, 648]],
+                            "initial_status": "FREE",
+                            "confidence": 0.97,
+                            "reason": "空闲车位",
+                        },
+                        {
+                            "label": "03",
+                            "spot_type": "standard",
+                            "polygon_1000": [[545, 475], [750, 475], [792, 648], [550, 648]],
+                            "initial_status": "FREE",
+                            "confidence": 0.97,
+                            "reason": "空闲车位",
+                        },
+                        {
+                            "label": "04",
+                            "spot_type": "standard",
+                            "polygon_1000": [[750, 475], [906, 475], [956, 648], [792, 648]],
+                            "initial_status": "FREE",
+                            "confidence": 0.95,
+                            "reason": "空闲车位",
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.ok = True
+            mock_resp.json.return_value = {"output_text": mock_vlm_cal_json}
+
+            with patch("app.vision_pipeline.requests.post", return_value=mock_resp):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/cameras/CAM_3F_WIN/auto-calibrate",
+                    data=json.dumps({"image_base64": b64_img, "auto_save": True}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    cal_res = json.loads(resp.read().decode("utf-8"))
+
+            self.assertTrue(cal_res["ok"])
+            self.assertEqual(len(cal_res["spots"]), 4)
+            self.assertEqual(cal_res["spots"][0]["status"], "OCCUPIED")
+            self.assertEqual(cal_res["spots"][1]["status"], "FREE")
+            self.assertTrue(cal_res["spots"][1]["has_ref_signature"])
+            self.assertGreaterEqual(cal_res["plates_redacted"], 1)
+            self.assertEqual(ctx.vision.privacy_stats["raw_images_written_to_disk"], 0)
+
+            # Verify persistent template endpoint returns saved template & metadata
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/cameras/CAM_3F_WIN/template", timeout=5
+            ) as tpl_resp:
+                tpl_data = json.loads(tpl_resp.read().decode("utf-8"))
+            self.assertTrue(tpl_data["has_template"])
+            self.assertTrue(tpl_data["template_jpeg_b64"].startswith("data:image/jpeg;base64,"))
+            self.assertEqual(tpl_data["template_meta"]["spots_count"], 4)
+
+            # Verify OpenCV offline fallback auto-calibration when VLM is set to local_only
+            config_manager.update({"vlm": {"mode": "local_only"}})
+            fb_res = ctx.calibrator.auto_calibrate_from_bytes(
+                "CAM_SOUTH_01", jpg_buf.tobytes(), auto_save=True
+            )
+            self.assertTrue(fb_res["ok"])
+            self.assertGreaterEqual(len(fb_res["spots"]), 3)
+        finally:
+            config_manager.update({"vlm": {"mode": "hybrid", "base_url": "", "clear_api_key": True}})
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

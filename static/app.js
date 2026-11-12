@@ -7,6 +7,8 @@ const state = {
     zoneId: "Z_BLDG3_EAST",
     mode: "perspective_row", // perspective_row | irregular_poly | elastic_strip | edit_vertices
     bgImage: null,
+    bgDataUrl: null,
+    templateMeta: null,
     imgW: 1280,
     imgH: 720,
     spots: [],
@@ -85,7 +87,12 @@ function populateSelectors(data) {
   updateSiriHint();
 
   const camOptions = data.cameras
-    .map((c) => `<option value="${c.camera_id}">${c.name} (${c.camera_id})</option>`)
+    .map(
+      (c) =>
+        `<option value="${c.camera_id}">${c.has_template ? "★ " : ""}${escapeHtml(c.name)} (${
+          c.camera_id
+        })${c.has_template ? " · 已设模板" : ""}</option>`
+    )
     .join("");
   const calibCamSel = document.getElementById("calibCameraSelect");
   const labCamSel = document.getElementById("labCameraSelect");
@@ -523,26 +530,56 @@ function bindCalibrationConsole() {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (ev) => {
+      const dataUrl = ev.target.result;
       const img = new Image();
       img.onload = () => {
         state.calib.bgImage = img;
+        state.calib.bgDataUrl = dataUrl;
         state.calib.imgW = img.naturalWidth;
         state.calib.imgH = img.naturalHeight;
         canvas.width = img.naturalWidth;
         canvas.height = img.naturalHeight;
+        updateCalibButtons();
         renderCalibCanvas();
       };
-      img.src = ev.target.result;
+      img.src = dataUrl;
     };
     reader.readAsDataURL(file);
+    e.target.value = "";
+  });
+
+  const autoCalibInput = document.getElementById("autoCalibFileInput");
+  document.getElementById("btnUploadAutoCalibrate").addEventListener("click", () => {
+    autoCalibInput.click();
+  });
+  autoCalibInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const camId = document.getElementById("calibCameraSelect").value;
+      const zoneId = document.getElementById("calibZoneSelect").value;
+      await runAutoCalibrationWithDataUrl(camId, zoneId, ev.target.result, false);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  });
+
+  document.getElementById("btnRerunAutoCalibrate").addEventListener("click", async () => {
+    if (!state.calib.bgDataUrl) return;
+    const camId = document.getElementById("calibCameraSelect").value;
+    const zoneId = document.getElementById("calibZoneSelect").value;
+    await runAutoCalibrationWithDataUrl(camId, zoneId, state.calib.bgDataUrl, false);
   });
 
   document.getElementById("btnGenDemoScene").addEventListener("click", () => {
     state.calib.bgImage = null;
+    state.calib.bgDataUrl = null;
     state.calib.imgW = 1280;
     state.calib.imgH = 720;
     canvas.width = 1280;
     canvas.height = 720;
+    updateCalibButtons();
     drawSyntheticDemoLotOnCalibCanvas();
     renderCalibCanvas();
   });
@@ -742,18 +779,171 @@ function bindCalibrationConsole() {
   });
 }
 
+async function runAutoCalibrationWithDataUrl(cameraId, zoneId, dataUrl, fromTestLab = false) {
+  const overlay = document.getElementById("calibLoadingOverlay");
+  const saveMsg = document.getElementById("calibSaveMsg");
+  const btnUpload = document.getElementById("btnUploadAutoCalibrate");
+  const btnRerun = document.getElementById("btnRerunAutoCalibrate");
+  const btnLabCal = document.getElementById("btnLabAutoCalibrate");
+  const canvas = document.getElementById("calibCanvas");
+
+  // Preview raw uploaded reference photo immediately while AI calibrates
+  await new Promise((resolve) => {
+    const preImg = new Image();
+    preImg.onload = () => {
+      if (state.calib.cameraId === cameraId) {
+        state.calib.bgImage = preImg;
+        state.calib.bgDataUrl = dataUrl;
+        state.calib.imgW = preImg.naturalWidth;
+        state.calib.imgH = preImg.naturalHeight;
+        canvas.width = preImg.naturalWidth;
+        canvas.height = preImg.naturalHeight;
+        renderCalibCanvas();
+      }
+      resolve();
+    };
+    preImg.onerror = () => resolve();
+    preImg.src = dataUrl;
+  });
+
+  overlay.classList.remove("hidden");
+  btnUpload.disabled = true;
+  btnRerun.disabled = true;
+  if (btnLabCal) {
+    btnLabCal.disabled = true;
+    btnLabCal.textContent = "正在 AI 自动标定建档...";
+  }
+  saveMsg.style.color = "#0071E3";
+  saveMsg.textContent = "正在通过多模态模型与 OpenCV 标线引擎自动标定参考模板...";
+
+  try {
+    const res = await api(`/api/cameras/${encodeURIComponent(cameraId)}/auto-calibrate`, {
+      method: "POST",
+      body: JSON.stringify({
+        image_base64: dataUrl,
+        zone_id: zoneId,
+        auto_save: true,
+      }),
+    });
+
+    await refreshOverview();
+    if (state.calib.cameraId === cameraId) {
+      await loadCameraSpotsForCalib(cameraId);
+      saveMsg.style.color = "#1D9E31";
+      saveMsg.textContent = `自动标定完成并存为参考模板：识别 ${res.spots.length} 个车位（耗时 ${(
+        res.elapsed_ms / 1000
+      ).toFixed(1)}s）`;
+    }
+
+    if (fromTestLab) {
+      const syntheticSnapRes = {
+        elapsed_ms: res.elapsed_ms,
+        instant_confirm_mode: true,
+        debounce_seconds: 0,
+        template_alignment: { active: true, aligned: false, shift_px: 0, just_calibrated: true },
+        reports: res.spots.map((sp) => ({
+          spot_id: sp.spot_id,
+          label: sp.label,
+          spot_type: sp.spot_type,
+          diff_score: 1.0,
+          stage_used: res.engine_used,
+          observed_status: sp.status,
+          confidence: sp.confidence || 0.95,
+          reason: sp.last_reason || "参考图自动标定基准",
+          fsm: {
+            committed_status: sp.status,
+            pending_status: null,
+            note: "已存为机位永久参考模板并同步初始车位状态",
+          },
+        })),
+      };
+      renderLabOverlayAndReport(
+        res.template_jpeg_b64 || dataUrl,
+        {
+          camera: { image_width: res.image_width, image_height: res.image_height },
+          spots: res.spots,
+        },
+        syntheticSnapRes
+      );
+    }
+    return res;
+  } catch (err) {
+    saveMsg.style.color = "#D70015";
+    saveMsg.textContent = `自动标定失败：${err.message}`;
+    if (fromTestLab) alert(`自动标定失败：${err.message}`);
+  } finally {
+    overlay.classList.add("hidden");
+    btnUpload.disabled = false;
+    updateCalibButtons();
+    if (btnLabCal) {
+      btnLabCal.disabled = false;
+      btnLabCal.textContent = "新视角？设为参考模板并自动标定";
+    }
+  }
+}
+
+function updateTemplateBannerUI(templateResp) {
+  const pill = document.getElementById("tplStatusPill");
+  const summary = document.getElementById("tplSummaryText");
+  if (!pill || !summary) return;
+
+  if (templateResp && templateResp.has_template && templateResp.template_meta) {
+    const m = templateResp.template_meta;
+    pill.className = "tpl-pill tpl-pill-ready";
+    pill.textContent = "参考模板已启用";
+    const hintPrefix = m.building_hint ? `${m.building_hint} · ` : "";
+    const redactNote = m.plates_redacted ? ` · 车牌脱敏 ${m.plates_redacted} 处` : "";
+    summary.textContent = `${hintPrefix}${m.scene_summary || "已完成自动标定"}（共 ${
+      m.spots_count || 0
+    } 位：初始空闲 ${m.initial_free ?? "-"} / 已停 ${m.initial_occupied ?? "-"}${redactNote} · 后续抓拍自动执行防抖对齐与基准比对）`;
+  } else {
+    pill.className = "tpl-pill tpl-pill-idle";
+    pill.textContent = "未设参考模板";
+    summary.textContent =
+      "不同机位高度与角度各异：上传一张实拍或生成图，AI 自动识别透视斜梯形车位、地面编号与初始空满状态，脱敏车牌后存为该机位后续防抖纠偏与比对的参考模板。";
+  }
+}
+
 async function loadCameraSpotsForCalib(cameraId) {
-  const data = await api(`/api/cameras/${encodeURIComponent(cameraId)}/spots`);
+  const [data, tpl] = await Promise.all([
+    api(`/api/cameras/${encodeURIComponent(cameraId)}/spots`),
+    api(`/api/cameras/${encodeURIComponent(cameraId)}/template`),
+  ]);
+
   state.calib.cameraId = cameraId;
   state.calib.zoneId = data.camera.zone_id;
+  state.calib.templateMeta = tpl.template_meta || null;
   document.getElementById("calibZoneSelect").value = data.camera.zone_id;
-  if (!state.calib.bgImage) {
-    state.calib.imgW = data.camera.image_width || 1280;
-    state.calib.imgH = data.camera.image_height || 720;
-    const canvas = document.getElementById("calibCanvas");
-    canvas.width = state.calib.imgW;
-    canvas.height = state.calib.imgH;
+  updateTemplateBannerUI(tpl);
+
+  const canvas = document.getElementById("calibCanvas");
+  const calW = data.camera.image_width || 1280;
+  const calH = data.camera.image_height || 720;
+  state.calib.imgW = calW;
+  state.calib.imgH = calH;
+  canvas.width = calW;
+  canvas.height = calH;
+
+  if (tpl.has_template && tpl.template_jpeg_b64) {
+    await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        state.calib.bgImage = img;
+        state.calib.bgDataUrl = tpl.template_jpeg_b64;
+        resolve();
+      };
+      img.onerror = () => {
+        state.calib.bgImage = null;
+        state.calib.bgDataUrl = null;
+        resolve();
+      };
+      img.src = tpl.template_jpeg_b64;
+    });
+  } else {
+    state.calib.bgImage = null;
+    state.calib.bgDataUrl = null;
   }
+
   state.calib.spots = data.spots || [];
   state.calib.draftPoints = [];
   state.calib.previewTrapezoids = [];
@@ -766,15 +956,18 @@ function updateCalibButtons() {
   document.getElementById("btnCommitRow").disabled = state.calib.previewTrapezoids.length === 0;
   document.getElementById("btnFinishIrregular").disabled = state.calib.draftPoints.length < 3;
   document.getElementById("btnFinishElastic").disabled = state.calib.draftPoints.length < 4;
+  const rerunBtn = document.getElementById("btnRerunAutoCalibrate");
+  if (rerunBtn) rerunBtn.disabled = !state.calib.bgDataUrl;
 }
 
 function renderSpotListSidebar() {
   document.getElementById("calibSpotCount").textContent = state.calib.spots.length;
   const list = document.getElementById("calibSpotList");
   if (!state.calib.spots.length) {
-    list.innerHTML = `<div class="locks-container">暂未框选区域，请在左侧画布点击标定</div>`;
+    list.innerHTML = `<div class="locks-container">暂未框选区域，可上传参考图自动标定或手绘框选</div>`;
     return;
   }
+  const stLabels = { FREE: "空闲", OCCUPIED: "已停", BLOCKED: "占道", UNKNOWN: "未知" };
   list.innerHTML = state.calib.spots
     .map((sp, i) => {
       const badge =
@@ -785,11 +978,13 @@ function renderSpotListSidebar() {
             ? "异形小车"
             : "异形框"
           : "透视梯形";
+      const st = sp.status || sp.initial_status || "FREE";
       return `
         <div class="calib-spot-item">
           <div>
             <strong>${escapeHtml(sp.label)}</strong>
             <small>${badge}</small>
+            <span class="spot-chip chip-${st}" style="margin-left:6px">${stLabels[st] || st}</span>
           </div>
           <button class="link-btn danger-link" type="button" onclick="removeCalibSpot(${i})">移除</button>
         </div>
@@ -852,20 +1047,28 @@ function renderCalibCanvas() {
   state.calib.spots.forEach((sp) => {
     const poly = sp.polygon;
     if (!poly || poly.length < 3) return;
+    const st = sp.status || sp.initial_status || "FREE";
     let stroke = "#34C759";
     let fill = "rgba(52, 199, 89, 0.22)";
-    if (sp.spot_type === "irregular") {
+    if (st === "OCCUPIED") {
+      stroke = "#FF453A";
+      fill = "rgba(255, 69, 58, 0.22)";
+    } else if (st === "BLOCKED") {
+      stroke = "#FF9F0A";
+      fill = "rgba(255, 159, 10, 0.24)";
+    } else if (sp.spot_type === "irregular") {
       stroke = "#FF9500";
       fill = "rgba(255, 149, 0, 0.22)";
     } else if (sp.spot_type === "elastic_strip") {
       stroke = "#007AFF";
       fill = "rgba(0, 122, 255, 0.22)";
     }
-    drawPolygon(ctx, poly, stroke, fill, 2.5);
+    drawPolygon(ctx, poly, stroke, fill, 2.6);
 
     const cx = poly.reduce((s, p) => s + p[0], 0) / poly.length;
     const cy = poly.reduce((s, p) => s + p[1], 0) / poly.length;
-    drawPillLabel(ctx, cx, cy, sp.label);
+    const suffix = st === "OCCUPIED" ? " · 已停" : st === "BLOCKED" ? " · 占道" : "";
+    drawPillLabel(ctx, cx, cy, `${sp.label}${suffix}`);
 
     if (state.calib.mode === "edit_vertices") {
       poly.forEach(([x, y]) => drawHandle(ctx, x, y, "#FF9500"));
@@ -942,11 +1145,29 @@ function drawHandle(ctx, x, y, color, label = "") {
 function bindTestLab() {
   const dropzone = document.getElementById("labDropzone");
   const fileInput = document.getElementById("labImageInput");
+  const labAutoCalInput = document.getElementById("labAutoCalibInput");
 
   document.getElementById("btnPickLabImage").addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", (e) => {
     if (e.target.files[0]) uploadSnapshotFile(e.target.files[0]);
     fileInput.value = "";
+  });
+
+  document.getElementById("btnLabAutoCalibrate").addEventListener("click", () => {
+    labAutoCalInput.click();
+  });
+  labAutoCalInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const camId = document.getElementById("labCameraSelect").value;
+      const camObj = (state.overview?.cameras || []).find((c) => c.camera_id === camId);
+      const zoneId = camObj ? camObj.zone_id : "Z_BLDG3_EAST";
+      await runAutoCalibrationWithDataUrl(camId, zoneId, ev.target.result, true);
+    };
+    reader.readAsDataURL(file);
+    labAutoCalInput.value = "";
   });
 
   dropzone.addEventListener("dragover", (e) => {
@@ -1066,9 +1287,19 @@ async function submitSnapshotDataUrl(dataUrl, sourceLabel) {
 function renderLabOverlayAndReport(dataUrl, spotData, res) {
   document.getElementById("labPreviewWrap").classList.remove("hidden");
   document.getElementById("labReportsWrap").classList.remove("hidden");
+  const tplAlign = res.template_alignment || {};
+  let alignNote = "";
+  if (tplAlign.just_calibrated) {
+    alignNote = " · 已建档设为参考模板";
+  } else if (tplAlign.aligned) {
+    alignNote = ` · 模板纠偏 Δ${tplAlign.shift_px}px`;
+  } else if (tplAlign.active) {
+    alignNote = " · 参考模板对齐就绪";
+  }
+
   document.getElementById("labTimingBadge").textContent = `${res.elapsed_ms} ms · 0 字节落盘 · ${
     res.instant_confirm_mode ? "单帧直通" : `双帧防抖 (${res.debounce_seconds}s)`
-  }`;
+  }${alignNote}`;
 
   const canvas = document.getElementById("labResultCanvas");
   const ctx = canvas.getContext("2d");

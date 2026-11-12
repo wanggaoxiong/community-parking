@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from app.auto_calibrator import ReferenceAutoCalibrator
 from app.config import BASE_DIR, config_manager
 from app.database import Database, db as default_db
 from app.homography import subdivide_perspective_row
@@ -24,6 +25,7 @@ class ParkingAppContext:
         self.db = database or default_db
         self.fsm = SpotStateMachine(self.db)
         self.vision = VisionPipeline(self.db, self.fsm)
+        self.calibrator = ReferenceAutoCalibrator(self.db, self.vision)
         self.recommender = ParkingRecommender(self.db)
         self.recent_events: list[Dict[str, Any]] = []
 
@@ -165,6 +167,25 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                     )
                     return
 
+                m_tpl = re.match(r"^/api/cameras/([^/]+)/template$", path)
+                if m_tpl:
+                    cam_id = m_tpl.group(1)
+                    cam_full = ctx.db.get_camera(cam_id, include_blobs=True)
+                    if not cam_full:
+                        self._send_json({"error": f"Camera {cam_id} not found"}, 404)
+                        return
+                    self._send_json(
+                        {
+                            "camera_id": cam_id,
+                            "has_template": cam_full["has_template"],
+                            "image_width": cam_full["image_width"],
+                            "image_height": cam_full["image_height"],
+                            "template_meta": cam_full["template_meta"],
+                            "template_jpeg_b64": cam_full.get("template_jpeg_b64") or "",
+                        }
+                    )
+                    return
+
                 if path == "/api/config":
                     self._send_json(config_manager.get_public())
                     return
@@ -233,6 +254,49 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                     )
                     ctx.vision.clear_frame_cache(cam_id)
                     self._send_json({"camera_id": cam_id, "spots": saved})
+                    return
+
+                m_autocal = re.match(r"^/api/cameras/([^/]+)/auto-calibrate$", path)
+                if m_autocal:
+                    cam_id = m_autocal.group(1)
+                    ctype = self.headers.get("Content-Type", "")
+                    zone_override: Optional[str] = qs.get("zone_id", [None])[0]  # type: ignore
+                    auto_save = qs.get("auto_save", ["true"])[0].lower() != "false"
+
+                    if "application/json" in ctype:
+                        body = self._read_json()
+                        b64 = str(body.get("image_base64", ""))
+                        if "," in b64:
+                            b64 = b64.split(",", 1)[1]
+                        if not b64:
+                            raise ValueError("缺少参考图数据 image_base64")
+                        raw_img = base64.b64decode(b64)
+                        if body.get("zone_id"):
+                            zone_override = str(body["zone_id"])
+                        if "auto_save" in body:
+                            auto_save = bool(body["auto_save"])
+                    else:
+                        raw_img = self._read_body()
+                        if not raw_img:
+                            raise ValueError("缺少参考图二进制内容")
+
+                    res = ctx.calibrator.auto_calibrate_from_bytes(
+                        camera_id=cam_id,
+                        raw_image_bytes=raw_img,
+                        zone_id=zone_override,
+                        auto_save=auto_save,
+                    )
+                    del raw_img
+                    ctx.push_event(
+                        {
+                            "ts": time.time(),
+                            "source": "AI 参考图自动标定模板",
+                            "camera_id": cam_id,
+                            "elapsed_ms": res["elapsed_ms"],
+                            "processed_spots": len(res["spots"]),
+                        }
+                    )
+                    self._send_json(res)
                     return
 
                 m_snap = re.match(r"^/api/cameras/([^/]+)/snapshot$", path)

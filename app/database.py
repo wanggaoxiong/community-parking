@@ -83,10 +83,27 @@ class Database:
                     last_reason TEXT NOT NULL DEFAULT '初始化空闲',
                     last_engine TEXT NOT NULL DEFAULT 'seed',
                     last_changed_at REAL NOT NULL,
-                    last_seen_at REAL
+                    last_seen_at REAL,
+                    ref_free_sig_b64 TEXT
                 );
                 """
             )
+            self._ensure_migrations(conn)
+
+    @staticmethod
+    def _ensure_migrations(conn: sqlite3.Connection) -> None:
+        cam_cols = {r["name"] for r in conn.execute("PRAGMA table_info(cameras)").fetchall()}
+        for col_name, col_def in (
+            ("template_jpeg_b64", "TEXT"),
+            ("template_gray_b64", "TEXT"),
+            ("template_meta_json", "TEXT"),
+        ):
+            if col_name not in cam_cols:
+                conn.execute(f"ALTER TABLE cameras ADD COLUMN {col_name} {col_def}")
+
+        spot_cols = {r["name"] for r in conn.execute("PRAGMA table_info(spots)").fetchall()}
+        if "ref_free_sig_b64" not in spot_cols:
+            conn.execute("ALTER TABLE spots ADD COLUMN ref_free_sig_b64 TEXT")
 
     def _seed_if_empty(self) -> None:
         with self._lock, self._connect() as conn:
@@ -134,7 +151,14 @@ class Database:
                 ("CAM_NORTH_4G", "5号楼断头路4G太阳能枪机", "Z_BLDG5_DEADEND", "4G太阳能补盲", 1280, 720, now, 1),
                 ("CAM_EAST_STRIP", "6号楼201窗台路侧俯拍机", "Z_BLDG6_STRIP", "业主窗台Wi-Fi", 1280, 720, now, 1),
             ]
-            conn.executemany("INSERT INTO cameras VALUES (?, ?, ?, ?, ?, ?, ?, ?)", cameras)
+            conn.executemany(
+                """
+                INSERT INTO cameras (
+                    camera_id, name, zone_id, mount_type, image_width, image_height, last_heartbeat, frames_received
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                cameras,
+            )
 
             # Seed realistic spots across the 4 cameras/zones (including perspective trapezoids, irregular corner, elastic strip)
             from app.homography import subdivide_perspective_row
@@ -213,7 +237,11 @@ class Database:
 
             conn.executemany(
                 """
-                INSERT INTO spots VALUES (
+                INSERT INTO spots (
+                    spot_id, camera_id, zone_id, label, spot_type, compact_only, total_meters, capacity,
+                    polygon_json, status, free_units, occupied_units, pending_status, pending_free_units,
+                    pending_since, confidence, last_reason, last_engine, last_changed_at, last_seen_at
+                ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
@@ -238,17 +266,82 @@ class Database:
             ).fetchall()
             return {r["zone_id"]: float(r["walk_meters"]) for r in rows}
 
+    @staticmethod
+    def _format_camera_row(row: sqlite3.Row, include_blobs: bool = False) -> Dict[str, Any]:
+        d = dict(row)
+        has_tpl = bool(d.get("template_jpeg_b64"))
+        meta_raw = d.pop("template_meta_json", None)
+        d["has_template"] = has_tpl
+        d["template_meta"] = json.loads(meta_raw) if meta_raw else None
+        if not include_blobs:
+            d.pop("template_jpeg_b64", None)
+            d.pop("template_gray_b64", None)
+        return d
+
     def list_cameras(self) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT * FROM cameras ORDER BY camera_id").fetchall()
-            return [dict(r) for r in rows]
+            return [self._format_camera_row(r, include_blobs=False) for r in rows]
 
-    def get_camera(self, camera_id: str) -> Optional[Dict[str, Any]]:
+    def get_camera(self, camera_id: str, include_blobs: bool = False) -> Optional[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM cameras WHERE camera_id = ?", (camera_id,)
             ).fetchone()
-            return dict(row) if row else None
+            return self._format_camera_row(row, include_blobs=include_blobs) if row else None
+
+    def save_camera_template(
+        self,
+        camera_id: str,
+        template_jpeg_b64: str,
+        template_gray_b64: str,
+        template_meta: Dict[str, Any],
+        image_width: int,
+        image_height: int,
+        zone_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            if zone_id:
+                conn.execute(
+                    """
+                    UPDATE cameras
+                    SET zone_id = ?, image_width = ?, image_height = ?,
+                        template_jpeg_b64 = ?, template_gray_b64 = ?, template_meta_json = ?,
+                        last_heartbeat = ?
+                    WHERE camera_id = ?
+                    """,
+                    (
+                        zone_id,
+                        image_width,
+                        image_height,
+                        template_jpeg_b64,
+                        template_gray_b64,
+                        json.dumps(template_meta, ensure_ascii=False),
+                        now,
+                        camera_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE cameras
+                    SET image_width = ?, image_height = ?,
+                        template_jpeg_b64 = ?, template_gray_b64 = ?, template_meta_json = ?,
+                        last_heartbeat = ?
+                    WHERE camera_id = ?
+                    """,
+                    (
+                        image_width,
+                        image_height,
+                        template_jpeg_b64,
+                        template_gray_b64,
+                        json.dumps(template_meta, ensure_ascii=False),
+                        now,
+                        camera_id,
+                    ),
+                )
+        return self.get_camera(camera_id, include_blobs=False)
 
     def upsert_camera(
         self,
@@ -274,7 +367,11 @@ class Database:
                 )
             else:
                 conn.execute(
-                    "INSERT INTO cameras VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                    """
+                    INSERT INTO cameras (
+                        camera_id, name, zone_id, mount_type, image_width, image_height, last_heartbeat, frames_received
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
                     (camera_id, name, zone_id, mount_type, image_width, image_height, time.time()),
                 )
         return self.get_camera(camera_id)  # type: ignore
@@ -304,7 +401,12 @@ class Database:
                     (now, camera_id),
                 )
 
-    def list_spots(self, camera_id: Optional[str] = None, zone_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_spots(
+        self,
+        camera_id: Optional[str] = None,
+        zone_id: Optional[str] = None,
+        include_signatures: bool = False,
+    ) -> List[Dict[str, Any]]:
         query = "SELECT * FROM spots WHERE 1=1"
         params: List[Any] = []
         if camera_id:
@@ -322,6 +424,9 @@ class Database:
                 d = dict(r)
                 d["polygon"] = json.loads(d.pop("polygon_json"))
                 d["compact_only"] = bool(d["compact_only"])
+                d["has_ref_signature"] = bool(d.get("ref_free_sig_b64"))
+                if not include_signatures:
+                    d.pop("ref_free_sig_b64", None)
                 result.append(d)
             return result
 
@@ -330,6 +435,13 @@ class Database:
     ) -> List[Dict[str, Any]]:
         now = time.time()
         with self._lock, self._connect() as conn:
+            existing_sigs = {
+                r["label"]: r["ref_free_sig_b64"]
+                for r in conn.execute(
+                    "SELECT label, ref_free_sig_b64 FROM spots WHERE camera_id = ?", (camera_id,)
+                ).fetchall()
+                if r["ref_free_sig_b64"]
+            }
             conn.execute(
                 "UPDATE cameras SET zone_id = ?, image_width = ?, image_height = ? WHERE camera_id = ?",
                 (zone_id, image_width, image_height, camera_id),
@@ -337,6 +449,7 @@ class Database:
             conn.execute("DELETE FROM spots WHERE camera_id = ?", (camera_id,))
             for idx, sp in enumerate(spots_payload):
                 spot_id = sp.get("spot_id") or f"{camera_id}-S{idx+1:02d}"
+                label = sp.get("label") or f"车位-{idx+1:02d}"
                 spot_type = sp.get("spot_type", "standard")
                 total_meters = float(sp.get("total_meters", 16.0 if spot_type == "elastic_strip" else 5.2))
                 capacity = (
@@ -344,26 +457,50 @@ class Database:
                     if spot_type == "elastic_strip"
                     else int(sp.get("capacity", 1))
                 )
+                raw_status = str(sp.get("initial_status") or sp.get("status") or "FREE").upper()
+                if raw_status not in ("FREE", "OCCUPIED", "BLOCKED", "UNKNOWN"):
+                    raw_status = "FREE"
+                if spot_type == "elastic_strip":
+                    free_u = int(sp.get("free_units", capacity if raw_status == "FREE" else 0))
+                    occ_u = int(sp.get("occupied_units", 0 if raw_status == "FREE" else capacity))
+                else:
+                    free_u = 1 if raw_status == "FREE" else 0
+                    occ_u = 1 if raw_status == "OCCUPIED" else 0
+                conf = float(sp.get("confidence", 1.0))
+                reason = str(sp.get("reason") or sp.get("last_reason") or "新标定车位（待抓拍更新）")
+                engine = str(sp.get("engine") or sp.get("last_engine") or "calibration")
+                ref_sig = sp.get("ref_free_sig_b64") or existing_sigs.get(label)
+
                 conn.execute(
                     """
-                    INSERT INTO spots VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FREE', ?, 0,
-                        NULL, NULL, NULL, 1.0, '新标定车位（待抓拍更新）', 'calibration', ?, ?
+                    INSERT INTO spots (
+                        spot_id, camera_id, zone_id, label, spot_type, compact_only, total_meters, capacity,
+                        polygon_json, status, free_units, occupied_units, pending_status, pending_free_units,
+                        pending_since, confidence, last_reason, last_engine, last_changed_at, last_seen_at,
+                        ref_free_sig_b64
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
                         spot_id,
                         camera_id,
                         zone_id,
-                        sp.get("label") or f"车位-{idx+1:02d}",
+                        label,
                         spot_type,
                         1 if sp.get("compact_only") else 0,
                         total_meters,
                         capacity,
                         json.dumps(sp["polygon"]),
-                        capacity,
+                        raw_status,
+                        free_u,
+                        occ_u,
+                        conf,
+                        reason,
+                        engine,
                         now,
                         now,
+                        ref_sig,
                     ),
                 )
         return self.list_spots(camera_id=camera_id)

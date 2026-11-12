@@ -147,15 +147,37 @@
         <div class="bento-card">
           <div class="card-head">
             <div>
-              <span class="eyebrow">单应性透视几何 &amp; 异形掩码引擎</span>
+              <span class="eyebrow">单应性透视几何 &amp; 参考图自我标定引擎</span>
               <h2>机位视野空间标定台</h2>
             </div>
             <div class="head-btn-row">
               <label class="btn-apple btn-apple-secondary btn-apple-sm file-trigger">
-                载入基准照片
+                仅载入底图(手绘)
                 <input type="file" id="calibImageInput" accept="image/*" hidden />
               </label>
-              <button id="btnGenDemoScene" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">恢复俯拍示意底图</button>
+              <button id="btnGenDemoScene" class="btn-apple btn-apple-ghost btn-apple-sm" type="button">恢复示意底图</button>
+            </div>
+          </div>
+
+          <!-- AI Reference-Image Self-Calibration & Template Banner -->
+          <div class="ai-template-banner">
+            <div class="ai-template-info">
+              <div class="ai-template-title-row">
+                <strong>AI 参考图自动标定 · 永久参考模板</strong>
+                <span id="tplStatusPill" class="tpl-pill tpl-pill-idle">未设参考模板</span>
+              </div>
+              <p id="tplSummaryText" class="ai-template-desc">
+                不同机位高度与角度各异：上传一张实拍或生成图，AI 自动识别透视斜梯形车位、地面编号与初始空满状态，脱敏车牌后存为该机位后续防抖纠偏与比对的参考模板。
+              </p>
+            </div>
+            <div class="ai-template-actions">
+              <input type="file" id="autoCalibFileInput" accept="image/*" hidden />
+              <button id="btnUploadAutoCalibrate" class="btn-apple btn-apple-primary" type="button">
+                上传参考图 · AI 自动标定为模板
+              </button>
+              <button id="btnRerunAutoCalibrate" class="btn-apple btn-apple-tinted btn-apple-sm" type="button" disabled>
+                对当前底图执行自动标定
+              </button>
             </div>
           </div>
 
@@ -214,8 +236,13 @@
             <span class="toolbar-hint">按住画布上任意车位的圆点手柄即可独立拖拽微调，适配立柱、树坑或斜马路牙子。</span>
           </div>
 
-          <div class="canvas-stage">
+          <div class="canvas-stage canvas-stage-rel">
             <canvas id="calibCanvas" width="1280" height="720"></canvas>
+            <div id="calibLoadingOverlay" class="canvas-loading-overlay hidden">
+              <div class="apple-spinner"></div>
+              <strong id="calibLoadingTitle">正在根据参考图自动标定车位并构建模板...</strong>
+              <span id="calibLoadingSub">多模态透视坐标解析 · OpenCV 标线亚像素吸附 · 车牌隐私脱敏（首次建档约需 10–30 秒）</span>
+            </div>
           </div>
         </div>
 
@@ -298,14 +325,20 @@
 
           <div id="labDropzone" class="apple-dropzone">
             <input type="file" id="labImageInput" accept="image/*" hidden />
+            <input type="file" id="labAutoCalibInput" accept="image/*" hidden />
             <div class="dropzone-icon" aria-hidden="true">
               <svg width="34" height="34" viewBox="0 0 24 24" fill="none">
                 <path d="M12 16V4M12 4L7.5 8.5M12 4L16.5 8.5M4 16.5V18.5C4 19.6 4.9 20.5 6 20.5H18C19.1 20.5 20 19.6 20 18.5V16.5" stroke="#0071E3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
             </div>
             <p class="dropzone-title">拖入或选择 AI 生成的停车场测试图</p>
-            <p class="dropzone-sub">服务端仅在内存中完成透视裁切与识别，原图 0 字节落盘</p>
-            <button id="btnPickLabImage" class="btn-apple btn-apple-primary" type="button">选择图片上传测试</button>
+            <p class="dropzone-sub">服务端仅在内存中完成透视裁切与参考模板对齐比对，原图 0 字节落盘</p>
+            <div class="dropzone-btn-group">
+              <button id="btnPickLabImage" class="btn-apple btn-apple-primary" type="button">上传日常抓拍图测试</button>
+              <button id="btnLabAutoCalibrate" class="btn-apple btn-apple-tinted" type="button" title="针对全新视角图片，先一键完成自我标定并保存为该机位的参考模板">
+                新视角？设为参考模板并自动标定
+              </button>
+            </div>
           </div>
 
           <div class="quick-synth-row">
@@ -368,9 +401,9 @@
           <div class="inset-group">
             <h3>测试闭环建议步骤</h3>
             <ol class="guide-steps">
-              <li>点击右上角<strong>「配置 Azure 模型」</strong>填入 Azure AI Foundry 的 Target URI 与 Key，点「测试连接」。</li>
-              <li>若用自定义生成的停车场图片，先在<strong>「空间标定」</strong>载入该图框选车位并保存。</li>
-              <li>回到本页上传「有车/无车/雪糕桶」变化图，观察识别报告与<strong>「寻位导览」</strong>语音推荐变化。</li>
+              <li>点击右上角<strong>「配置 Azure 模型」</strong>确认 Azure AI Foundry 的 Target URI 与 Key 已就绪。</li>
+              <li>首次接入某个机位视角时，点击<strong>「新视角？设为参考模板并自动标定」</strong>（或在「空间标定」页上传参考图），一键生成透视车位与参考模板。</li>
+              <li>后续上传同一视角下车辆进出或锥桶占道变化图，自动基于参考模板完成防抖纠偏、空满识别与语音寻位推荐。</li>
             </ol>
           </div>
 

@@ -23,12 +23,19 @@ class CommunityParkingSystemTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.tmp_dir.name) / "test_parking.db")
+        self._orig_cfg_snapshot = config_manager.get()
+        self._cfg_patch = patch(
+            "app.config.RUNTIME_CONFIG_PATH", Path(self.tmp_dir.name) / "test_runtime_config.json"
+        )
+        self._cfg_patch.start()
         self.db = Database(self.db_path)
         self.fsm = SpotStateMachine(self.db)
         self.vision = VisionPipeline(self.db, self.fsm)
         self.recommender = ParkingRecommender(self.db)
 
     def tearDown(self) -> None:
+        config_manager._config = self._orig_cfg_snapshot
+        self._cfg_patch.stop()
         self.tmp_dir.cleanup()
 
     def test_perspective_homography_near_far_foreshortening(self) -> None:
@@ -57,17 +64,28 @@ class CommunityParkingSystemTests(unittest.TestCase):
         self.assertEqual(patch_strip.shape, (160, 672, 3))
 
     def test_azure_ai_foundry_url_and_auth_resolver(self) -> None:
-        # 1. Full Target URI pasted directly from Azure AI Foundry portal
+        # 0. Azure AI Foundry Responses API Target URI (e.g. gpt-6.1-sol / gpt-5 / o3)
+        resp_uri = "https://biuch-mocspl5y-swedencentral.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
+        url0, style0, h0, fb0 = VisionPipeline.resolve_vlm_request_target(
+            {"base_url": resp_uri, "api_key": "az-resp-key", "model": "gpt-6.1-sol", "auth_mode": "auto"}
+        )
+        self.assertEqual(url0, resp_uri)
+        self.assertEqual(style0, "responses")
+        self.assertEqual(h0.get("api-key"), "az-resp-key")
+        self.assertEqual(fb0.get("Authorization"), "Bearer az-resp-key")
+
+        # 1. Full Chat Completions Target URI pasted directly from Azure AI Foundry portal
         target_uri = "https://my-foundry.cognitiveservices.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview"
-        url1, h1, fb1 = VisionPipeline.resolve_vlm_request_target(
+        url1, style1, h1, fb1 = VisionPipeline.resolve_vlm_request_target(
             {"base_url": target_uri, "api_key": "az-secret-key", "model": "gpt-4o", "auth_mode": "auto"}
         )
         self.assertEqual(url1, target_uri)
+        self.assertEqual(style1, "chat_completions")
         self.assertEqual(h1.get("api-key"), "az-secret-key")
         self.assertEqual(fb1.get("Authorization"), "Bearer az-secret-key")
 
         # 2. Azure OpenAI resource root
-        url2, h2, _ = VisionPipeline.resolve_vlm_request_target(
+        url2, style2, h2, _ = VisionPipeline.resolve_vlm_request_target(
             {
                 "base_url": "https://demo-res.openai.azure.com/",
                 "api_key": "k2",
@@ -79,10 +97,11 @@ class CommunityParkingSystemTests(unittest.TestCase):
             url2,
             "https://demo-res.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2024-12-01-preview",
         )
+        self.assertEqual(style2, "chat_completions")
         self.assertEqual(h2.get("api-key"), "k2")
 
         # 3. Azure AI Foundry Serverless /models endpoint
-        url3, h3, _ = VisionPipeline.resolve_vlm_request_target(
+        url3, style3, h3, _ = VisionPipeline.resolve_vlm_request_target(
             {
                 "base_url": "https://proj-eastus.services.ai.azure.com/models",
                 "api_key": "k3",
@@ -94,6 +113,7 @@ class CommunityParkingSystemTests(unittest.TestCase):
             url3,
             "https://proj-eastus.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview",
         )
+        self.assertEqual(style3, "chat_completions")
         self.assertEqual(h3.get("api-key"), "k3")
 
     def test_dual_frame_debounce_filters_passing_car(self) -> None:

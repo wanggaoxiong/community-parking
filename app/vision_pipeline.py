@@ -399,30 +399,51 @@ class VisionPipeline:
         }
 
     @staticmethod
-    def resolve_vlm_request_target(vlm_cfg: Dict[str, Any]) -> Tuple[str, Dict[str, str], Dict[str, str]]:
+    def resolve_vlm_request_target(
+        vlm_cfg: Dict[str, Any],
+    ) -> Tuple[str, str, Dict[str, str], Dict[str, str]]:
         """
-        Smart URL & Auth resolver supporting Azure AI Foundry (Target URI, Azure OpenAI
-        deployments, Azure AI Services /models, OpenAI v1) and standard OpenAI-compatible APIs.
-        Returns (resolved_url, primary_headers, fallback_headers).
+        Smart URL, API-protocol & Auth resolver supporting:
+          1) Azure AI Foundry / OpenAI Responses API (`/openai/responses?...` or `/v1/responses`)
+          2) Azure AI Foundry Chat Completions Target URI (`/deployments/.../chat/completions?...`)
+          3) Azure OpenAI / Cognitive Services resource root (`*.openai.azure.com`, `*.cognitiveservices.azure.com`)
+          4) Azure AI Services `/models` (`*.services.ai.azure.com`) and standard OpenAI `/v1`.
+
+        Returns (resolved_url, api_style, primary_headers, fallback_headers)
+        where api_style is "responses" or "chat_completions".
         """
         raw_url = str(vlm_cfg.get("base_url", "")).strip()
         model = str(vlm_cfg.get("model", "gpt-4o")).strip()
-        api_ver = str(vlm_cfg.get("api_version", "") or "2024-12-01-preview").strip()
+        api_ver = str(vlm_cfg.get("api_version", "") or "2025-04-01-preview").strip()
         api_key = str(vlm_cfg.get("api_key", "")).strip()
         auth_mode = str(vlm_cfg.get("auth_mode", "auto")).strip().lower()
 
         base = raw_url.rstrip("/")
-        lower = base.lower()
+        lower = raw_url.lower()
+        api_style = "chat_completions"
 
-        if "/chat/completions" in lower:
-            resolved_url = raw_url.strip()
+        if "/responses" in lower:
+            api_style = "responses"
+            if "?" in raw_url or "/v1/responses" in lower or ".azure.com" not in lower:
+                resolved_url = raw_url
+            else:
+                resolved_url = f"{base}?api-version={api_ver}"
+        elif "/chat/completions" in lower:
+            if "?" in raw_url or "/v1/" in lower or ".azure.com" not in lower:
+                resolved_url = raw_url
+            else:
+                resolved_url = f"{base}?api-version={api_ver}"
         elif (".openai.azure.com" in lower or ".cognitiveservices.azure.com" in lower) and "/v1" not in lower:
-            if "/openai/deployments/" in lower:
+            if "?" in raw_url:
+                path_part, query_part = raw_url.split("?", 1)
+                path_part = path_part.rstrip("/")
+                resolved_url = f"{path_part}/openai/deployments/{model}/chat/completions?{query_part}"
+            elif "/openai/deployments/" in lower:
                 resolved_url = f"{base}/chat/completions?api-version={api_ver}"
             else:
                 resolved_url = f"{base}/openai/deployments/{model}/chat/completions?api-version={api_ver}"
         elif ".services.ai.azure.com" in lower and "/v1" not in lower:
-            if lower.endswith("/models"):
+            if base.lower().endswith("/models"):
                 resolved_url = f"{base}/chat/completions?api-version={api_ver}"
             else:
                 resolved_url = f"{base}/models/chat/completions?api-version={api_ver}"
@@ -446,23 +467,75 @@ class VisionPipeline:
                 primary_h["Authorization"] = f"Bearer {api_key}"
                 fallback_h["api-key"] = api_key
 
-        return resolved_url, primary_h, fallback_h
+        return resolved_url, api_style, primary_h, fallback_h
+
+    @staticmethod
+    def _extract_responses_api_text(data: Dict[str, Any]) -> str:
+        if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+            return data["output_text"].strip()
+        chunks: List[str] = []
+        for item in data.get("output", []) or []:
+            if not isinstance(item, dict):
+                continue
+            for part in item.get("content", []) or []:
+                if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                    txt = part.get("text", "")
+                    if txt:
+                        chunks.append(str(txt))
+        if chunks:
+            return "\n".join(chunks).strip()
+        if "choices" in data and data["choices"]:
+            return str(data["choices"][0]["message"]["content"]).strip()
+        return ""
 
     def _post_vlm_completions(
-        self, vlm_cfg: Dict[str, Any], messages: List[Dict[str, Any]], max_tokens: int = 200
+        self,
+        vlm_cfg: Dict[str, Any],
+        prompt_text: str,
+        image_data_uri: str,
+        max_tokens: int = 240,
     ) -> Tuple[Optional[str], Optional[str], str]:
-        url, primary_headers, fallback_headers = self.resolve_vlm_request_target(vlm_cfg)
+        url, api_style, primary_headers, fallback_headers = self.resolve_vlm_request_target(vlm_cfg)
         if not vlm_cfg.get("base_url", "").strip():
             return None, "未填写 Endpoint / Target URI", url
 
-        timeout = float(vlm_cfg.get("timeout_seconds", 25))
+        timeout = float(vlm_cfg.get("timeout_seconds", 30))
         model_name = str(vlm_cfg.get("model", "gpt-4o")).strip()
-        payload: Dict[str, Any] = {
-            "model": model_name,
-            "temperature": 0.1,
-            "max_tokens": max_tokens,
-            "messages": messages,
-        }
+
+        if api_style == "responses":
+            payload: Dict[str, Any] = {
+                "model": model_name,
+                "reasoning": {"effort": "low"},
+                "max_output_tokens": max(max_tokens, 1024),
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt_text},
+                            {
+                                "type": "input_image",
+                                "image_url": image_data_uri,
+                                "detail": "auto",
+                            },
+                        ],
+                    }
+                ],
+            }
+        else:
+            payload = {
+                "model": model_name,
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": image_data_uri}},
+                        ],
+                    }
+                ],
+            }
 
         try:
             resp = requests.post(url, headers=primary_headers, json=payload, timeout=timeout)
@@ -472,26 +545,39 @@ class VisionPipeline:
             else:
                 active_headers = primary_headers
 
-            # Reasoning / newer Foundry models (o-series / gpt-5 / gpt-4.1) compatibility retry
-            if resp.status_code == 400 and (
-                "max_tokens" in resp.text or "temperature" in resp.text
-            ):
-                compat_payload = {
-                    "model": model_name,
-                    "max_completion_tokens": max(max_tokens, 512),
-                    "messages": messages,
-                }
-                resp = requests.post(url, headers=active_headers, json=compat_payload, timeout=timeout)
+            # Compatibility retry:
+            # - For Responses API if a non-reasoning model rejects `reasoning`
+            # - For Chat Completions if a reasoning model rejects `max_tokens` or `temperature`
+            if resp.status_code == 400:
+                err_txt = resp.text
+                if api_style == "responses" and "reasoning" in err_txt:
+                    compat_payload = dict(payload)
+                    compat_payload.pop("reasoning", None)
+                    resp = requests.post(url, headers=active_headers, json=compat_payload, timeout=timeout)
+                elif api_style == "chat_completions" and (
+                    "max_tokens" in err_txt or "temperature" in err_txt
+                ):
+                    compat_payload = {
+                        "model": model_name,
+                        "max_completion_tokens": max(max_tokens, 1024),
+                        "messages": payload["messages"],
+                    }
+                    resp = requests.post(url, headers=active_headers, json=compat_payload, timeout=timeout)
 
             if not resp.ok:
-                snippet = resp.text[:160].replace("\n", " ")
+                snippet = resp.text[:200].replace("\n", " ")
                 return None, f"HTTP {resp.status_code}: {snippet}", url
 
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            return str(content), None, url
+            if api_style == "responses":
+                content = self._extract_responses_api_text(data)
+            else:
+                content = str(data["choices"][0]["message"]["content"])
+            if not content:
+                return None, "模型返回成功但文本内容为空", url
+            return content, None, url
         except Exception as exc:
-            return None, str(exc)[:140], url
+            return None, str(exc)[:160], url
 
     def test_vlm_connection(self, override_vlm_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Send a tiny synthetic 64x64 parking spot image to verify Azure Foundry / VLM connectivity."""
@@ -510,19 +596,10 @@ class VisionPipeline:
         ok, buf = cv2.imencode(".jpg", sample, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         b64 = base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": '连通性测试：这是一张灰色空车位示意图，请仅回复 JSON: {"status":"FREE","ok":true}',
-                    },
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                ],
-            }
-        ]
-        reply, err, resolved_url = self._post_vlm_completions(cfg, messages, max_tokens=80)
+        prompt_text = '连通性测试：这是一张灰色空车位示意图，请仅回复 JSON: {"status":"FREE","ok":true}'
+        reply, err, resolved_url = self._post_vlm_completions(
+            cfg, prompt_text, f"data:image/jpeg;base64,{b64}", max_tokens=120
+        )
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         if err:
             return {
@@ -571,20 +648,9 @@ class VisionPipeline:
                 '仅输出严格 JSON：{"status":"FREE"|"OCCUPIED"|"BLOCKED", "confidence":0.0到1.0, "reason":"不超过18字中文说明"}'
             )
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_jpg}"},
-                    },
-                ],
-            }
-        ]
-
-        content, err, _ = self._post_vlm_completions(vlm_cfg, messages, max_tokens=200)
+        content, err, _ = self._post_vlm_completions(
+            vlm_cfg, prompt, f"data:image/jpeg;base64,{b64_jpg}", max_tokens=240
+        )
         if err or not content:
             return None, err
 

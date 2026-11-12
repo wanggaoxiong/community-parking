@@ -135,7 +135,14 @@ class SpotStateMachine:
                     "note": f"双帧防抖确认通过 ({elapsed:.1f}s >= {debounce_seconds:.1f}s): {cur_status} -> {observed_status}",
                 }
             else:
-                self.db.update_spot_state(spot["spot_id"], {"last_seen_at": ts})
+                self.db.update_spot_state(
+                    spot["spot_id"],
+                    {
+                        "last_seen_at": ts,
+                        "last_reason": f"待复核({observed_status}): {reason}",
+                        "last_engine": engine,
+                    },
+                )
                 remain = max(0.0, debounce_seconds - elapsed)
                 return {
                     "spot_id": spot["spot_id"],
@@ -156,6 +163,8 @@ class SpotStateMachine:
                 "pending_free_units": observed_free_units,
                 "pending_since": ts,
                 "confidence": round(confidence, 3),
+                "last_reason": f"待复核({observed_status}): {reason}",
+                "last_engine": engine,
                 "last_seen_at": ts,
             },
         )

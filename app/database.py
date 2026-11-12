@@ -7,6 +7,24 @@ from typing import Any, Dict, List, Optional
 from app.config import DB_PATH
 
 
+DEFAULT_SITE_MAP_TOPOLOGY: Dict[str, Any] = {
+    "gates": [
+        {"gate_id": "south", "name": "南门入口", "x": 47.0, "y": 96.5, "w": 14.0, "h": 4.2},
+        {"gate_id": "east", "name": "东门", "x": 96.2, "y": 52.0, "w": 5.5, "h": 12.0},
+    ],
+    "roads": [
+        {
+            "name": "小区内部主环路",
+            "points": [[8.0, 83.0], [88.0, 83.0], [88.0, 22.0], [12.0, 22.0]],
+            "width": 6.2,
+        }
+    ],
+    "greens": [
+        {"name": "中心景观花园", "x": 42.0, "y": 34.0, "w": 20.0, "h": 11.0}
+    ],
+}
+
+
 class Database:
     def __init__(self, db_path: str = str(DB_PATH)) -> None:
         self.db_path = db_path
@@ -86,6 +104,16 @@ class Database:
                     last_seen_at REAL,
                     ref_free_sig_b64 TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS site_map (
+                    map_id TEXT PRIMARY KEY,
+                    source_type TEXT NOT NULL DEFAULT 'seed',
+                    backdrop_jpeg_b64 TEXT,
+                    aspect_ratio REAL NOT NULL DEFAULT 1.0,
+                    topology_json TEXT NOT NULL DEFAULT '{}',
+                    meta_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL
+                );
                 """
             )
             self._ensure_migrations(conn)
@@ -105,6 +133,22 @@ class Database:
         if "ref_free_sig_b64" not in spot_cols:
             conn.execute("ALTER TABLE spots ADD COLUMN ref_free_sig_b64 TEXT")
 
+        zone_cols = {r["name"] for r in conn.execute("PRAGMA table_info(zones)").fetchall()}
+        for col_name, col_def in (
+            ("layout_angle", "REAL NOT NULL DEFAULT 0"),
+            ("is_demo_seed", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if col_name not in zone_cols:
+                conn.execute(f"ALTER TABLE zones ADD COLUMN {col_name} {col_def}")
+
+        unit_cols = {r["name"] for r in conn.execute("PRAGMA table_info(units)").fetchall()}
+        for col_name, col_def in (
+            ("map_w", "REAL NOT NULL DEFAULT 12.4"),
+            ("map_h", "REAL NOT NULL DEFAULT 6.8"),
+        ):
+            if col_name not in unit_cols:
+                conn.execute(f"ALTER TABLE units ADD COLUMN {col_name} {col_def}")
+
     def _seed_if_empty(self) -> None:
         with self._lock, self._connect() as conn:
             cnt = conn.execute("SELECT COUNT(*) FROM zones").fetchone()[0]
@@ -121,7 +165,8 @@ class Database:
                 ("6-1", "6号楼1单元（近东门）", "east", 74, 28),
             ]
             conn.executemany(
-                "INSERT INTO units VALUES (?, ?, ?, ?, ?)", units
+                "INSERT INTO units (unit_id, name, default_gate, map_x, map_y) VALUES (?, ?, ?, ?, ?)",
+                units,
             )
 
             zones = [
@@ -131,7 +176,12 @@ class Database:
                 ("Z_BLDG6_STRIP", "6号楼西侧无划线弹性带", 8.0, "east,south", 68, 40, 14, 34, "18米老旧路侧无划线带，支持弹性测算"),
             ]
             conn.executemany(
-                "INSERT INTO zones VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", zones
+                """
+                INSERT INTO zones (
+                    zone_id, name, dead_end_penalty, gate_access, map_x, map_y, map_w, map_h, description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                zones,
             )
 
             # Walking distance matrix (meters)
@@ -513,9 +563,247 @@ class Database:
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE spots SET {cols} WHERE spot_id = ?", vals)
 
+    def get_site_map(self, include_backdrop: bool = True) -> Dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM site_map WHERE map_id = 'default'"
+            ).fetchone()
+            if not row:
+                return {
+                    "map_id": "default",
+                    "source_type": "seed",
+                    "has_backdrop": False,
+                    "backdrop_jpeg_b64": "" if include_backdrop else None,
+                    "aspect_ratio": 1.45,
+                    "topology": json.loads(json.dumps(DEFAULT_SITE_MAP_TOPOLOGY)),
+                    "meta": {
+                        "scene_summary": "默认零实景矢量平面图（支持上传小区平面图自动生成）",
+                        "estimated_span_meters": 185.0,
+                    },
+                    "updated_at": 0.0,
+                }
+            d = dict(row)
+            has_bg = bool(d.get("backdrop_jpeg_b64"))
+            try:
+                topology = json.loads(d.get("topology_json") or "{}")
+            except Exception:
+                topology = {}
+            if not topology.get("gates") and not topology.get("roads"):
+                topology = json.loads(json.dumps(DEFAULT_SITE_MAP_TOPOLOGY))
+            try:
+                meta = json.loads(d.get("meta_json") or "{}")
+            except Exception:
+                meta = {}
+            return {
+                "map_id": d["map_id"],
+                "source_type": d.get("source_type", "custom"),
+                "has_backdrop": has_bg,
+                "backdrop_jpeg_b64": (d.get("backdrop_jpeg_b64") or "") if include_backdrop else None,
+                "aspect_ratio": float(d.get("aspect_ratio") or 1.45),
+                "topology": topology,
+                "meta": meta,
+                "updated_at": float(d.get("updated_at") or 0.0),
+            }
+
+    def save_site_map(
+        self,
+        source_type: str,
+        backdrop_jpeg_b64: Optional[str],
+        aspect_ratio: float,
+        topology: Dict[str, Any],
+        meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        now = time.time()
+        aspect = max(0.65, min(2.6, float(aspect_ratio or 1.45)))
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT backdrop_jpeg_b64 FROM site_map WHERE map_id = 'default'"
+            ).fetchone()
+            final_bg = (
+                backdrop_jpeg_b64
+                if backdrop_jpeg_b64 is not None
+                else (existing["backdrop_jpeg_b64"] if existing else "")
+            )
+            conn.execute(
+                """
+                INSERT INTO site_map (
+                    map_id, source_type, backdrop_jpeg_b64, aspect_ratio, topology_json, meta_json, updated_at
+                ) VALUES ('default', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(map_id) DO UPDATE SET
+                    source_type = excluded.source_type,
+                    backdrop_jpeg_b64 = excluded.backdrop_jpeg_b64,
+                    aspect_ratio = excluded.aspect_ratio,
+                    topology_json = excluded.topology_json,
+                    meta_json = excluded.meta_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    source_type,
+                    final_bg,
+                    aspect,
+                    json.dumps(topology, ensure_ascii=False),
+                    json.dumps(meta, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return self.get_site_map(include_backdrop=False)
+
+    def recompute_unit_zone_distances(self, span_meters: Optional[float] = None) -> None:
+        with self._lock, self._connect() as conn:
+            if span_meters is None:
+                smap = self.get_site_map(include_backdrop=False)
+                span_meters = float(
+                    (smap.get("meta") or {}).get("estimated_span_meters") or 185.0
+                )
+            span_m = max(60.0, min(600.0, float(span_meters)))
+            m_per_unit = span_m / 100.0
+
+            units = [dict(r) for r in conn.execute("SELECT * FROM units").fetchall()]
+            zones = [dict(r) for r in conn.execute("SELECT * FROM zones").fetchall()]
+            if not units or not zones:
+                return
+
+            pairs = []
+            for u in units:
+                ux = float(u["map_x"])
+                uy = float(u["map_y"])
+                for z in zones:
+                    zx0 = float(z["map_x"])
+                    zy0 = float(z["map_y"])
+                    zx1 = zx0 + max(2.0, float(z["map_w"]))
+                    zy1 = zy0 + max(2.0, float(z["map_h"]))
+                    # Distance from building entrance to nearest edge of parking zone box
+                    nx = min(max(ux, zx0), zx1)
+                    ny = min(max(uy, zy0), zy1)
+                    dx = abs(ux - nx)
+                    dy = abs(uy - ny)
+                    euclid = (dx * dx + dy * dy) ** 0.5
+                    manhattan = dx + dy
+                    blended_units = 0.65 * euclid + 0.35 * manhattan
+                    walk_m = round(max(12.0, 8.0 + blended_units * m_per_unit * 1.15), 1)
+                    pairs.append((u["unit_id"], z["zone_id"], walk_m))
+
+            conn.execute("DELETE FROM unit_zone_dist")
+            conn.executemany(
+                "INSERT INTO unit_zone_dist (unit_id, zone_id, walk_meters) VALUES (?, ?, ?)",
+                pairs,
+            )
+
+    def apply_sitemap_layout(
+        self,
+        zones_payload: Optional[List[Dict[str, Any]]] = None,
+        units_payload: Optional[List[Dict[str, Any]]] = None,
+        topology_patch: Optional[Dict[str, Any]] = None,
+        span_meters: Optional[float] = None,
+        replace_units: bool = False,
+    ) -> Dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            if zones_payload:
+                existing_zones = {
+                    r["zone_id"]: dict(r)
+                    for r in conn.execute("SELECT * FROM zones").fetchall()
+                }
+                for zp in zones_payload:
+                    zid = str(zp["zone_id"]).strip()
+                    if not zid:
+                        continue
+                    cur = existing_zones.get(zid)
+                    mx = round(max(0.5, min(96.0, float(zp.get("map_x", cur["map_x"] if cur else 20.0)))), 2)
+                    my = round(max(0.5, min(96.0, float(zp.get("map_y", cur["map_y"] if cur else 20.0)))), 2)
+                    mw = round(max(6.0, min(98.0 - mx, float(zp.get("map_w", cur["map_w"] if cur else 24.0)))), 2)
+                    mh = round(max(5.0, min(98.0 - my, float(zp.get("map_h", cur["map_h"] if cur else 10.0)))), 2)
+                    angle = round(max(-85.0, min(85.0, float(zp.get("layout_angle", cur["layout_angle"] if cur else 0.0)))), 1)
+                    name = str(zp.get("name") or (cur["name"] if cur else zid)).strip()
+                    dead_end = float(zp.get("dead_end_penalty", cur["dead_end_penalty"] if cur else 0.0))
+                    gate_acc = str(zp.get("gate_access") or (cur["gate_access"] if cur else "south,east"))
+                    desc = str(zp.get("description") if zp.get("description") is not None else (cur["description"] if cur else ""))
+                    is_demo = int(zp.get("is_demo_seed", 0))
+
+                    if cur:
+                        conn.execute(
+                            """
+                            UPDATE zones
+                            SET name = ?, dead_end_penalty = ?, gate_access = ?,
+                                map_x = ?, map_y = ?, map_w = ?, map_h = ?,
+                                description = ?, layout_angle = ?, is_demo_seed = ?
+                            WHERE zone_id = ?
+                            """,
+                            (name, dead_end, gate_acc, mx, my, mw, mh, desc, angle, is_demo, zid),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO zones (
+                                zone_id, name, dead_end_penalty, gate_access,
+                                map_x, map_y, map_w, map_h, description, layout_angle, is_demo_seed
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (zid, name, dead_end, gate_acc, mx, my, mw, mh, desc, angle, is_demo),
+                        )
+
+            if units_payload:
+                if replace_units:
+                    conn.execute("DELETE FROM units")
+                existing_units = {
+                    r["unit_id"]: dict(r)
+                    for r in conn.execute("SELECT * FROM units").fetchall()
+                }
+                for up in units_payload:
+                    uid = str(up["unit_id"]).strip()
+                    if not uid:
+                        continue
+                    cur_u = existing_units.get(uid)
+                    ux = round(max(3.0, min(97.0, float(up.get("map_x", cur_u["map_x"] if cur_u else 50.0)))), 2)
+                    uy = round(max(3.0, min(97.0, float(up.get("map_y", cur_u["map_y"] if cur_u else 50.0)))), 2)
+                    uw = round(max(6.0, min(28.0, float(up.get("map_w", cur_u["map_w"] if cur_u else 12.4)))), 2)
+                    uh = round(max(4.5, min(20.0, float(up.get("map_h", cur_u["map_h"] if cur_u else 6.8)))), 2)
+                    uname = str(up.get("name") or (cur_u["name"] if cur_u else f"{uid}号楼")).strip()
+                    ugate = str(up.get("default_gate") or (cur_u["default_gate"] if cur_u else "south"))
+                    if cur_u and not replace_units:
+                        conn.execute(
+                            """
+                            UPDATE units
+                            SET name = ?, default_gate = ?, map_x = ?, map_y = ?, map_w = ?, map_h = ?
+                            WHERE unit_id = ?
+                            """,
+                            (uname, ugate, ux, uy, uw, uh, uid),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO units (
+                                unit_id, name, default_gate, map_x, map_y, map_w, map_h
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (uid, uname, ugate, ux, uy, uw, uh),
+                        )
+
+            if topology_patch:
+                cur_map = self.get_site_map(include_backdrop=True)
+                merged_topo = dict(cur_map["topology"])
+                for k in ("gates", "roads", "greens"):
+                    if k in topology_patch and isinstance(topology_patch[k], list):
+                        merged_topo[k] = topology_patch[k]
+                meta = dict(cur_map.get("meta") or {})
+                meta["layout_tuned_at"] = time.time()
+                self.save_site_map(
+                    source_type=cur_map["source_type"] if cur_map["source_type"] != "seed" else "manual_tuned",
+                    backdrop_jpeg_b64=None,
+                    aspect_ratio=cur_map["aspect_ratio"],
+                    topology=merged_topo,
+                    meta=meta,
+                )
+
+        self.recompute_unit_zone_distances(span_meters=span_meters)
+        return {
+            "zones": self.list_zones(),
+            "units": self.list_units(),
+            "site_map": self.get_site_map(include_backdrop=False),
+        }
+
     def reset_seed_data(self) -> None:
         with self._lock, self._connect() as conn:
-            for tbl in ("spots", "cameras", "unit_zone_dist", "zones", "units"):
+            for tbl in ("spots", "cameras", "unit_zone_dist", "zones", "units", "site_map"):
                 conn.execute(f"DELETE FROM {tbl}")
         self._seed_if_empty()
 

@@ -7,6 +7,9 @@ from app.config import config_manager
 from app.database import Database
 
 
+MAX_SOFT_LOCKS = 200
+
+
 class ParkingRecommender:
     """
     Zone-based parking recommendation engine with In-Transit Soft Locks (TTL=180s).
@@ -373,6 +376,9 @@ class ParkingRecommender:
                 "expires_at": ts + ttl,
             }
             with self._lock:
+                self._purge_expired(ts)
+                if len(self._soft_locks) >= MAX_SOFT_LOCKS:
+                    del self._soft_locks[: len(self._soft_locks) - MAX_SOFT_LOCKS + 1]
                 self._soft_locks.append(lock_created)
             primary["effective_free_after_lock"] = max(0, primary["effective_free"] - 1)
 

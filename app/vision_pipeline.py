@@ -1,9 +1,11 @@
 import base64
+from collections import OrderedDict
+from contextlib import contextmanager
 import json
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -13,6 +15,10 @@ from app.config import config_manager
 from app.database import Database
 from app.homography import extract_spot_patch
 from app.state_machine import SpotStateMachine
+
+MAX_SIGNATURE_CACHE_ENTRIES = 512  # 512 * (32x32 uint8 = 1KB) = 512 KB hard cap
+MAX_CONCURRENT_IMAGE_DECODES = 3   # Prevent concurrent high-res decodes from spiking RAM
+MAX_DECODE_LONG_EDGE = 2560        # Downscale ultra-high-res frames immediately in RAM
 
 
 class VisionPipeline:
@@ -27,19 +33,87 @@ class VisionPipeline:
          cases, obstacle semantics (`BLOCKED`), or elastic parallel parking strips.
     """
 
-    def __init__(self, database: Database, fsm: SpotStateMachine) -> None:
+    def __init__(
+        self,
+        database: Database,
+        fsm: SpotStateMachine,
+        max_signature_entries: int = MAX_SIGNATURE_CACHE_ENTRIES,
+        max_concurrent_decodes: int = MAX_CONCURRENT_IMAGE_DECODES,
+    ) -> None:
         self.db = database
         self.fsm = fsm
         self._lock = threading.RLock()
-        # Only stores tiny 32x32 grayscale structural signatures (1KB, non-identifiable)
-        self._prev_signatures: Dict[str, np.ndarray] = {}
-        self.privacy_stats: Dict[str, int] = {
+        self.max_signature_entries = max(16, int(max_signature_entries))
+        self.max_concurrent_decodes = max(1, int(max_concurrent_decodes))
+        self._decode_semaphore = threading.BoundedSemaphore(self.max_concurrent_decodes)
+        self._active_decodes = 0
+        # Bounded LRU OrderedDict storing only 32x32 grayscale structural signatures (1KB each)
+        self._prev_signatures: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self.privacy_stats: Dict[str, Any] = {
             "frames_processed_in_ram": 0,
+            "frames_destroyed_in_ram": 0,
             "raw_images_written_to_disk": 0,
             "spots_skipped_by_framediff": 0,
             "fast_lane_inferences": 0,
             "slow_lane_vlm_calls": 0,
+            "signature_cache_entries": 0,
+            "signature_cache_max_entries": self.max_signature_entries,
+            "signature_cache_kb": 0.0,
+            "max_signature_cache_kb": round(self.max_signature_entries * 1.0, 1),
+            "active_decodes": 0,
+            "max_concurrent_decodes": self.max_concurrent_decodes,
         }
+
+    def _sync_memory_stats_locked(self) -> None:
+        total_bytes = sum(int(arr.nbytes) for arr in self._prev_signatures.values())
+        self.privacy_stats["frames_destroyed_in_ram"] = self.privacy_stats["frames_processed_in_ram"]
+        self.privacy_stats["signature_cache_entries"] = len(self._prev_signatures)
+        self.privacy_stats["signature_cache_max_entries"] = self.max_signature_entries
+        self.privacy_stats["signature_cache_kb"] = round(total_bytes / 1024.0, 1)
+        self.privacy_stats["max_signature_cache_kb"] = round(self.max_signature_entries * 1.0, 1)
+        self.privacy_stats["active_decodes"] = self._active_decodes
+        self.privacy_stats["max_concurrent_decodes"] = self.max_concurrent_decodes
+
+    def get_privacy_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            self._sync_memory_stats_locked()
+            return dict(self.privacy_stats)
+
+    @contextmanager
+    def decode_guard(self, timeout: float = 15.0) -> Iterator[None]:
+        acquired = self._decode_semaphore.acquire(timeout=timeout)
+        if not acquired:
+            raise RuntimeError("当前并发图像解码队列繁忙，请稍后重试（内存防爆保护已生效）")
+        with self._lock:
+            self._active_decodes += 1
+            self._sync_memory_stats_locked()
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_decodes = max(0, self._active_decodes - 1)
+                self._sync_memory_stats_locked()
+            self._decode_semaphore.release()
+
+    def _get_signature_lru(self, key: str) -> Optional[np.ndarray]:
+        with self._lock:
+            sig = self._prev_signatures.get(key)
+            if sig is not None:
+                self._prev_signatures.move_to_end(key)
+            return sig
+
+    def _put_signature_lru(self, key: str, sig: np.ndarray) -> None:
+        with self._lock:
+            compact_sig = np.asarray(sig, dtype=np.uint8)
+            if compact_sig.shape != (32, 32):
+                compact_sig = cv2.resize(compact_sig, (32, 32))
+            else:
+                compact_sig = compact_sig.copy()
+            self._prev_signatures[key] = compact_sig
+            self._prev_signatures.move_to_end(key)
+            while len(self._prev_signatures) > self.max_signature_entries:
+                self._prev_signatures.popitem(last=False)
+            self._sync_memory_stats_locked()
 
     def clear_frame_cache(self, camera_id: Optional[str] = None) -> None:
         with self._lock:
@@ -49,12 +123,12 @@ class VisionPipeline:
                 prefix = f"{camera_id}::"
                 for k in [k for k in self._prev_signatures if k.startswith(prefix)]:
                     self._prev_signatures.pop(k, None)
+            self._sync_memory_stats_locked()
 
     def prime_reference_signatures(self, camera_id: str, spot_sigs: Dict[str, np.ndarray]) -> None:
-        with self._lock:
-            for spot_id, sig in spot_sigs.items():
-                if isinstance(sig, np.ndarray) and sig.shape == (32, 32):
-                    self._prev_signatures[f"{camera_id}::{spot_id}"] = sig.copy()
+        for spot_id, sig in spot_sigs.items():
+            if isinstance(sig, np.ndarray) and sig.shape == (32, 32):
+                self._put_signature_lru(f"{camera_id}::{spot_id}", sig)
 
     @staticmethod
     def _align_to_reference_template(
@@ -136,12 +210,6 @@ class VisionPipeline:
         simulated_timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        arr = np.frombuffer(raw_image_bytes, dtype=np.uint8)
-        full_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if full_img is None:
-            raise ValueError("无法解码上传的图片字节流，请确认格式为 JPG/PNG/WebP")
-
-        h_img, w_img = full_img.shape[:2]
         cfg = config_manager.get()
         now = simulated_timestamp if simulated_timestamp is not None else time.time()
 
@@ -150,29 +218,49 @@ class VisionPipeline:
             raise ValueError(f"未找到相机配置: {camera_id}")
 
         spots = self.db.list_spots(camera_id=camera_id, include_signatures=True)
-        cal_w = max(1, int(cam.get("image_width") or w_img))
-        cal_h = max(1, int(cam.get("image_height") or h_img))
-
-        full_img, tpl_align_info = self._align_to_reference_template(
-            full_img, cam.get("template_gray_b64"), cal_w, cal_h
-        )
-        h_img, w_img = full_img.shape[:2]
-        # Scale spot polygons proportionally if uploaded test image resolution differs from calibration resolution
-        sx = w_img / cal_w
-        sy = h_img / cal_h
-
         extracted_patches: List[Tuple[Dict[str, Any], np.ndarray, np.ndarray]] = []
-        for sp in spots:
-            scaled_poly = [[p[0] * sx, p[1] * sy] for p in sp["polygon"]]
-            patch, mask = extract_spot_patch(full_img, scaled_poly, spot_type=sp["spot_type"])
-            extracted_patches.append((sp, patch, mask))
 
-        # Immediately destroy raw full-frame image in RAM (Zero-Disk, Zero-Retention Privacy Guarantee)
-        del full_img
-        del arr
+        with self.decode_guard():
+            arr = np.frombuffer(raw_image_bytes, dtype=np.uint8)
+            full_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            del arr
+            if full_img is None:
+                raise ValueError("无法解码上传的图片字节流，请确认格式为 JPG/PNG/WebP")
+
+            h_raw, w_raw = full_img.shape[:2]
+            if max(h_raw, w_raw) > MAX_DECODE_LONG_EDGE:
+                cap_scale = MAX_DECODE_LONG_EDGE / float(max(h_raw, w_raw))
+                resized = cv2.resize(
+                    full_img,
+                    (max(64, int(round(w_raw * cap_scale))), max(64, int(round(h_raw * cap_scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                del full_img
+                full_img = resized
+
+            h_img, w_img = full_img.shape[:2]
+            cal_w = max(1, int(cam.get("image_width") or w_raw))
+            cal_h = max(1, int(cam.get("image_height") or h_raw))
+
+            full_img, tpl_align_info = self._align_to_reference_template(
+                full_img, cam.get("template_gray_b64"), cal_w, cal_h
+            )
+            h_img, w_img = full_img.shape[:2]
+            # Scale spot polygons proportionally if uploaded image resolution differs from calibration resolution
+            sx = w_img / cal_w
+            sy = h_img / cal_h
+
+            for sp in spots:
+                scaled_poly = [[p[0] * sx, p[1] * sy] for p in sp["polygon"]]
+                patch, mask = extract_spot_patch(full_img, scaled_poly, spot_type=sp["spot_type"])
+                extracted_patches.append((sp, patch, mask))
+
+            # Immediately destroy raw full-frame image in RAM (Zero-Disk, Zero-Retention Privacy Guarantee)
+            del full_img
 
         with self._lock:
             self.privacy_stats["frames_processed_in_ram"] += 1
+            self._sync_memory_stats_locked()
 
         self.db.record_camera_heartbeat(camera_id, ts=now)
 
@@ -189,139 +277,149 @@ class VisionPipeline:
 
         spot_reports: List[Dict[str, Any]] = []
 
-        for sp, patch, mask in extracted_patches:
-            sig_key = f"{camera_id}::{sp['spot_id']}"
-            small_gray = cv2.resize(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY), (32, 32))
-
-            with self._lock:
-                prev_sig = self._prev_signatures.get(sig_key)
-                if prev_sig is not None:
-                    diff_score = float(np.mean(np.abs(small_gray.astype(np.float32) - prev_sig.astype(np.float32))) / 255.0)
-                else:
-                    diff_score = 1.0
-
-            # Note: If spot currently has a pending debounce check waiting for confirmation, NEVER skip via framediff!
-            has_pending = sp.get("pending_status") is not None
-            if (not force_reanalyze) and (not has_pending) and diff_score < diff_thresh:
-                with self._lock:
-                    self.privacy_stats["spots_skipped_by_framediff"] += 1
-                self.db.update_spot_state(sp["spot_id"], {"last_seen_at": now})
-                spot_reports.append(
-                    {
-                        "spot_id": sp["spot_id"],
-                        "label": sp["label"],
-                        "spot_type": sp["spot_type"],
-                        "diff_score": round(diff_score, 4),
-                        "stage_used": "Stage1_FrameDiff_Skipped",
-                        "observed_status": sp["status"],
-                        "confidence": sp["confidence"],
-                        "reason": "画面静止无变化（帧差拦截跳过推理）",
-                        "fsm": {
-                            "transition": "SKIPPED_STATIC",
-                            "committed_status": sp["status"],
-                            "pending_status": None,
-                            "free_units": sp["free_units"],
-                            "occupied_units": sp["occupied_units"],
-                            "note": "帧差 < 阈值，0算力跳过",
-                        },
-                    }
-                )
-                continue
-
-            with self._lock:
-                self._prev_signatures[sig_key] = small_gray
-                self.privacy_stats["fast_lane_inferences"] += 1
-
-            # Stage 2: Fast-lane local OpenCV analysis (+ Reference Template empty-stall baseline if available)
-            ref_sig_arr: Optional[np.ndarray] = None
-            if sp.get("ref_free_sig_b64"):
+        try:
+            while extracted_patches:
+                sp, patch, mask = extracted_patches.pop(0)
                 try:
-                    raw_sig = base64.b64decode(sp["ref_free_sig_b64"])
-                    if len(raw_sig) == 1024:
-                        ref_sig_arr = np.frombuffer(raw_sig, dtype=np.uint8).reshape((32, 32))
-                except Exception:
-                    ref_sig_arr = None
+                    sig_key = f"{camera_id}::{sp['spot_id']}"
+                    small_gray = cv2.resize(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY), (32, 32))
 
-            fast_res = self._analyze_patch_fast_opencv(
-                patch,
-                mask,
-                spot_type=sp["spot_type"],
-                total_meters=float(sp["total_meters"]),
-                car_len_m=car_len_m,
-                ref_free_sig=ref_sig_arr,
-                small_gray=small_gray,
-            )
+                    prev_sig = self._get_signature_lru(sig_key)
+                    if prev_sig is not None:
+                        diff_score = float(
+                            np.mean(np.abs(small_gray.astype(np.float32) - prev_sig.astype(np.float32))) / 255.0
+                        )
+                    else:
+                        diff_score = 1.0
 
-            final_obs = fast_res
-            stage_used = "Stage2_Fast_OpenCV"
+                    # Note: If spot currently has a pending debounce check waiting for confirmation, NEVER skip via framediff!
+                    has_pending = sp.get("pending_status") is not None
+                    if (not force_reanalyze) and (not has_pending) and diff_score < diff_thresh:
+                        with self._lock:
+                            self.privacy_stats["spots_skipped_by_framediff"] += 1
+                        self.db.update_spot_state(sp["spot_id"], {"last_seen_at": now})
+                        spot_reports.append(
+                            {
+                                "spot_id": sp["spot_id"],
+                                "label": sp["label"],
+                                "spot_type": sp["spot_type"],
+                                "diff_score": round(diff_score, 4),
+                                "stage_used": "Stage1_FrameDiff_Skipped",
+                                "observed_status": sp["status"],
+                                "confidence": sp["confidence"],
+                                "reason": "画面静止无变化（帧差拦截跳过推理）",
+                                "fsm": {
+                                    "transition": "SKIPPED_STATIC",
+                                    "committed_status": sp["status"],
+                                    "effective_status": sp["status"],
+                                    "pending_status": None,
+                                    "free_units": sp["free_units"],
+                                    "effective_free_units": sp["free_units"] if sp["status"] == "FREE" else 0,
+                                    "occupied_units": sp["occupied_units"],
+                                    "note": "帧差 < 阈值，0算力跳过",
+                                },
+                            }
+                        )
+                        continue
 
-            # Stage 3: Decide whether to invoke Slow-lane Multimodal VLM (Azure AI Foundry / OpenAI-compat)
-            base_u = vlm_cfg.get("base_url", "").strip()
-            has_vlm_ready = bool(base_u) and (
-                bool(vlm_cfg.get("api_key"))
-                or "127.0.0.1" in base_u
-                or "localhost" in base_u
-            )
-            need_vlm = False
-            if vlm_mode == "always_vlm" and has_vlm_ready:
-                need_vlm = True
-            elif vlm_mode == "hybrid" and has_vlm_ready:
-                if (
-                    fast_res["confidence"] < 0.78
-                    or fast_res["status"] == "BLOCKED"
-                    or sp["spot_type"] == "elastic_strip"
-                ):
-                    need_vlm = True
+                    self._put_signature_lru(sig_key, small_gray)
+                    with self._lock:
+                        self.privacy_stats["fast_lane_inferences"] += 1
 
-            vlm_error_note = ""
-            if need_vlm:
-                vlm_res, vlm_err = self._call_slow_lane_vlm(patch, sp, vlm_cfg, car_len_m)
-                if vlm_res is not None:
-                    final_obs = vlm_res
-                    stage_used = f"Azure/VLM ({vlm_cfg.get('model', 'model')})"
-                else:
-                    vlm_error_note = f" [VLM回退: {vlm_err}]" if vlm_err else " [VLM回退]"
-                    stage_used = "Fast_OpenCV" + vlm_error_note
+                    # Stage 2: Fast-lane local OpenCV analysis (+ Reference Template empty-stall baseline if available)
+                    ref_sig_arr: Optional[np.ndarray] = None
+                    if sp.get("ref_free_sig_b64"):
+                        try:
+                            raw_sig = base64.b64decode(sp["ref_free_sig_b64"])
+                            if len(raw_sig) == 1024:
+                                ref_sig_arr = np.frombuffer(raw_sig, dtype=np.uint8).reshape((32, 32))
+                        except Exception:
+                            ref_sig_arr = None
 
-            fsm_res = self.fsm.apply_observation(
-                spot=sp,
-                observed_status=final_obs["status"],
-                observed_free_units=final_obs["free_units"],
-                observed_occupied_units=final_obs["occupied_units"],
-                confidence=final_obs["confidence"],
-                reason=final_obs["reason"],
-                engine=stage_used,
-                debounce_seconds=debounce_sec,
-                instant_confirm=instant_mode,
-                now=now,
-            )
+                    fast_res = self._analyze_patch_fast_opencv(
+                        patch,
+                        mask,
+                        spot_type=sp["spot_type"],
+                        total_meters=float(sp["total_meters"]),
+                        car_len_m=car_len_m,
+                        ref_free_sig=ref_sig_arr,
+                        small_gray=small_gray,
+                    )
 
-            # Self-learn empty reference baseline when an uncalibrated/initially-occupied spot becomes FREE
-            if (
-                sp["spot_type"] != "elastic_strip"
-                and not sp.get("ref_free_sig_b64")
-                and fsm_res["committed_status"] == "FREE"
-                and final_obs["confidence"] >= 0.88
-            ):
-                self.db.update_spot_state(
-                    sp["spot_id"],
-                    {"ref_free_sig_b64": base64.b64encode(small_gray.tobytes()).decode("ascii")},
-                )
+                    final_obs = fast_res
+                    stage_used = "Stage2_Fast_OpenCV"
 
-            spot_reports.append(
-                {
-                    "spot_id": sp["spot_id"],
-                    "label": sp["label"],
-                    "spot_type": sp["spot_type"],
-                    "diff_score": round(diff_score, 4),
-                    "stage_used": stage_used,
-                    "observed_status": final_obs["status"],
-                    "confidence": round(final_obs["confidence"], 3),
-                    "reason": final_obs["reason"],
-                    "metrics": fast_res.get("metrics", {}),
-                    "fsm": fsm_res,
-                }
-            )
+                    # Stage 3: Decide whether to invoke Slow-lane Multimodal VLM (Azure AI Foundry / OpenAI-compat)
+                    base_u = vlm_cfg.get("base_url", "").strip()
+                    has_vlm_ready = bool(base_u) and (
+                        bool(vlm_cfg.get("api_key"))
+                        or "127.0.0.1" in base_u
+                        or "localhost" in base_u
+                    )
+                    need_vlm = False
+                    if vlm_mode == "always_vlm" and has_vlm_ready:
+                        need_vlm = True
+                    elif vlm_mode == "hybrid" and has_vlm_ready:
+                        if (
+                            fast_res["confidence"] < 0.78
+                            or fast_res["status"] == "BLOCKED"
+                            or sp["spot_type"] == "elastic_strip"
+                        ):
+                            need_vlm = True
+
+                    if need_vlm:
+                        vlm_res, vlm_err = self._call_slow_lane_vlm(patch, sp, vlm_cfg, car_len_m)
+                        if vlm_res is not None:
+                            final_obs = vlm_res
+                            stage_used = f"Azure/VLM ({vlm_cfg.get('model', 'model')})"
+                        else:
+                            vlm_error_note = f" [VLM回退: {vlm_err}]" if vlm_err else " [VLM回退]"
+                            stage_used = "Fast_OpenCV" + vlm_error_note
+
+                    fsm_res = self.fsm.apply_observation(
+                        spot=sp,
+                        observed_status=final_obs["status"],
+                        observed_free_units=final_obs["free_units"],
+                        observed_occupied_units=final_obs["occupied_units"],
+                        confidence=final_obs["confidence"],
+                        reason=final_obs["reason"],
+                        engine=stage_used,
+                        debounce_seconds=debounce_sec,
+                        instant_confirm=instant_mode,
+                        now=now,
+                    )
+
+                    # Self-learn empty reference baseline when an uncalibrated/initially-occupied spot becomes FREE
+                    if (
+                        sp["spot_type"] != "elastic_strip"
+                        and not sp.get("ref_free_sig_b64")
+                        and fsm_res["committed_status"] == "FREE"
+                        and final_obs["confidence"] >= 0.88
+                    ):
+                        self.db.update_spot_state(
+                            sp["spot_id"],
+                            {"ref_free_sig_b64": base64.b64encode(small_gray.tobytes()).decode("ascii")},
+                        )
+
+                    spot_reports.append(
+                        {
+                            "spot_id": sp["spot_id"],
+                            "label": sp["label"],
+                            "spot_type": sp["spot_type"],
+                            "diff_score": round(diff_score, 4),
+                            "stage_used": stage_used,
+                            "observed_status": final_obs["status"],
+                            "confidence": round(final_obs["confidence"], 3),
+                            "reason": final_obs["reason"],
+                            "metrics": fast_res.get("metrics", {}),
+                            "fsm": fsm_res,
+                        }
+                    )
+                finally:
+                    del patch
+                    del mask
+        finally:
+            extracted_patches.clear()
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         return {

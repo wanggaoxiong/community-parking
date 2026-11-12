@@ -20,6 +20,34 @@ class SpotStateMachine:
     def __init__(self, database: Database) -> None:
         self.db = database
 
+    @staticmethod
+    def compute_pessimistic_effective(
+        committed_status: str,
+        committed_free: int,
+        spot_type: str,
+        pending_status: Optional[str],
+        pending_free: Optional[int],
+    ) -> tuple[str, int]:
+        """
+        Pessimistic net-free rule ("宁少勿多，绝不虚报空位"):
+        - FREE + pending(OCCUPIED / BLOCKED) immediately withholds free capacity.
+        - OCCUPIED/BLOCKED + pending(FREE) keeps 0 free until debounce confirms.
+        """
+        if committed_status == "FREE":
+            if spot_type == "elastic_strip":
+                eff_free = int(committed_free)
+                if pending_free is not None:
+                    eff_free = min(eff_free, max(0, int(pending_free)))
+                if pending_status == "BLOCKED":
+                    return "BLOCKED", 0
+                if eff_free <= 0 and pending_status == "OCCUPIED":
+                    return "OCCUPIED", 0
+                return ("FREE" if eff_free > 0 else "OCCUPIED"), eff_free
+            if pending_status in ("OCCUPIED", "BLOCKED"):
+                return pending_status, 0
+            return "FREE", int(committed_free)
+        return committed_status, 0
+
     def apply_observation(
         self,
         spot: Dict[str, Any],
@@ -65,8 +93,10 @@ class SpotStateMachine:
                 "transition": "REVERTED_TRANSIENT" if had_pending else "STABLE",
                 "previous_status": cur_status,
                 "committed_status": cur_status,
+                "effective_status": cur_status,
                 "pending_status": None,
                 "free_units": cur_free,
+                "effective_free_units": cur_free if cur_status == "FREE" else 0,
                 "occupied_units": int(spot["occupied_units"]),
                 "note": "复核恢复原状态（已过滤瞬态过路车干扰）" if had_pending else "状态稳定维持",
             }
@@ -94,8 +124,10 @@ class SpotStateMachine:
                 "transition": "COMMITTED_IMMEDIATE",
                 "previous_status": cur_status,
                 "committed_status": observed_status,
+                "effective_status": observed_status,
                 "pending_status": None,
                 "free_units": observed_free_units,
+                "effective_free_units": observed_free_units if observed_status == "FREE" else 0,
                 "occupied_units": observed_occupied_units,
                 "note": f"状态直接更新: {cur_status} -> {observed_status}",
             }
@@ -129,8 +161,10 @@ class SpotStateMachine:
                     "transition": "COMMITTED_DEBOUNCED",
                     "previous_status": cur_status,
                     "committed_status": observed_status,
+                    "effective_status": observed_status,
                     "pending_status": None,
                     "free_units": observed_free_units,
+                    "effective_free_units": observed_free_units if observed_status == "FREE" else 0,
                     "occupied_units": observed_occupied_units,
                     "note": f"双帧防抖确认通过 ({elapsed:.1f}s >= {debounce_seconds:.1f}s): {cur_status} -> {observed_status}",
                 }
@@ -144,15 +178,20 @@ class SpotStateMachine:
                     },
                 )
                 remain = max(0.0, debounce_seconds - elapsed)
+                eff_st, eff_fu = self.compute_pessimistic_effective(
+                    cur_status, cur_free, spot["spot_type"], observed_status, observed_free_units
+                )
                 return {
                     "spot_id": spot["spot_id"],
                     "transition": "WAITING_DEBOUNCE",
                     "previous_status": cur_status,
                     "committed_status": cur_status,
+                    "effective_status": eff_st,
                     "pending_status": observed_status,
                     "free_units": cur_free,
+                    "effective_free_units": eff_fu,
                     "occupied_units": int(spot["occupied_units"]),
-                    "note": f"防抖观察中（还需 {remain:.1f}s 后复核帧确认）",
+                    "note": f"防抖观察中（已按悲观策略预扣/冻结空位，还需 {remain:.1f}s 复核确认）",
                 }
 
         # Case 4: First frame showing a new state -> enter PENDING!
@@ -168,15 +207,20 @@ class SpotStateMachine:
                 "last_seen_at": ts,
             },
         )
+        eff_st, eff_fu = self.compute_pessimistic_effective(
+            cur_status, cur_free, spot["spot_type"], observed_status, observed_free_units
+        )
         return {
             "spot_id": spot["spot_id"],
             "transition": "ENTERED_PENDING",
             "previous_status": cur_status,
             "committed_status": cur_status,
+            "effective_status": eff_st,
             "pending_status": observed_status,
             "free_units": cur_free,
+            "effective_free_units": eff_fu,
             "occupied_units": int(spot["occupied_units"]),
-            "note": f"首帧检测到变化({observed_status}: {reason})，进入 {debounce_seconds:.0f}s 防抖待确认态",
+            "note": f"首帧检测到变化({observed_status}: {reason})，进入 {debounce_seconds:.0f}s 防抖复核（净空位已立即防虚报调整）",
         }
 
     def check_offline_timeouts(

@@ -60,7 +60,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "debounce_seconds": 8.0,
     "instant_confirm_mode": False,
     "soft_lock_ttl_seconds": 180,
-    "offline_timeout_seconds": 900,
+    "offline_timeout_seconds": 86400,
     "ssim_change_threshold": 0.035,
     "standard_car_length_m": 5.2,
     "http_port": int(os.environ.get("PORT", "8790")),

@@ -40,14 +40,27 @@ class ReferenceAutoCalibrator:
         auto_save: bool = True,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        arr = np.frombuffer(raw_image_bytes, dtype=np.uint8)
-        full_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if full_img is None:
-            raise ValueError("无法解码参考图字节流，请上传有效的 JPG/PNG/WebP 图片")
-
         cam = self.db.get_camera(camera_id)
         if not cam:
             raise ValueError(f"未找到相机机位: {camera_id}")
+
+        with self.vision.decode_guard():
+            arr = np.frombuffer(raw_image_bytes, dtype=np.uint8)
+            full_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            del arr
+            if full_img is None:
+                raise ValueError("无法解码参考图字节流，请上传有效的 JPG/PNG/WebP 图片")
+
+            h_raw, w_raw = full_img.shape[:2]
+            if max(h_raw, w_raw) > 2560:
+                sc = 2560.0 / float(max(h_raw, w_raw))
+                resized = cv2.resize(
+                    full_img,
+                    (max(64, int(round(w_raw * sc))), max(64, int(round(h_raw * sc)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                del full_img
+                full_img = resized
 
         target_zone_id = zone_id or cam["zone_id"]
         h_img, w_img = full_img.shape[:2]
@@ -164,10 +177,10 @@ class ReferenceAutoCalibrator:
 
         # Zero-Disk privacy guarantee: destroy raw unredacted image immediately
         del full_img
-        del arr
 
         with self.vision._lock:
             self.vision.privacy_stats["frames_processed_in_ram"] += 1
+            self.vision._sync_memory_stats_locked()
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         template_meta = {

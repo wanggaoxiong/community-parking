@@ -123,8 +123,13 @@ class InMemoryFTPProtocol:
                     chunk = await r.read(65536)
                     if not chunk:
                         break
-                    if self.data_Buffer is not None and len(self.data_Buffer) < MAX_SNAPSHOT_BYTES:
-                        self.data_Buffer.extend(chunk)
+                    if self.data_Buffer is not None:
+                        if len(self.data_Buffer) + len(chunk) <= MAX_SNAPSHOT_BYTES:
+                            self.data_Buffer.extend(chunk)
+                        else:
+                            logger.warning("FTP upload exceeded MAX_SNAPSHOT_BYTES (%d), aborting stream", MAX_SNAPSHOT_BYTES)
+                            self.data_Buffer = None
+                            break
             finally:
                 try:
                     w.close()

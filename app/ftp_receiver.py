@@ -3,6 +3,7 @@ import logging
 import re
 import threading
 from typing import Callable, Optional
+from urllib.parse import unquote
 
 from app.config import config_manager
 
@@ -176,11 +177,12 @@ class InMemoryFTPProtocol:
             await self.send("451 Failed to process in-memory snapshot")
 
     def _infer_camera_id(self, virtual_path: str) -> str:
+        decoded_path = unquote(virtual_path)
         # Match e.g. /CAM_3F_WIN/snap.jpg or CAM_3F_WIN_2026.jpg
-        m = re.search(r"(CAM_[A-Za-z0-9_-]+)", virtual_path)
+        m = re.search(r"(CAM_[A-Za-z0-9_-]+)", decoded_path)
         if m:
             return m.group(1)
-        parts = [p for p in virtual_path.split("/") if p]
+        parts = [p for p in decoded_path.split("/") if p]
         if len(parts) >= 2:
             return parts[0]
         return "CAM_3F_WIN"

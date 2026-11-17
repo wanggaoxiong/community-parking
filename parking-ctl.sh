@@ -140,12 +140,26 @@ cmd_health() {
 import sys, json
 d = json.loads(sys.stdin.read())
 ps = d.get('privacy_stats', {})
-print(f\"   📊 概览: 总车位 {d.get('total_capacity')} | 净余空位 {d.get('total_effective_free')} | 原图落盘 {ps.get('raw_images_written_to_disk', 0)} | 累计内存处理帧 {ps.get('frames_processed_in_ram', 0)}\")
+used_kb = ps.get('cache_used_kb', ps.get('signature_cache_kb', 0.0))
+budget_mb = ps.get('cache_budget_mb', 64.0)
+human_cache = f'{used_kb/1024:.2f} MB' if used_kb >= 1024 else f'{used_kb:.1f} KB'
+vlm_hits = ps.get('vlm_cache_hits', 0)
+tpl_hits = ps.get('template_cache_hits', 0)
+print(f\"   📊 概览: 总车位 {d.get('total_capacity')} | 净余空位 {d.get('total_effective_free')} | 落盘 {ps.get('raw_images_written_to_disk', 0)} | 瞬时销毁 {ps.get('frames_processed_in_ram', 0)} 帧 | 热快取 {human_cache}/{budget_mb:.0f}MB (命中: 模板{tpl_hits}/VLM{vlm_hits})\")
 " <<< "${resp}"
   else
     echo "⚠️  健康检查未响应: http://${HOST}:${PORT}/api/health"
     return 1
   fi
+}
+
+cmd_foreground() {
+  rotate_log_if_needed
+  echo "$$" > "${PID_FILE}"
+  exec "${VENV_PY}" "${APP_DIR}/run.py" \
+    --host "${HOST}" \
+    --port "${PORT}" \
+    --ftp-port "${FTP_PORT}"
 }
 
 cmd_logs() {
@@ -210,6 +224,7 @@ case "${1:-status}" in
   status)            cmd_status ;;
   health)            cmd_health ;;
   logs)              cmd_logs ;;
+  foreground)        cmd_foreground ;;
   install-launchd)   cmd_install_launchd ;;
   uninstall-launchd) cmd_uninstall_launchd ;;
   *)

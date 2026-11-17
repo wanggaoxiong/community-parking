@@ -57,11 +57,22 @@ VLM_PRESETS: Dict[str, Dict[str, str]] = {
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "community_name": "阳光花园 · 邻里公益寻位",
-    "debounce_seconds": 8.0,
+    "debounce_seconds": 3.0,
     "instant_confirm_mode": False,
-    "soft_lock_ttl_seconds": 180,
+    "first_frame_vlm_anchor": False,
+    "hybrid_vlm_confidence_threshold": 0.85,
+    "dynamic_roi_enabled": True,
+    "debounce_v2_5s_migrated": True,
+    "debounce_v3_3s_migrated": True,
+    "soft_lock_v2_40s_migrated": True,
+    "vlm_hybrid_auto_migrated": True,
+    "vlm_hybrid_v2_migrated": True,
+    "hybrid_85_gate_migrated": True,
+    "soft_lock_ttl_seconds": 40,
     "offline_timeout_seconds": 86400,
     "ssim_change_threshold": 0.035,
+    "cache_budget_mb": 64,
+    "vlm_cache_ttl_seconds": 900,
     "standard_car_length_m": 5.2,
     "http_port": int(os.environ.get("PORT", "8790")),
     "ftp_port": int(os.environ.get("FTP_PORT", "2121")),
@@ -90,7 +101,47 @@ class ConfigManager:
         if RUNTIME_CONFIG_PATH.exists():
             try:
                 saved = json.loads(RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+                migrated = False
+                if not saved.get("debounce_v2_5s_migrated"):
+                    if float(saved.get("debounce_seconds", 8.0)) == 8.0:
+                        saved["debounce_seconds"] = 5.0
+                    saved["debounce_v2_5s_migrated"] = True
+                    migrated = True
+                if not saved.get("debounce_v3_3s_migrated"):
+                    if float(saved.get("debounce_seconds", 5.0)) in (8.0, 5.0):
+                        saved["debounce_seconds"] = 3.0
+                    saved["debounce_v3_3s_migrated"] = True
+                    migrated = True
+                if not saved.get("soft_lock_v2_40s_migrated"):
+                    if int(saved.get("soft_lock_ttl_seconds", 180)) == 180:
+                        saved["soft_lock_ttl_seconds"] = 40
+                    saved["soft_lock_v2_40s_migrated"] = True
+                    migrated = True
+                if not saved.get("vlm_hybrid_auto_migrated") or not saved.get("vlm_hybrid_v2_migrated"):
+                    vlm_saved = saved.get("vlm")
+                    if (
+                        isinstance(vlm_saved, dict)
+                        and vlm_saved.get("mode") == "local_only"
+                        and str(vlm_saved.get("base_url") or "").strip()
+                        and str(vlm_saved.get("api_key") or "").strip()
+                    ):
+                        vlm_saved["mode"] = "hybrid"
+                    saved["vlm_hybrid_auto_migrated"] = True
+                    saved["vlm_hybrid_v2_migrated"] = True
+                    migrated = True
+                if not saved.get("hybrid_85_gate_migrated"):
+                    saved["first_frame_vlm_anchor"] = False
+                    saved["hybrid_vlm_confidence_threshold"] = float(
+                        saved.get("hybrid_vlm_confidence_threshold") or 0.85
+                    )
+                    saved["hybrid_85_gate_migrated"] = True
+                    migrated = True
                 self._deep_merge(self._config, saved)
+                if migrated:
+                    RUNTIME_CONFIG_PATH.write_text(
+                        json.dumps(self._config, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
             except Exception:
                 pass
 

@@ -75,6 +75,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "vlm_cache_ttl_seconds": 900,
     "standard_car_length_m": 5.2,
     "http_port": int(os.environ.get("PORT", "8790")),
+    "mobile_http_host": os.environ.get("MOBILE_HOST", "0.0.0.0"),
+    "mobile_http_port": int(os.environ.get("MOBILE_PORT", "18790")),
     "ftp_port": int(os.environ.get("FTP_PORT", "2121")),
     "ftp_user": "camera",
     "ftp_password": "parking2026",

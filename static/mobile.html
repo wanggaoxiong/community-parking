@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+  />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="邻里寻位" />
+  <meta name="theme-color" content="#FFFFFF" />
+  <meta name="parking-mobile-version" content="dev" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <title>邻里寻位 · 实时车位平面图</title>
+  <link rel="stylesheet" href="/mobile.css" />
+</head>
+<body>
+  <div class="mobile-shell">
+    <!-- 顶部极简状态栏 -->
+    <header class="m-topbar">
+      <div class="m-brand">
+        <span class="live-dot" id="liveDot" aria-hidden="true"></span>
+        <h1 class="m-title" id="communityName">邻里公益寻位</h1>
+      </div>
+      <div class="m-net-pill" id="totalFreePill">
+        <span>净余</span>
+        <strong id="totalFreeNum">--</strong>
+        <span>位</span>
+      </div>
+    </header>
+
+    <!-- 目的地与语音播报控制卡（每台手机独立记忆） -->
+    <section class="m-controls-card" aria-label="目的地与语音播报设置">
+      <div class="m-dest-row">
+        <label class="m-dest-label" for="mobileUnitSelect">🏠 目的地</label>
+        <div class="m-select-wrap">
+          <select id="mobileUnitSelect" class="m-unit-select" aria-label="选择回家目的地楼栋单元"></select>
+        </div>
+        <button type="button" id="btnSpeakAction" class="m-speak-btn" aria-live="polite">
+          🔊 播报
+        </button>
+      </div>
+
+      <div class="m-broadcast-row">
+        <div class="m-seg-group" id="repeatModeGroup" role="radiogroup" aria-label="播报遍数设置">
+          <button type="button" class="m-seg-btn" data-repeat="1" role="radio" aria-checked="false">1遍</button>
+          <button type="button" class="m-seg-btn is-active" data-repeat="2" role="radio" aria-checked="true">2遍</button>
+          <button type="button" class="m-seg-btn" data-repeat="0" role="radio" aria-checked="false">静音</button>
+        </div>
+
+        <button
+          type="button"
+          id="btnContinuousToggle"
+          class="m-continuous-pill is-on"
+          aria-pressed="true"
+          title="开启后持续轮询车位变化并周期自动语音播报"
+        >
+          <span class="m-cont-dot" aria-hidden="true"></span>
+          <span id="continuousLabel">持续播报 · 开</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- 实时推荐精简摘要条 -->
+    <section class="m-guidance-strip" id="guidanceCard" aria-live="polite">
+      <div class="m-guide-main">
+        <div class="m-guide-primary">
+          <span class="m-rec-tag" id="recBadgeTag">首选推荐</span>
+          <span class="m-rec-zone" id="recZoneName">正在获取实时车位…</span>
+        </div>
+        <div class="m-guide-metrics" id="recMetricsWrap">
+          <span class="m-metric-free" id="recFreePill">--</span>
+          <span class="m-metric-walk" id="recWalkPill">🚶 --m</span>
+        </div>
+      </div>
+      <div class="m-guide-sub">
+        <span class="m-backup-line" id="recBackupText">点选上方目的地或地图楼栋即可自动寻位</span>
+        <span class="m-voice-state" id="voiceStatusBadge">待命</span>
+      </div>
+    </section>
+
+    <!-- 实时态势平面图画布（支持单指平移、双指捏合缩放、点楼栋切目的地） -->
+    <main class="m-map-stage" id="mobileMapStage">
+      <svg
+        id="mobileMapSvg"
+        class="m-map-svg"
+        viewBox="0 0 145 100"
+        preserveAspectRatio="xMidYMid meet"
+        aria-label="小区车位实时态势平面图"
+      ></svg>
+
+      <!-- 地图右上角悬浮极简缩放与底图按钮 -->
+      <div class="m-map-tools">
+        <button type="button" id="btnZoomIn" class="m-tool-btn" aria-label="放大平面图">＋</button>
+        <button type="button" id="btnZoomOut" class="m-tool-btn" aria-label="缩小平面图">－</button>
+        <button type="button" id="btnZoomReset" class="m-tool-btn m-tool-text" aria-label="重置全局视角">全图</button>
+        <button type="button" id="btnBackdropToggle" class="m-tool-btn m-tool-text" hidden aria-label="切换底图叠显">底图</button>
+      </div>
+
+      <!-- 轻触车位/停车带时的浮动微提示 -->
+      <div class="m-map-toast" id="mapSpotToast" hidden></div>
+
+      <!-- 底部紧凑图例 -->
+      <footer class="m-map-legend" aria-label="图例说明">
+        <span class="lg-item"><i class="lg-dot lg-free"></i>空闲</span>
+        <span class="lg-item"><i class="lg-dot lg-occ"></i>已停</span>
+        <span class="lg-item"><i class="lg-dot lg-blk"></i>禁停</span>
+        <span class="lg-item"><i class="lg-line lg-walk"></i>步行至单元门</span>
+        <span class="lg-item"><i class="lg-line lg-drive"></i>行车引导</span>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/mobile.js"></script>
+</body>
+</html>

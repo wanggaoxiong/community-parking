@@ -1,0 +1,1739 @@
+(function () {
+  "use strict";
+
+  const STORAGE_KEYS = {
+    unitId: "parking_mobile_unit_id",
+    repeatCount: "parking_mobile_repeat_count",
+    continuous: "parking_mobile_continuous",
+    showBackdrop: "parking_mobile_show_backdrop",
+  };
+
+  const POLL_INTERVAL_MS = 4000;
+  const CONTINUOUS_REPEAT_MS = 16000;
+
+  const state = {
+    overview: null,
+    unitId: "",
+    repeatCount: 2, // 1 | 2 | 0 (mute)
+    continuousBroadcast: true,
+    showBackdrop: false,
+    backdropDataUrl: null,
+    backdropLoading: false,
+    zoom: 1.0,
+    panX: 0,
+    panY: 0,
+    worldW: 145,
+    worldH: 100,
+    latestVoiceText: "",
+    lastAnnouncedSig: "",
+    isSpeaking: false,
+    currentPass: 0,
+    totalPasses: 0,
+    speechSessionId: 0,
+    passTimer: null,
+    watchdogTimer: null,
+    continuousTimer: null,
+    toastTimer: null,
+    userInteracted: false,
+    speechBlockedByAutoplay: false,
+    wakeLock: null,
+    pollTimer: null,
+    fetching: false,
+  };
+
+  const els = {
+    liveDot: document.getElementById("liveDot"),
+    communityName: document.getElementById("communityName"),
+    totalFreePill: document.getElementById("totalFreePill"),
+    totalFreeNum: document.getElementById("totalFreeNum"),
+    unitSelect: document.getElementById("mobileUnitSelect"),
+    btnSpeakAction: document.getElementById("btnSpeakAction"),
+    repeatModeGroup: document.getElementById("repeatModeGroup"),
+    btnContinuousToggle: document.getElementById("btnContinuousToggle"),
+    continuousLabel: document.getElementById("continuousLabel"),
+    guidanceCard: document.getElementById("guidanceCard"),
+    recBadgeTag: document.getElementById("recBadgeTag"),
+    recZoneName: document.getElementById("recZoneName"),
+    recFreePill: document.getElementById("recFreePill"),
+    recWalkPill: document.getElementById("recWalkPill"),
+    recBackupText: document.getElementById("recBackupText"),
+    voiceStatusBadge: document.getElementById("voiceStatusBadge"),
+    mapStage: document.getElementById("mobileMapStage"),
+    mapSvg: document.getElementById("mobileMapSvg"),
+    btnZoomIn: document.getElementById("btnZoomIn"),
+    btnZoomOut: document.getElementById("btnZoomOut"),
+    btnZoomReset: document.getElementById("btnZoomReset"),
+    btnBackdropToggle: document.getElementById("btnBackdropToggle"),
+    mapSpotToast: document.getElementById("mapSpotToast"),
+  };
+
+  function escapeHtml(str) {
+    return String(str ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function loadPersistedSettings() {
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const queryUnit = (urlParams.get("unit") || "").trim();
+      const savedUnit = (localStorage.getItem(STORAGE_KEYS.unitId) || "").trim();
+      state.unitId = queryUnit || savedUnit || "";
+
+      const savedRepeat = localStorage.getItem(STORAGE_KEYS.repeatCount);
+      if (savedRepeat === "0" || savedRepeat === "1" || savedRepeat === "2") {
+        state.repeatCount = Number(savedRepeat);
+      } else {
+        state.repeatCount = 2;
+      }
+
+      const savedCont = localStorage.getItem(STORAGE_KEYS.continuous);
+      if (savedCont === "0" || savedCont === "1") {
+        state.continuousBroadcast = savedCont === "1";
+      } else {
+        state.continuousBroadcast = true;
+      }
+
+      state.showBackdrop = localStorage.getItem(STORAGE_KEYS.showBackdrop) === "1";
+    } catch (_err) {
+      // Ignore storage access errors in private WebViews
+    }
+  }
+
+  function persistSettings() {
+    try {
+      if (state.unitId) {
+        localStorage.setItem(STORAGE_KEYS.unitId, state.unitId);
+      }
+      localStorage.setItem(STORAGE_KEYS.repeatCount, String(state.repeatCount));
+      localStorage.setItem(
+        STORAGE_KEYS.continuous,
+        state.continuousBroadcast ? "1" : "0"
+      );
+      localStorage.setItem(
+        STORAGE_KEYS.showBackdrop,
+        state.showBackdrop ? "1" : "0"
+      );
+    } catch (_err) {
+      // Ignore storage errors
+    }
+  }
+
+  function syncUrlUnitParam(unitId) {
+    if (!unitId || !window.history || !window.history.replaceState) return;
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("unit") !== unitId) {
+        url.searchParams.set("unit", unitId);
+        window.history.replaceState(null, "", url.toString());
+      }
+    } catch (_err) {
+      // Ignore URL errors
+    }
+  }
+
+  async function requestWakeLockIfNeeded() {
+    if (!("wakeLock" in navigator)) return;
+    if (state.continuousBroadcast && state.repeatCount > 0) {
+      if (state.wakeLock) return;
+      try {
+        state.wakeLock = await navigator.wakeLock.request("screen");
+        state.wakeLock.addEventListener("release", () => {
+          state.wakeLock = null;
+        });
+      } catch (_err) {
+        // WakeLock unsupported or denied
+      }
+    } else if (state.wakeLock) {
+      try {
+        await state.wakeLock.release();
+      } catch (_err) {
+        // Ignore
+      }
+      state.wakeLock = null;
+    }
+  }
+
+  function syncBroadcastControlUi() {
+    const segBtns = els.repeatModeGroup.querySelectorAll(".m-seg-btn");
+    segBtns.forEach((btn) => {
+      const val = Number(btn.dataset.repeat);
+      const active = val === state.repeatCount;
+      btn.classList.toggle("is-active", active);
+      btn.setAttribute("aria-checked", active ? "true" : "false");
+    });
+
+    const contActive = state.continuousBroadcast && state.repeatCount > 0;
+    els.btnContinuousToggle.classList.toggle("is-on", contActive);
+    els.btnContinuousToggle.setAttribute(
+      "aria-pressed",
+      state.continuousBroadcast ? "true" : "false"
+    );
+    els.continuousLabel.textContent = state.continuousBroadcast
+      ? "持续播报 · 开"
+      : "持续播报 · 关";
+
+    els.btnSpeakAction.classList.toggle("is-speaking", state.isSpeaking);
+    els.btnSpeakAction.classList.toggle(
+      "needs-unlock",
+      !state.isSpeaking && state.speechBlockedByAutoplay && state.repeatCount > 0
+    );
+
+    if (state.isSpeaking) {
+      els.btnSpeakAction.textContent =
+        state.totalPasses > 1
+          ? `⏹ 停止 (${state.currentPass}/${state.totalPasses})`
+          : "⏹ 停止";
+      els.voiceStatusBadge.textContent =
+        state.totalPasses > 1
+          ? `🔊 第 ${state.currentPass}/${state.totalPasses} 遍播报中…`
+          : "🔊 语音播报中…";
+    } else if (state.speechBlockedByAutoplay && state.repeatCount > 0) {
+      els.btnSpeakAction.textContent = "🔊 点按播报";
+      els.voiceStatusBadge.textContent = "👆 轻触开启语音";
+    } else {
+      els.btnSpeakAction.textContent = "🔊 播报";
+      if (state.repeatCount === 0) {
+        els.voiceStatusBadge.textContent = "🔇 已静音";
+      } else if (state.continuousBroadcast) {
+        els.voiceStatusBadge.textContent = `🔁 持续(${state.repeatCount}遍)待命`;
+      } else {
+        els.voiceStatusBadge.textContent = `🔊 ${state.repeatCount}遍播报待命`;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Multi-Pass (1x / 2x) + Continuous Web Speech Engine
+  // ---------------------------------------------------------------------------
+
+  function pickChineseVoice() {
+    if (!("speechSynthesis" in window)) return null;
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return null;
+    const preferred = [
+      "Tingting",
+      "Xiaoxiao",
+      "Yunxi",
+      "Mei-Jia",
+      "Sin-ji",
+      "Google 普通话",
+    ];
+    for (const kw of preferred) {
+      const hit = voices.find(
+        (v) =>
+          (v.name || "").includes(kw) &&
+          /^zh/i.test(String(v.lang || "zh-CN"))
+      );
+      if (hit) return hit;
+    }
+    return (
+      voices.find((v) => /^zh[-_]?CN/i.test(String(v.lang || ""))) ||
+      voices.find((v) => /^zh/i.test(String(v.lang || ""))) ||
+      null
+    );
+  }
+
+  function clearSpeechTimers() {
+    if (state.passTimer) {
+      clearTimeout(state.passTimer);
+      state.passTimer = null;
+    }
+    if (state.watchdogTimer) {
+      clearTimeout(state.watchdogTimer);
+      state.watchdogTimer = null;
+    }
+  }
+
+  function clearContinuousTimer() {
+    if (state.continuousTimer) {
+      clearTimeout(state.continuousTimer);
+      state.continuousTimer = null;
+    }
+  }
+
+  function stopBroadcast(cancelContinuous = false) {
+    state.speechSessionId += 1;
+    clearSpeechTimers();
+    if (cancelContinuous) {
+      clearContinuousTimer();
+    }
+    state.isSpeaking = false;
+    state.currentPass = 0;
+    state.totalPasses = 0;
+    if ("speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (_err) {
+        // Ignore
+      }
+    }
+    syncBroadcastControlUi();
+  }
+
+  function scheduleNextContinuousCycle() {
+    clearContinuousTimer();
+    if (!state.continuousBroadcast || state.repeatCount <= 0) return;
+    if (document.hidden) return;
+    state.continuousTimer = setTimeout(() => {
+      state.continuousTimer = null;
+      if (!state.continuousBroadcast || state.repeatCount <= 0 || document.hidden) {
+        return;
+      }
+      if (state.latestVoiceText && !state.isSpeaking) {
+        speakBroadcast(state.latestVoiceText, state.repeatCount, "continuous");
+      }
+    }, CONTINUOUS_REPEAT_MS);
+  }
+
+  function speakBroadcast(text, passes, _reason) {
+    const cleanText = String(text || "").trim();
+    const targetPasses = Math.max(1, Math.min(2, Number(passes) || 1));
+    if (!cleanText) return;
+
+    if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+      els.voiceStatusBadge.textContent = "当前浏览器不支持语音合成";
+      return;
+    }
+
+    stopBroadcast(true);
+    const sessionId = state.speechSessionId;
+    state.isSpeaking = true;
+    state.totalPasses = targetPasses;
+    state.currentPass = 1;
+    syncBroadcastControlUi();
+
+    const runSinglePass = (passNo) => {
+      if (sessionId !== state.speechSessionId) return;
+      state.currentPass = passNo;
+      syncBroadcastControlUi();
+
+      let finished = false;
+      let startedSpeaking = false;
+
+      const completePass = (blocked = false) => {
+        if (finished || sessionId !== state.speechSessionId) return;
+        finished = true;
+        clearSpeechTimers();
+
+        if (blocked) {
+          state.isSpeaking = false;
+          state.currentPass = 0;
+          state.totalPasses = 0;
+          state.speechBlockedByAutoplay = true;
+          syncBroadcastControlUi();
+          return;
+        }
+
+        state.speechBlockedByAutoplay = false;
+        if (passNo < targetPasses) {
+          state.passTimer = setTimeout(() => {
+            runSinglePass(passNo + 1);
+          }, 700);
+        } else {
+          state.isSpeaking = false;
+          state.currentPass = 0;
+          state.totalPasses = 0;
+          syncBroadcastControlUi();
+          scheduleNextContinuousCycle();
+        }
+      };
+
+      try {
+        const utter = new SpeechSynthesisUtterance(cleanText);
+        utter.lang = "zh-CN";
+        utter.rate = 1.02;
+        utter.pitch = 1.0;
+        const voice = pickChineseVoice();
+        if (voice) utter.voice = voice;
+
+        utter.onstart = () => {
+          startedSpeaking = true;
+          state.speechBlockedByAutoplay = false;
+          syncBroadcastControlUi();
+        };
+        utter.onend = () => completePass(false);
+        utter.onerror = (ev) => {
+          const errCode = String((ev && ev.error) || "").toLowerCase();
+          if (
+            errCode.includes("not-allowed") ||
+            (!state.userInteracted && !startedSpeaking)
+          ) {
+            completePass(true);
+          } else {
+            completePass(false);
+          }
+        };
+
+        window.speechSynthesis.resume();
+        window.speechSynthesis.speak(utter);
+
+        // Detect iOS Safari / mobile WebView silent pre-gesture block quickly
+        if (!state.userInteracted) {
+          setTimeout(() => {
+            if (
+              !finished &&
+              sessionId === state.speechSessionId &&
+              !startedSpeaking &&
+              !window.speechSynthesis.speaking
+            ) {
+              try {
+                window.speechSynthesis.cancel();
+              } catch (_e) {
+                // Ignore
+              }
+              completePass(true);
+            }
+          }, 1100);
+        }
+
+        // Watchdog in case mobile WebView drops onend callback
+        const maxDurationMs = Math.max(6000, cleanText.length * 380);
+        state.watchdogTimer = setTimeout(() => {
+          completePass(false);
+        }, maxDurationMs);
+      } catch (_err) {
+        completePass(!state.userInteracted);
+      }
+    };
+
+    // Slight defer after cancel() avoids WebKit speech queue swallow bug
+    state.passTimer = setTimeout(() => {
+      runSinglePass(1);
+    }, 60);
+  }
+
+  function buildRecommendationSignature(rec, unitId) {
+    if (!rec) return "";
+    const p = rec.primary || {};
+    const b = rec.backup || {};
+    return [
+      unitId || "",
+      rec.has_recommendation ? "REC" : "FULL",
+      p.zone_id || "NONE",
+      p.group_code || "",
+      p.effective_free ?? 0,
+      b.zone_id || "",
+      b.group_code || "",
+      b.effective_free ?? 0,
+    ].join("|");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Site Map SVG Rendering (1:1 Parity with Main Console Floor-Plan)
+  // ---------------------------------------------------------------------------
+
+  function getSiteMapMetrics(smap) {
+    const aspect = Math.max(
+      0.45,
+      Math.min(2.6, Number((smap && smap.aspect_ratio) || 1.45))
+    );
+    const worldW = aspect >= 1 ? +(100 * aspect).toFixed(3) : 100;
+    const worldH = aspect >= 1 ? 100 : +(100 / aspect).toFixed(3);
+    return {
+      worldW,
+      worldH,
+      px: (v) => +((Number(v || 0) / 100) * worldW).toFixed(3),
+      py: (v) => +((Number(v || 0) / 100) * worldH).toFixed(3),
+    };
+  }
+
+  function applySvgViewBox() {
+    const z = Math.max(1, Math.min(4.5, Number(state.zoom || 1)));
+    const vw = state.worldW / z;
+    const vh = state.worldH / z;
+    const maxX = Math.max(0, state.worldW - vw);
+    const maxY = Math.max(0, state.worldH - vh);
+    state.panX = Math.max(0, Math.min(maxX, state.panX));
+    state.panY = Math.max(0, Math.min(maxY, state.panY));
+    els.mapSvg.setAttribute(
+      "viewBox",
+      `${state.panX.toFixed(2)} ${state.panY.toFixed(2)} ${vw.toFixed(
+        2
+      )} ${vh.toFixed(2)}`
+    );
+  }
+
+  function zoomAroundRatio(newZoom, anchorRatioX = 0.5, anchorRatioY = 0.5) {
+    const oldZ = Math.max(1, Math.min(4.5, Number(state.zoom || 1)));
+    const targetZ = Math.max(1, Math.min(4.5, Number(newZoom || 1)));
+    const oldVw = state.worldW / oldZ;
+    const oldVh = state.worldH / oldZ;
+    const focusWorldX = state.panX + oldVw * anchorRatioX;
+    const focusWorldY = state.panY + oldVh * anchorRatioY;
+
+    const newVw = state.worldW / targetZ;
+    const newVh = state.worldH / targetZ;
+    state.zoom = targetZ;
+    if (targetZ <= 1.001) {
+      state.zoom = 1.0;
+      state.panX = 0;
+      state.panY = 0;
+    } else {
+      state.panX = focusWorldX - newVw * anchorRatioX;
+      state.panY = focusWorldY - newVh * anchorRatioY;
+    }
+    applySvgViewBox();
+    renderFloorPlanSvg();
+  }
+
+  function formatCompactUnitBadgeLabel(u, allUnits) {
+    const uid = String((u && u.unit_id) || "").trim();
+    const m = uid.match(/^([A-Za-z0-9]+)[-_#](\d+)$/);
+    if (!m) return `${uid}栋`;
+    const bldg = m[1];
+    const unitNo = Number(m[2]);
+    const siblingCount = (allUnits || []).filter((x) => {
+      const xm = String((x && x.unit_id) || "").match(
+        /^([A-Za-z0-9]+)[-_#](\d+)$/
+      );
+      return xm && xm[1].toUpperCase() === bldg.toUpperCase();
+    }).length;
+    if (siblingCount >= 2 || unitNo >= 2) {
+      return `${bldg}栋${unitNo}单元`;
+    }
+    return `${bldg}栋`;
+  }
+
+  function shortenSpotLabel(label, fallbackIdx) {
+    const s = String(label || "").trim();
+    const m = s.match(/(\d{1,3})$/);
+    if (m) return m[1].padStart(2, "0");
+    if (s.length <= 4) return s;
+    return s.slice(-3) || String(fallbackIdx + 1).padStart(2, "0");
+  }
+
+  function renderFloorPlanSvg() {
+    const ov = state.overview;
+    if (!ov) return;
+    const smap = ov.site_map || {};
+    const { worldW, worldH, px, py } = getSiteMapMetrics(smap);
+    state.worldW = worldW;
+    state.worldH = worldH;
+    applySvgViewBox();
+
+    const invScale = Math.pow(Math.max(1, state.zoom || 1), -0.52);
+    const topo = smap.topology || {};
+    const roads =
+      topo.roads && topo.roads.length
+        ? topo.roads
+        : [
+            {
+              road_id: "R_MAIN",
+              points: [
+                [8, 83],
+                [88, 83],
+                [88, 22],
+                [12, 22],
+              ],
+              width: 5.2,
+            },
+          ];
+    const walkways = topo.walkways || [];
+    const gates =
+      topo.gates && topo.gates.length
+        ? topo.gates
+        : [
+            { gate_id: "south", name: "南门入口", x: 47, y: 96.5, w: 8.5, h: 2.8 },
+            { gate_id: "east", name: "东门", x: 95.5, y: 52, w: 6.5, h: 2.8 },
+          ];
+    const greens = topo.greens || [];
+    const unitsToDraw = Array.isArray(ov.units) ? ov.units : [];
+
+    const rec = ov.recommendation || null;
+    const recPrimary = rec && rec.has_recommendation ? rec.primary : null;
+    const recZoneId = recPrimary ? recPrimary.zone_id : "";
+    const recGroupCode = recPrimary ? recPrimary.group_code || "" : "";
+
+    const spotsToDraw = [];
+    (ov.zones || []).forEach((z) => {
+      (z.spots || []).forEach((sp) => {
+        if (sp.map_placed === false || sp.map_x == null || sp.map_y == null) {
+          return;
+        }
+        spotsToDraw.push({
+          ...sp,
+          zone_id: sp.zone_id || z.zone_id,
+          zone_name: sp.zone_name || z.name,
+        });
+      });
+    });
+
+    let html = `
+      <rect x="0.25" y="0.25" width="${(worldW - 0.5).toFixed(
+        2
+      )}" height="${(worldH - 0.5).toFixed(
+        2
+      )}" rx="2.6" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="0.4"/>
+    `;
+
+    if (state.showBackdrop && state.backdropDataUrl) {
+      const bgAlpha = Number(
+        (smap.meta && smap.meta.backdrop_alpha) || 0.58
+      ).toFixed(2);
+      html += `
+        <image href="${state.backdropDataUrl}" x="0.25" y="0.25" width="${(
+          worldW - 0.5
+        ).toFixed(2)}" height="${(worldH - 0.5).toFixed(
+          2
+        )}" preserveAspectRatio="none" opacity="${bgAlpha}"/>
+      `;
+    } else {
+      for (const gr of greens) {
+        html += `
+          <rect x="${px(gr.x)}" y="${py(gr.y)}" width="${px(gr.w)}" height="${py(
+            gr.h
+          )}" rx="2.2"
+                fill="rgba(52, 199, 89, 0.09)" stroke="rgba(52, 199, 89, 0.20)" stroke-width="0.3"/>
+        `;
+      }
+    }
+
+    const renderChevronAlongSegments = (
+      ptsArr,
+      color,
+      scaleMul = 1.0,
+      twoWay = false
+    ) => {
+      let chevHtml = "";
+      const stepWorld = 10.5;
+      let nextAt = 4.5;
+      let accum = 0;
+      for (let i = 0; i < ptsArr.length - 1; i++) {
+        const [x1, y1] = ptsArr[i];
+        const [x2, y2] = ptsArr[i + 1];
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const segLen = Math.hypot(dx, dy);
+        if (segLen < 0.05) continue;
+        const ang = (Math.atan2(dy, dx) * 180) / Math.PI;
+        while (nextAt <= accum + segLen) {
+          const t = Math.max(0.08, Math.min(0.92, (nextAt - accum) / segLen));
+          const cx = x1 + dx * t;
+          const cy = y1 + dy * t;
+          const s = 0.72 * scaleMul;
+          chevHtml += `<g transform="translate(${cx.toFixed(2)} ${cy.toFixed(
+            2
+          )}) rotate(${ang.toFixed(1)})">
+            <polygon points="${(1.25 * s).toFixed(2)},0 ${(-0.85 * s).toFixed(
+              2
+            )},${(-0.85 * s).toFixed(2)} ${(-0.38 * s).toFixed(2)},0 ${(
+              -0.85 * s
+            ).toFixed(2)},${(0.85 * s).toFixed(2)}" fill="${color}"/>
+          </g>`;
+          if (twoWay && segLen > 7.5) {
+            const cx2 = x1 + dx * Math.min(0.86, t + 0.16);
+            const cy2 = y1 + dy * Math.min(0.86, t + 0.16);
+            chevHtml += `<g transform="translate(${cx2.toFixed(
+              2
+            )} ${cy2.toFixed(2)}) rotate(${(ang + 180).toFixed(1)})">
+              <polygon points="${(1.05 * s).toFixed(2)},0 ${(
+                -0.75 * s
+              ).toFixed(2)},${(-0.75 * s).toFixed(2)} ${(-0.32 * s).toFixed(
+                2
+              )},0 ${(-0.75 * s).toFixed(2)},${(0.75 * s).toFixed(
+                2
+              )}" fill="${color}" opacity="0.82"/>
+            </g>`;
+          }
+          nextAt += stepWorld;
+        }
+        accum += segLen;
+      }
+      return chevHtml;
+    };
+
+    // 1. Unified 2F Vehicular Roads Layer
+    roads.forEach((r) => {
+      const ptsArr = (r.points || []).map(([rx, ry]) => [px(rx), py(ry)]);
+      if (ptsArr.length < 2) return;
+      const ptsStr = ptsArr.map(([x, y]) => `${x},${y}`).join(" ");
+      const rw = Math.max(1.8, Number(r.width || 4.4));
+      const isTwoWay = r.one_way === false || r.direction === "twoway";
+      const roadFillStroke = state.showBackdrop
+        ? "rgba(148, 163, 184, 0.38)"
+        : "#E2E8F0";
+      const centerDashStroke = state.showBackdrop
+        ? "rgba(2, 132, 199, 0.62)"
+        : "rgba(14, 165, 233, 0.45)";
+      html += `
+        <g pointer-events="none">
+          <polyline points="${ptsStr}" fill="none" stroke="${roadFillStroke}"
+                    stroke-width="${rw}" stroke-linecap="round" stroke-linejoin="round"/>
+          <polyline points="${ptsStr}" fill="none" stroke="${centerDashStroke}"
+                    stroke-width="0.40" stroke-dasharray="1.6,1.3"/>
+          ${renderChevronAlongSegments(
+            ptsArr,
+            "rgba(2, 132, 199, 0.80)",
+            0.92,
+            isTwoWay
+          )}
+        </g>
+      `;
+    });
+
+    // 2. 2F Courtyard Pedestrian Walkways Layer
+    walkways.forEach((wk) => {
+      const ptsArr = (wk.points || []).map(([wx, wy]) => [px(wx), py(wy)]);
+      if (ptsArr.length < 2) return;
+      const ptsStr = ptsArr.map(([x, y]) => `${x},${y}`).join(" ");
+      html += `
+        <g pointer-events="none">
+          <polyline points="${ptsStr}" fill="none" stroke="rgba(16, 185, 129, 0.16)"
+                    stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>
+          <polyline points="${ptsStr}" fill="none" stroke="#10B981"
+                    stroke-width="0.46" stroke-dasharray="1.05,0.85" stroke-linecap="round" stroke-linejoin="round"/>
+        </g>
+      `;
+    });
+
+    // 3. Active Driver Recommended Guidance Route Highlight
+    const recRoute = rec && rec.recommended_route;
+    if (recRoute && Array.isArray(recRoute.points) && recRoute.points.length >= 2) {
+      const recPts = recRoute.points.map(([rx, ry]) => [px(rx), py(ry)]);
+      const recStr = recPts
+        .map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`)
+        .join(" ");
+      const [sx0, sy0] = recPts[0];
+      const gateLabel = recRoute.entry_gate_name
+        ? `🚗 ${recRoute.entry_gate_name}行车引导`
+        : "🚗 进场行车引导";
+      const gPillW = Math.max(7.2, gateLabel.length * 1.12 + 1.6) * invScale;
+      const gPillH = 1.92 * invScale;
+      const gLblY = Math.max(gPillH * 0.7, sy0 - 1.55 * invScale);
+      html += `
+        <g pointer-events="none">
+          <polyline points="${recStr}" fill="none" stroke="rgba(0, 113, 227, 0.22)" stroke-width="${(
+            1.85 * invScale
+          ).toFixed(2)}" stroke-linecap="round" stroke-linejoin="round"/>
+          <polyline points="${recStr}" fill="none" stroke="#0071E3" stroke-width="${(
+            0.68 * invScale
+          ).toFixed(2)}" stroke-dasharray="${(1.35 * invScale).toFixed(2)},${(
+            0.75 * invScale
+          ).toFixed(
+            2
+          )}" class="active-guidance-route" stroke-linecap="round" stroke-linejoin="round"/>
+          ${renderChevronAlongSegments(recPts, "#1D4ED8", 1.05 * invScale, false)}
+          <circle cx="${sx0.toFixed(2)}" cy="${sy0.toFixed(2)}" r="${(
+            0.78 * invScale
+          ).toFixed(2)}" fill="#0071E3" stroke="#FFFFFF" stroke-width="${(
+            0.28 * invScale
+          ).toFixed(2)}"/>
+          <rect x="${(sx0 - gPillW / 2).toFixed(2)}" y="${(
+            gLblY -
+            gPillH / 2
+          ).toFixed(2)}" width="${gPillW.toFixed(2)}" height="${gPillH.toFixed(
+            2
+          )}" rx="${(gPillH / 2).toFixed(
+            2
+          )}" fill="rgba(0, 113, 227, 0.92)" stroke="#FFFFFF" stroke-width="${(
+            0.22 * invScale
+          ).toFixed(2)}"/>
+          <text x="${sx0.toFixed(2)}" y="${(gLblY + 0.36 * invScale).toFixed(
+            2
+          )}" font-size="${(0.98 * invScale).toFixed(
+            2
+          )}" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeHtml(
+            gateLabel
+          )}</text>
+        </g>
+      `;
+    }
+
+    // 4. Individual Parking Stalls Layer (1:1 Top-Down Vehicle Silhouettes & Status Colors)
+    spotsToDraw.forEach((sp, idx) => {
+      const sx = px(sp.map_x ?? 50);
+      const sy = py(sp.map_y ?? 50);
+      const w = Math.max(
+        0.85,
+        Number(sp.map_w || (sp.spot_type === "elastic_strip" ? 7.8 : 1.75))
+      );
+      const h = Math.max(
+        0.85,
+        Number(sp.map_h || (sp.spot_type === "elastic_strip" ? 2.05 : 3.25))
+      );
+      const angle = Number(sp.map_angle || 0);
+
+      const effSt = sp.effective_status || sp.status || "FREE";
+      const obsType = String(sp.obstacle_type || "none").toLowerCase();
+      let fill = "#24B83B";
+      if (effSt === "FREE" && obsType === "movable") fill = "#0D9488";
+      else if (effSt === "FREE" && obsType === "pedestrian") fill = "#0284C7";
+      else if (effSt === "OCCUPIED") fill = "#F03226";
+      else if (effSt === "BLOCKED") fill = "#F58A00";
+      else if (effSt === "UNKNOWN") fill = "#64748B";
+
+      const isUnassigned = !sp.camera_id || sp.camera_id === "UNASSIGNED";
+      if (isUnassigned) {
+        fill = "#475569";
+      }
+
+      const isRecZone =
+        (recGroupCode
+          ? sp.group_code === recGroupCode
+          : Boolean(recZoneId && sp.zone_id === recZoneId)) &&
+        effSt === "FREE" &&
+        !isUnassigned;
+
+      const statusCn = isUnassigned
+        ? "待接入摄像头"
+        : effSt === "FREE" && obsType === "movable"
+        ? "可移轻物(可停)"
+        : effSt === "FREE" && obsType === "pedestrian"
+        ? "临停行人(让行可停)"
+        : effSt === "FREE"
+        ? "空闲可停"
+        : effSt === "OCCUPIED"
+        ? "已停车辆"
+        : effSt === "BLOCKED"
+        ? "占道禁停"
+        : "待识别/离线";
+
+      const pendTxt = sp.pending_status ? " · 双帧防抖确认中" : "";
+      const hintTxt = sp.action_hint ? ` · ${sp.action_hint}` : "";
+      const spotToast = `${sp.group_name || sp.zone_name || sp.zone_id} · ${
+        sp.label
+      }号位：${statusCn}${pendTxt}${hintTxt}`;
+
+      const outerStroke = isUnassigned ? "#F59E0B" : "rgba(15, 23, 42, 0.36)";
+      const outerStrokeW = isUnassigned ? 0.26 : 0.2;
+      const outerDash = isUnassigned ? 'stroke-dasharray="0.65,0.4"' : "";
+
+      html += `<g transform="translate(${sx.toFixed(2)} ${sy.toFixed(
+        2
+      )}) rotate(${angle.toFixed(1)})" data-spot-toast="${escapeHtml(
+        spotToast
+      )}">`;
+
+      if (isRecZone) {
+        html += `<rect x="${(-w / 2 - 0.45).toFixed(2)}" y="${(
+          -h / 2 -
+          0.45
+        ).toFixed(2)}" width="${(w + 0.9).toFixed(2)}" height="${(
+          h + 0.9
+        ).toFixed(
+          2
+        )}" rx="0.65" fill="rgba(40, 205, 65, 0.28)" stroke="#28CD41" stroke-width="0.30"/>`;
+      }
+
+      html += `
+        <rect x="${(-w / 2).toFixed(2)}" y="${(-h / 2).toFixed(
+          2
+        )}" width="${w.toFixed(2)}" height="${h.toFixed(2)}" rx="0.36"
+              fill="${fill}" stroke="${outerStroke}" stroke-width="${outerStrokeW}" ${outerDash}/>
+        <rect x="${(-w / 2 + 0.14).toFixed(2)}" y="${(
+          -h / 2 +
+          0.14
+        ).toFixed(2)}" width="${Math.max(0.2, w - 0.28).toFixed(
+          2
+        )}" height="${Math.max(0.2, h - 0.28).toFixed(2)}" rx="0.26"
+              fill="none" stroke="rgba(255,255,255,0.72)" stroke-width="0.14"/>
+      `;
+
+      if (sp.spot_type === "elastic_strip") {
+        const cap = Math.max(2, Number(sp.capacity || 3));
+        for (let k = 1; k < cap; k++) {
+          const divX = -w / 2 + (w * k) / cap;
+          html += `<line x1="${divX.toFixed(2)}" y1="${(-h * 0.38).toFixed(
+            2
+          )}" x2="${divX.toFixed(2)}" y2="${(h * 0.38).toFixed(
+            2
+          )}" stroke="rgba(255,255,255,0.62)" stroke-width="0.18" stroke-dasharray="0.45,0.35"/>`;
+        }
+      } else if (w > h * 1.22) {
+        const cw = w * 0.76;
+        const ch = h * 0.68;
+        html += `
+          <rect x="${(-cw / 2).toFixed(2)}" y="${(-ch / 2).toFixed(
+            2
+          )}" width="${cw.toFixed(2)}" height="${ch.toFixed(2)}" rx="${(
+            ch * 0.28
+          ).toFixed(
+            2
+          )}" fill="rgba(255,255,255,0.16)" stroke="rgba(255,255,255,0.58)" stroke-width="0.13"/>
+          <polygon points="${(cw * 0.1).toFixed(2)},${(-ch * 0.36).toFixed(
+            2
+          )} ${(cw * 0.32).toFixed(2)},${(-ch * 0.28).toFixed(2)} ${(
+            cw * 0.32
+          ).toFixed(2)},${(ch * 0.28).toFixed(2)} ${(cw * 0.1).toFixed(2)},${(
+            ch * 0.36
+          ).toFixed(2)}" fill="rgba(255,255,255,0.34)"/>
+          <line x1="${(w / 2 - 0.34).toFixed(2)}" y1="${(-h * 0.26).toFixed(
+            2
+          )}" x2="${(w / 2 - 0.34).toFixed(2)}" y2="${(h * 0.26).toFixed(
+            2
+          )}" stroke="rgba(255,255,255,0.88)" stroke-width="0.20" stroke-linecap="round"/>
+        `;
+      } else {
+        const cw = w * 0.7;
+        const ch = h * 0.76;
+        html += `
+          <rect x="${(-cw / 2).toFixed(2)}" y="${(-ch / 2).toFixed(
+            2
+          )}" width="${cw.toFixed(2)}" height="${ch.toFixed(2)}" rx="${(
+            cw * 0.28
+          ).toFixed(
+            2
+          )}" fill="rgba(255,255,255,0.16)" stroke="rgba(255,255,255,0.58)" stroke-width="0.13"/>
+          <polygon points="${(-cw * 0.36).toFixed(2)},${(-ch * 0.1).toFixed(
+            2
+          )} ${(cw * 0.36).toFixed(2)},${(-ch * 0.1).toFixed(2)} ${(
+            cw * 0.28
+          ).toFixed(2)},${(-ch * 0.32).toFixed(2)} ${(-cw * 0.28).toFixed(
+            2
+          )},${(-ch * 0.32).toFixed(2)}" fill="rgba(255,255,255,0.34)"/>
+          <line x1="${(-w * 0.28).toFixed(2)}" y1="${(-h / 2 + 0.36).toFixed(
+            2
+          )}" x2="${(w * 0.28).toFixed(2)}" y2="${(-h / 2 + 0.36).toFixed(
+            2
+          )}" stroke="rgba(255,255,255,0.88)" stroke-width="0.20" stroke-linecap="round"/>
+        `;
+      }
+
+      if (sp.pending_status) {
+        html += `<rect x="${(-w / 2 - 0.22).toFixed(2)}" y="${(
+          -h / 2 -
+          0.22
+        ).toFixed(2)}" width="${(w + 0.44).toFixed(2)}" height="${(
+          h + 0.44
+        ).toFixed(
+          2
+        )}" rx="0.45" fill="none" stroke="#5856D6" stroke-width="0.34" stroke-dasharray="0.65,0.42"/>`;
+      }
+
+      const minDim = Math.min(w, h);
+      if (sp.spot_type === "elastic_strip") {
+        const lblTxt = `${sp.label || "顺停"} 余${sp.free_units ?? 0}/${
+          sp.capacity || 1
+        }`;
+        html += `<text x="0" y="0.42" font-size="1.15" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeHtml(
+          lblTxt
+        )}</text>`;
+      } else if (minDim >= 1.1) {
+        const shortLbl = shortenSpotLabel(sp.label, idx);
+        const fontSz = Math.min(1.18, Math.max(0.82, minDim * 0.56)).toFixed(2);
+        html += `<g transform="rotate(${(-angle).toFixed(1)})">
+          <text x="0" y="${(Number(fontSz) * 0.35).toFixed(
+            2
+          )}" font-size="${fontSz}" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeHtml(
+            shortLbl
+          )}</text>
+        </g>`;
+      }
+
+      html += `</g>`;
+    });
+
+    // 5. Walking Path from Selected Unit Door 🚪 to Recommended/Nearest Stall Strip
+    let walkObj =
+      rec && rec.door_walk_path && rec.door_walk_path.unit_id === state.unitId
+        ? rec.door_walk_path
+        : null;
+    if (!walkObj && state.unitId && Array.isArray(ov.spot_groups)) {
+      const candidates = ov.spot_groups.filter(
+        (g) =>
+          g.map_placed !== false &&
+          g.selected_door_walk &&
+          Array.isArray(g.selected_door_walk.path_points) &&
+          g.selected_door_walk.path_points.length >= 2
+      );
+      const pref = candidates
+        .slice()
+        .sort((a, b) => {
+          const aFree = Number(a.effective_free || 0) > 0 ? 0 : 1;
+          const bFree = Number(b.effective_free || 0) > 0 ? 0 : 1;
+          if (aFree !== bFree) return aFree - bFree;
+          return (
+            Number(
+              (a.selected_door_walk && a.selected_door_walk.walk_meters) ?? 9999
+            ) -
+            Number(
+              (b.selected_door_walk && b.selected_door_walk.walk_meters) ?? 9999
+            )
+          );
+        })[0];
+      if (pref) {
+        walkObj = {
+          unit_id: state.unitId,
+          path_points: pref.selected_door_walk.path_points,
+          walk_meters: pref.selected_door_walk.walk_meters,
+        };
+      }
+    }
+
+    if (
+      walkObj &&
+      Array.isArray(walkObj.path_points) &&
+      walkObj.path_points.length >= 2
+    ) {
+      const wPts = walkObj.path_points.map(([wx, wy]) => [px(wx), py(wy)]);
+      const wStr = wPts
+        .map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`)
+        .join(" ");
+      let totalArc = 0;
+      for (let i = 0; i < wPts.length - 1; i++) {
+        totalArc += Math.hypot(
+          wPts[i + 1][0] - wPts[i][0],
+          wPts[i + 1][1] - wPts[i][1]
+        );
+      }
+      let halfArc = totalArc * 0.5;
+      let mxLbl = (wPts[0][0] + wPts[wPts.length - 1][0]) / 2;
+      let myLbl = (wPts[0][1] + wPts[wPts.length - 1][1]) / 2;
+      for (let i = 0; i < wPts.length - 1; i++) {
+        const seg = Math.hypot(
+          wPts[i + 1][0] - wPts[i][0],
+          wPts[i + 1][1] - wPts[i][1]
+        );
+        if (halfArc <= seg && seg > 0.001) {
+          const r = halfArc / seg;
+          mxLbl = wPts[i][0] + (wPts[i + 1][0] - wPts[i][0]) * r;
+          myLbl = wPts[i][1] + (wPts[i + 1][1] - wPts[i][1]) * r;
+          break;
+        }
+        halfArc -= seg;
+      }
+      myLbl -= 1.25 * invScale;
+      const walkText = `🚶 距单元门 ${walkObj.walk_meters}m`;
+      const pillW = Math.max(7.6, walkText.length * 1.15 + 1.8) * invScale;
+      const pillH = 2.0 * invScale;
+      html += `
+        <g pointer-events="none">
+          <polyline points="${wStr}" fill="none" stroke="rgba(13, 148, 136, 0.22)" stroke-width="${(
+            1.45 * invScale
+          ).toFixed(2)}" stroke-linecap="round" stroke-linejoin="round"/>
+          <polyline points="${wStr}" fill="none" stroke="#0D9488" stroke-width="${(
+            0.52 * invScale
+          ).toFixed(2)}" stroke-dasharray="${(0.95 * invScale).toFixed(2)},${(
+            0.65 * invScale
+          ).toFixed(2)}" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="${(mxLbl - pillW / 2).toFixed(2)}" y="${(
+            myLbl -
+            pillH / 2
+          ).toFixed(2)}" width="${pillW.toFixed(2)}" height="${pillH.toFixed(
+            2
+          )}" rx="${(pillH / 2).toFixed(
+            2
+          )}" fill="rgba(15, 118, 110, 0.94)" stroke="#FFFFFF" stroke-width="${(
+            0.24 * invScale
+          ).toFixed(2)}"/>
+          <text x="${mxLbl.toFixed(2)}" y="${(myLbl + 0.38 * invScale).toFixed(
+            2
+          )}" font-size="${(1.06 * invScale).toFixed(
+            2
+          )}" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeHtml(
+            walkText
+          )}</text>
+        </g>
+      `;
+    }
+
+    // 6. Named Parking Strip Summary Chips & In-Transit Soft-Lock Pills (with anti-overlap nudge)
+    const occupiedChipBoxes = unitsToDraw.map((u) => {
+      const ux = px(u.map_x);
+      const uy = py(u.map_y);
+      const compactLabel = formatCompactUnitBadgeLabel(u, unitsToDraw);
+      const shortText = `${u.unit_id === state.unitId ? "★ " : ""}${compactLabel}`;
+      const uw = Math.max(5.6, shortText.length * 1.28 + 1.8) * invScale;
+      const uh = 2.55 * invScale;
+      return { cx: ux, cy: uy, w: uw + 0.6, h: uh + 0.6 };
+    });
+    const boxesOverlap = (a, b) =>
+      Math.abs(a.cx - b.cx) * 2 < a.w + b.w &&
+      Math.abs(a.cy - b.cy) * 2 < a.h + b.h;
+
+    (ov.spot_groups || []).forEach((grp) => {
+      if (grp.map_placed === false || !grp.spot_count) return;
+      const gSpots = spotsToDraw.filter(
+        (s) => (s.group_code || "") === grp.group_code
+      );
+      if (!gSpots.length) return;
+      const gPts = gSpots.map((s) => [px(s.map_x), py(s.map_y)]);
+      const baseCx = gPts.reduce((a, p) => a + p[0], 0) / gPts.length;
+      const topY = Math.min(...gPts.map((p) => p[1])) - 2.45 * invScale;
+      const botY = Math.max(...gPts.map((p) => p[1])) + 2.55 * invScale;
+      const dispName = grp.group_name || grp.group_code;
+      const shortDisp =
+        dispName.length > 8 ? `${dispName.slice(0, 7)}…` : dispName;
+      const isRecGrp = recGroupCode && grp.group_code === recGroupCode;
+      const statusTxt = grp.is_bound ? `余${grp.effective_free}` : "待接入";
+      const chipTxt = `${isRecGrp ? "★ " : ""}${shortDisp} · ${statusTxt}`;
+      const bw = Math.max(7.2, chipTxt.length * 1.05 + 1.6) * invScale;
+      const bh = 1.92 * invScale;
+
+      const candidates = [
+        [baseCx, topY],
+        [baseCx, topY - 2.15 * invScale],
+        [baseCx, botY],
+        [baseCx - 3.6 * invScale, topY],
+        [baseCx + 3.6 * invScale, topY],
+        [baseCx, botY + 2.15 * invScale],
+      ];
+      let gcx = baseCx;
+      let minGY = topY;
+      for (const [candX, candY] of candidates) {
+        const clampedX = Math.max(
+          bw / 2 + 0.6,
+          Math.min(worldW - bw / 2 - 0.6, candX)
+        );
+        const clampedY = Math.max(
+          bh / 2 + 0.6,
+          Math.min(worldH - bh / 2 - 0.6, candY)
+        );
+        const box = { cx: clampedX, cy: clampedY, w: bw + 0.4, h: bh + 0.35 };
+        if (!occupiedChipBoxes.some((ob) => boxesOverlap(box, ob))) {
+          gcx = clampedX;
+          minGY = clampedY;
+          break;
+        }
+      }
+      occupiedChipBoxes.push({ cx: gcx, cy: minGY, w: bw + 0.4, h: bh + 0.35 });
+      const bgFill = isRecGrp
+        ? "#0071E3"
+        : grp.is_bound
+        ? "rgba(15, 23, 42, 0.84)"
+        : "rgba(100, 116, 139, 0.86)";
+      const walkM =
+        grp.selected_door_walk && grp.selected_door_walk.walk_meters != null
+          ? ` · 距单元门约 ${grp.selected_door_walk.walk_meters}m`
+          : "";
+      const grpToast = `${dispName}：净余 ${grp.effective_free}/${grp.total_capacity} 位${walkM}`;
+
+      html += `
+        <g data-spot-toast="${escapeHtml(grpToast)}">
+          <rect x="${(gcx - bw / 2).toFixed(2)}" y="${(minGY - bh / 2).toFixed(
+            2
+          )}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" rx="${(
+            bh / 2
+          ).toFixed(
+            2
+          )}" fill="${bgFill}" stroke="rgba(255,255,255,0.88)" stroke-width="${(
+            0.24 * invScale
+          ).toFixed(2)}"/>
+          <text x="${gcx.toFixed(2)}" y="${(minGY + 0.36 * invScale).toFixed(
+            2
+          )}" font-size="${(1.02 * invScale).toFixed(
+            2
+          )}" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeHtml(
+            chipTxt
+          )}</text>
+        </g>
+      `;
+
+      if (Number(grp.soft_locked || 0) > 0) {
+        const lockY = minGY - 2.2 * invScale;
+        const pillW = 6.2 * invScale;
+        const pillH = 1.9 * invScale;
+        html += `
+          <g pointer-events="none">
+            <rect x="${(gcx - pillW / 2).toFixed(2)}" y="${(
+              lockY -
+              pillH / 2
+            ).toFixed(2)}" width="${pillW.toFixed(2)}" height="${pillH.toFixed(
+              2
+            )}" rx="${(pillH / 2).toFixed(
+              2
+            )}" fill="#0071E3" stroke="#FFFFFF" stroke-width="${(
+              0.24 * invScale
+            ).toFixed(2)}"/>
+            <text x="${gcx.toFixed(2)}" y="${(lockY + 0.36 * invScale).toFixed(
+              2
+            )}" font-size="${(1.04 * invScale).toFixed(
+              2
+            )}" fill="#FFFFFF" font-weight="700" text-anchor="middle">在途×${
+              grp.soft_locked
+            }</text>
+          </g>
+        `;
+      }
+    });
+
+    // 7. Community Entrance Gate Pills
+    for (const g of gates) {
+      const gx = px(Number(g.x ?? 50));
+      const gy = py(Number(g.y ?? 96));
+      const labelStr = g.name || "出入口";
+      const gw =
+        Math.max(5.8, Math.min(11.5, labelStr.length * 1.65 + 2.2)) * invScale;
+      const gh = 2.45 * invScale;
+      html += `
+        <g pointer-events="none">
+          <rect x="${(gx - gw / 2).toFixed(2)}" y="${(gy - gh / 2).toFixed(
+            2
+          )}" width="${gw.toFixed(2)}" height="${gh.toFixed(2)}" rx="${(
+            gh / 2
+          ).toFixed(2)}"
+                fill="#0071E3" stroke="#FFFFFF" stroke-width="${(
+                  0.3 * invScale
+                ).toFixed(2)}"/>
+          <text x="${gx.toFixed(2)}" y="${(gy + 0.46 * invScale).toFixed(
+            2
+          )}" font-size="${(1.32 * invScale).toFixed(
+            2
+          )}" fill="#FFFFFF" font-weight="600" text-anchor="middle">${escapeHtml(
+            labelStr
+          )}</text>
+        </g>
+      `;
+    }
+
+    // 8. Building Unit Badges & Entrance Door Pins (Tap to switch destination)
+    for (const u of unitsToDraw) {
+      const ux = px(u.map_x);
+      const uy = py(u.map_y);
+      const dx = px(u.door_x != null ? u.door_x : u.map_x);
+      const dy = py(u.door_y != null ? u.door_y : u.map_y);
+      const isHome = u.unit_id === state.unitId;
+      const compactLabel = formatCompactUnitBadgeLabel(u, unitsToDraw);
+      const shortText = `${isHome ? "★ " : ""}${compactLabel}`;
+      const uw = Math.max(5.6, shortText.length * 1.28 + 1.8) * invScale;
+      const uh = 2.55 * invScale;
+      const doorDistPx = Math.hypot(dx - ux, dy - uy);
+
+      if (doorDistPx > 0.35) {
+        html += `
+          <line x1="${ux.toFixed(2)}" y1="${uy.toFixed(2)}" x2="${dx.toFixed(
+            2
+          )}" y2="${dy.toFixed(2)}" stroke="${
+            isHome ? "#0D9488" : "rgba(13, 148, 136, 0.62)"
+          }" stroke-width="${((isHome ? 0.36 : 0.24) * invScale).toFixed(
+            2
+          )}" stroke-dasharray="${(0.65 * invScale).toFixed(2)},${(
+            0.45 * invScale
+          ).toFixed(2)}" pointer-events="none"/>
+        `;
+      }
+
+      const doorR = (isHome ? 1.12 : 0.88) * invScale;
+      html += `
+        <g class="clickable-unit" data-unit-id="${escapeHtml(u.unit_id)}">
+          <circle cx="${dx.toFixed(2)}" cy="${dy.toFixed(2)}" r="${doorR.toFixed(
+            2
+          )}" fill="${
+            isHome ? "#0D9488" : "#14B8A6"
+          }" stroke="#FFFFFF" stroke-width="${(0.28 * invScale).toFixed(2)}"/>
+          <text x="${dx.toFixed(2)}" y="${(dy + 0.36 * invScale).toFixed(
+            2
+          )}" font-size="${(0.95 * invScale).toFixed(
+            2
+          )}" fill="#FFFFFF" text-anchor="middle" font-weight="800">门</text>
+        </g>
+        <g class="clickable-unit" data-unit-id="${escapeHtml(u.unit_id)}">
+          <rect x="${(ux - uw / 2).toFixed(2)}" y="${(uy - uh / 2).toFixed(
+            2
+          )}" width="${uw.toFixed(2)}" height="${uh.toFixed(2)}" rx="${(
+            0.85 * invScale
+          ).toFixed(2)}"
+                fill="${isHome ? "#0071E3" : "rgba(255, 255, 255, 0.95)"}"
+                stroke="${
+                  isHome ? "#FFFFFF" : "#475569"
+                }" stroke-width="${((isHome ? 0.48 : 0.34) * invScale).toFixed(
+                  2
+                )}"/>
+          <text x="${ux.toFixed(2)}" y="${(uy + 0.48 * invScale).toFixed(
+            2
+          )}" font-size="${(1.32 * invScale).toFixed(2)}" fill="${
+            isHome ? "#FFFFFF" : "#0F172A"
+          }" text-anchor="middle" font-weight="700">${escapeHtml(
+            shortText
+          )}</text>
+        </g>
+      `;
+    }
+
+    els.mapSvg.innerHTML = html;
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI Data Binding & Live Polling
+  // ---------------------------------------------------------------------------
+
+  function showMapToast(msg) {
+    if (!msg) return;
+    els.mapSpotToast.textContent = msg;
+    els.mapSpotToast.hidden = false;
+    if (state.toastTimer) clearTimeout(state.toastTimer);
+    state.toastTimer = setTimeout(() => {
+      els.mapSpotToast.hidden = true;
+    }, 2800);
+  }
+
+  function populateUnitSelect(units, selectedUnitId) {
+    if (!Array.isArray(units) || !units.length) return;
+    const currentOpts = Array.from(els.unitSelect.options).map((o) => o.value);
+    const nextIds = units.map((u) => u.unit_id);
+    const sameList =
+      currentOpts.length === nextIds.length &&
+      currentOpts.every((id, idx) => id === nextIds[idx]);
+
+    if (!sameList) {
+      els.unitSelect.innerHTML = units
+        .map(
+          (u) =>
+            `<option value="${escapeHtml(u.unit_id)}">${escapeHtml(
+              u.name || u.unit_id
+            )}</option>`
+        )
+        .join("");
+    }
+    if (selectedUnitId && nextIds.includes(selectedUnitId)) {
+      els.unitSelect.value = selectedUnitId;
+    }
+  }
+
+  async function ensureBackdropLoaded() {
+    if (!state.showBackdrop || state.backdropDataUrl || state.backdropLoading) {
+      return;
+    }
+    state.backdropLoading = true;
+    try {
+      const resp = await fetch("/api/mobile/backdrop", { cache: "no-store" });
+      if (resp.ok) {
+        const data = await resp.json();
+        const rawB64 =
+          (data && (data.backdrop_data_url || data.backdrop_jpeg_b64)) || "";
+        if (data && data.has_backdrop && rawB64) {
+          state.backdropDataUrl = rawB64.startsWith("data:")
+            ? rawB64
+            : `data:image/jpeg;base64,${rawB64}`;
+          renderFloorPlanSvg();
+        }
+      }
+    } catch (_err) {
+      // Ignore backdrop fetch failure
+    } finally {
+      state.backdropLoading = false;
+    }
+  }
+
+  function renderGuidanceStrip(ov) {
+    const rec = ov && ov.recommendation;
+    if (!rec) return;
+
+    if (!rec.has_recommendation || !rec.primary) {
+      els.guidanceCard.classList.add("is-full");
+      els.recBadgeTag.textContent = "车位暂满";
+      els.recZoneName.textContent = "小区地面公益车位暂满";
+      els.recFreePill.textContent = "净余 0";
+
+      let nearestWalkM = null;
+      if (Array.isArray(ov.spot_groups)) {
+        for (const g of ov.spot_groups) {
+          const wm = g.selected_door_walk && g.selected_door_walk.walk_meters;
+          if (wm != null && (nearestWalkM == null || wm < nearestWalkM)) {
+            nearestWalkM = wm;
+          }
+        }
+      }
+      els.recWalkPill.textContent =
+        nearestWalkM != null ? `🚶 最近车位带 ${nearestWalkM}m` : "建议周边临停";
+      els.recBackupText.textContent =
+        rec.voice_text || "当前暂无可用空位，请留意周边临停导引";
+      return;
+    }
+
+    els.guidanceCard.classList.remove("is-full");
+    const primary = rec.primary;
+    const freeCnt =
+      primary.effective_free != null ? primary.effective_free : 0;
+    const walkVal =
+      primary.walk_meters != null
+        ? primary.walk_meters
+        : primary.walk_distance_m;
+    const walkM = walkVal != null ? `${walkVal}m` : "--m";
+
+    els.recBadgeTag.textContent = "首选推荐";
+    els.recZoneName.textContent =
+      primary.broadcast_zone_name || primary.zone_name || primary.zone_id;
+    els.recFreePill.textContent = `净余 ${freeCnt} 位`;
+    els.recWalkPill.textContent = `🚶 距单元门 ${walkM}`;
+
+    const b0 =
+      rec.backup || (Array.isArray(rec.backups) ? rec.backups[0] : null);
+    if (b0 && b0.zone_name) {
+      const bWalk =
+        b0.walk_meters != null ? b0.walk_meters : b0.walk_distance_m ?? "--";
+      els.recBackupText.textContent = `备选：${b0.zone_name}（余 ${b0.effective_free} 位 · 步行 ${bWalk}m）`;
+    } else {
+      els.recBackupText.textContent = "轻触地图楼栋或门标可快速切换目的地";
+    }
+  }
+
+  async function fetchOverview({ forceSpeak = false } = {}) {
+    if (state.fetching) return;
+    state.fetching = true;
+    try {
+      const qs = state.unitId
+        ? `?unit_id=${encodeURIComponent(state.unitId)}`
+        : "";
+      const resp = await fetch(`/api/mobile/overview${qs}`, {
+        cache: "no-store",
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+
+      if (
+        state.mobileVersion &&
+        data.mobile_version &&
+        data.mobile_version !== state.mobileVersion
+      ) {
+        window.location.reload();
+        return;
+      }
+      if (data.mobile_version) {
+        state.mobileVersion = data.mobile_version;
+      }
+
+      els.liveDot.classList.remove("is-offline");
+      state.overview = data;
+      if (data.community_name) {
+        els.communityName.textContent = data.community_name;
+      }
+
+      const totalFree = Number(
+        data.total_effective_free != null
+          ? data.total_effective_free
+          : (data.summary && data.summary.effective_free_spots) || 0
+      );
+      els.totalFreeNum.textContent = String(totalFree);
+      els.totalFreePill.classList.toggle("is-full", totalFree <= 0);
+
+      const resolvedUnit = data.selected_unit_id || state.unitId;
+      if (resolvedUnit && resolvedUnit !== state.unitId) {
+        state.unitId = resolvedUnit;
+        persistSettings();
+      }
+      syncUrlUnitParam(state.unitId);
+      populateUnitSelect(data.units || [], state.unitId);
+
+      const hasBackdrop = Boolean(data.site_map && data.site_map.has_backdrop);
+      els.btnBackdropToggle.hidden = !hasBackdrop;
+      els.btnBackdropToggle.classList.toggle(
+        "is-active",
+        hasBackdrop && state.showBackdrop
+      );
+      if (hasBackdrop && state.showBackdrop) {
+        ensureBackdropLoaded();
+      }
+
+      renderGuidanceStrip(data);
+      renderFloorPlanSvg();
+
+      const rec = data.recommendation;
+      const voiceText = (rec && rec.voice_text) || "";
+      state.latestVoiceText = voiceText;
+      const newSig = buildRecommendationSignature(rec, state.unitId);
+      const wasInitialLoad = !state.lastAnnouncedSig;
+      const sigChanged = Boolean(newSig && newSig !== state.lastAnnouncedSig);
+      state.lastAnnouncedSig = newSig;
+
+      if (state.repeatCount > 0 && voiceText) {
+        if (forceSpeak) {
+          speakBroadcast(voiceText, state.repeatCount, "manual");
+        } else if (wasInitialLoad) {
+          speakBroadcast(voiceText, state.repeatCount, "initial");
+        } else if (sigChanged && (state.continuousBroadcast || !state.isSpeaking)) {
+          speakBroadcast(voiceText, state.repeatCount, "change");
+        }
+      }
+    } catch (_err) {
+      els.liveDot.classList.add("is-offline");
+    } finally {
+      state.fetching = false;
+    }
+  }
+
+  function changeDestination(nextUnitId, speakNow = true) {
+    const cleanId = String(nextUnitId || "").trim();
+    if (!cleanId) return;
+    state.unitId = cleanId;
+    els.unitSelect.value = cleanId;
+    persistSettings();
+    syncUrlUnitParam(cleanId);
+    fetchOverview({ forceSpeak: speakNow && state.repeatCount > 0 });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Touch Pan / Pinch-to-Zoom / Tap Gesture Handling on Floor-Plan Stage
+  // ---------------------------------------------------------------------------
+
+  function bindMapGestures() {
+    const activePointers = new Map();
+    let gestureStartDist = 0;
+    let gestureStartZoom = 1;
+    let lastSinglePt = null;
+    let tapStartPt = null;
+    let maxMovePx = 0;
+
+    const getSvgRect = () => els.mapSvg.getBoundingClientRect();
+
+    els.mapSvg.addEventListener("pointerdown", (ev) => {
+      activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      try {
+        els.mapSvg.setPointerCapture(ev.pointerId);
+      } catch (_e) {
+        // Ignore
+      }
+
+      if (activePointers.size === 1) {
+        lastSinglePt = { x: ev.clientX, y: ev.clientY };
+        tapStartPt = {
+          x: ev.clientX,
+          y: ev.clientY,
+          target: ev.target,
+        };
+        maxMovePx = 0;
+      } else if (activePointers.size === 2) {
+        const pts = Array.from(activePointers.values());
+        gestureStartDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        gestureStartZoom = state.zoom;
+        tapStartPt = null;
+      }
+    });
+
+    els.mapSvg.addEventListener("pointermove", (ev) => {
+      if (!activePointers.has(ev.pointerId)) return;
+      activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+      if (activePointers.size === 1 && lastSinglePt) {
+        const dxPx = ev.clientX - lastSinglePt.x;
+        const dyPx = ev.clientY - lastSinglePt.y;
+        lastSinglePt = { x: ev.clientX, y: ev.clientY };
+        if (tapStartPt) {
+          maxMovePx = Math.max(
+            maxMovePx,
+            Math.hypot(ev.clientX - tapStartPt.x, ev.clientY - tapStartPt.y)
+          );
+        }
+        if (state.zoom > 1.005 && (Math.abs(dxPx) > 0.5 || Math.abs(dyPx) > 0.5)) {
+          const rect = getSvgRect();
+          if (rect.width > 10 && rect.height > 10) {
+            const vw = state.worldW / state.zoom;
+            const vh = state.worldH / state.zoom;
+            state.panX -= (dxPx / rect.width) * vw;
+            state.panY -= (dyPx / rect.height) * vh;
+            applySvgViewBox();
+          }
+        }
+      } else if (activePointers.size === 2 && gestureStartDist > 12) {
+        const pts = Array.from(activePointers.values());
+        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        const midX = (pts[0].x + pts[1].x) / 2;
+        const midY = (pts[0].y + pts[1].y) / 2;
+        const rect = getSvgRect();
+        const rx =
+          rect.width > 0
+            ? Math.max(0, Math.min(1, (midX - rect.left) / rect.width))
+            : 0.5;
+        const ry =
+          rect.height > 0
+            ? Math.max(0, Math.min(1, (midY - rect.top) / rect.height))
+            : 0.5;
+        const nextZoom = gestureStartZoom * (dist / gestureStartDist);
+        zoomAroundRatio(nextZoom, rx, ry);
+      }
+    });
+
+    const finishPointer = (ev) => {
+      const wasSingleTap =
+        activePointers.size === 1 && tapStartPt && maxMovePx < 9;
+      const tapOriginTarget = tapStartPt ? tapStartPt.target : null;
+      activePointers.delete(ev.pointerId);
+
+      if (activePointers.size === 1) {
+        const remaining = Array.from(activePointers.values())[0];
+        lastSinglePt = { x: remaining.x, y: remaining.y };
+      } else if (activePointers.size === 0) {
+        lastSinglePt = null;
+      }
+
+      if (wasSingleTap && tapOriginTarget && tapOriginTarget.closest) {
+        const unitNode = tapOriginTarget.closest("[data-unit-id]");
+        if (unitNode) {
+          const uid = unitNode.getAttribute("data-unit-id");
+          if (uid) {
+            showMapToast(`🏠 已切换目的地：${uid}`);
+            changeDestination(uid, true);
+          }
+          tapStartPt = null;
+          return;
+        }
+        const toastNode = tapOriginTarget.closest("[data-spot-toast]");
+        if (toastNode) {
+          showMapToast(toastNode.getAttribute("data-spot-toast"));
+        }
+      }
+      tapStartPt = null;
+    };
+
+    els.mapSvg.addEventListener("pointerup", finishPointer);
+    els.mapSvg.addEventListener("pointercancel", finishPointer);
+
+    // Desktop wheel zoom convenience
+    els.mapSvg.addEventListener(
+      "wheel",
+      (ev) => {
+        ev.preventDefault();
+        const rect = getSvgRect();
+        const rx =
+          rect.width > 0
+            ? Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width))
+            : 0.5;
+        const ry =
+          rect.height > 0
+            ? Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height))
+            : 0.5;
+        const factor = ev.deltaY < 0 ? 1.18 : 1 / 1.18;
+        zoomAroundRatio(state.zoom * factor, rx, ry);
+      },
+      { passive: false }
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Control Events & Lifecycle
+  // ---------------------------------------------------------------------------
+
+  function markUserGesture() {
+    const wasBlocked = state.speechBlockedByAutoplay;
+    state.userInteracted = true;
+    requestWakeLockIfNeeded();
+    if (
+      wasBlocked &&
+      state.repeatCount > 0 &&
+      state.latestVoiceText &&
+      !state.isSpeaking
+    ) {
+      state.speechBlockedByAutoplay = false;
+      speakBroadcast(state.latestVoiceText, state.repeatCount, "unlock");
+    }
+  }
+
+  function bindControls() {
+    document.addEventListener("pointerdown", markUserGesture, {
+      passive: true,
+    });
+
+    els.unitSelect.addEventListener("change", () => {
+      state.userInteracted = true;
+      changeDestination(els.unitSelect.value, true);
+    });
+
+    els.btnSpeakAction.addEventListener("click", () => {
+      state.userInteracted = true;
+      requestWakeLockIfNeeded();
+      if (state.isSpeaking) {
+        stopBroadcast(false);
+        return;
+      }
+      // Manual tap speaks even if currently muted (defaults to 1 pass when muted, else repeatCount)
+      const passes = state.repeatCount > 0 ? state.repeatCount : 1;
+      if (state.latestVoiceText) {
+        speakBroadcast(state.latestVoiceText, passes, "button");
+      } else {
+        fetchOverview({ forceSpeak: true });
+      }
+    });
+
+    els.repeatModeGroup.addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".m-seg-btn");
+      if (!btn) return;
+      state.userInteracted = true;
+      const nextRepeat = Number(btn.dataset.repeat);
+      state.repeatCount = nextRepeat;
+      persistSettings();
+      requestWakeLockIfNeeded();
+
+      if (nextRepeat === 0) {
+        stopBroadcast(true);
+      } else {
+        syncBroadcastControlUi();
+        if (state.latestVoiceText) {
+          speakBroadcast(state.latestVoiceText, nextRepeat, "mode-switch");
+        }
+      }
+    });
+
+    els.btnContinuousToggle.addEventListener("click", () => {
+      state.userInteracted = true;
+      state.continuousBroadcast = !state.continuousBroadcast;
+      persistSettings();
+      requestWakeLockIfNeeded();
+      if (!state.continuousBroadcast) {
+        clearContinuousTimer();
+        syncBroadcastControlUi();
+      } else {
+        // Turning continuous ON when muted restores 2-pass broadcast automatically
+        if (state.repeatCount === 0) {
+          state.repeatCount = 2;
+          persistSettings();
+        }
+        syncBroadcastControlUi();
+        if (state.latestVoiceText && !state.isSpeaking) {
+          speakBroadcast(
+            state.latestVoiceText,
+            state.repeatCount,
+            "continuous-enable"
+          );
+        }
+      }
+    });
+
+    els.btnZoomIn.addEventListener("click", () => {
+      zoomAroundRatio(state.zoom * 1.35, 0.5, 0.5);
+    });
+    els.btnZoomOut.addEventListener("click", () => {
+      zoomAroundRatio(state.zoom / 1.35, 0.5, 0.5);
+    });
+    els.btnZoomReset.addEventListener("click", () => {
+      zoomAroundRatio(1.0, 0.5, 0.5);
+    });
+    els.btnBackdropToggle.addEventListener("click", () => {
+      state.showBackdrop = !state.showBackdrop;
+      els.btnBackdropToggle.classList.toggle("is-active", state.showBackdrop);
+      persistSettings();
+      if (state.showBackdrop) {
+        ensureBackdropLoaded();
+      }
+      renderFloorPlanSvg();
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        clearContinuousTimer();
+      } else {
+        requestWakeLockIfNeeded();
+        fetchOverview({ forceSpeak: false });
+        scheduleNextContinuousCycle();
+      }
+    });
+
+    if ("speechSynthesis" in window) {
+      // Pre-warm voices array on Safari / Chrome
+      window.speechSynthesis.getVoices();
+      if ("onvoiceschanged" in window.speechSynthesis) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          window.speechSynthesis.getVoices();
+        };
+      }
+    }
+  }
+
+  function init() {
+    loadPersistedSettings();
+    syncBroadcastControlUi();
+    bindControls();
+    bindMapGestures();
+    fetchOverview({ forceSpeak: false });
+    state.pollTimer = setInterval(() => {
+      if (!document.hidden) {
+        fetchOverview({ forceSpeak: false });
+      }
+    }, POLL_INTERVAL_MS);
+  }
+
+  init();
+})();

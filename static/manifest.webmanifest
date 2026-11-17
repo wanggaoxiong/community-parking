@@ -1,0 +1,10 @@
+{
+  "name": "邻里停 · 业主寻位",
+  "short_name": "邻里寻位",
+  "description": "小区公益车位实时平面图与语音寻位播报",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F5F5F7",
+  "theme_color": "#FFFFFF",
+  "lang": "zh-CN"
+}

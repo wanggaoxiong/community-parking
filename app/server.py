@@ -55,6 +55,171 @@ def _compute_frontend_version() -> str:
     return h.hexdigest()[:10]
 
 
+def _compute_mobile_version() -> str:
+    h = hashlib.sha1()
+    for name in ("mobile.html", "mobile.js", "mobile.css", "manifest.webmanifest"):
+        fp = STATIC_DIR / name
+        if fp.is_file():
+            st = fp.stat()
+            h.update(f"{name}:{st.st_size}:{st.st_mtime_ns};".encode("utf-8"))
+    return h.hexdigest()[:10]
+
+
+def _build_mobile_overview_payload(
+    ctx: "ParkingAppContext",
+    unit_id: Optional[str] = None,
+    vehicle_type: str = "sedan",
+    entry_gate_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build a lightweight, privacy-sanitized read-only payload exclusively for the mobile owner viewer (:18790).
+    Never exposes camera IPs/URLs/credentials/VLM keys, and never creates soft locks during passive viewing.
+    """
+    vtype = vehicle_type if vehicle_type in ("sedan", "suv", "compact") else "sedan"
+    cfg = config_manager.get_public()
+    ctx.fsm.check_offline_timeouts(float(cfg.get("offline_timeout_seconds", 900)))
+    zones_raw = ctx.recommender.get_zone_summaries(vehicle_type=vtype)
+    units_list = ctx.db.list_units()
+    cams_list = ctx.db.list_cameras()
+    smap_meta = ctx.db.get_site_map(include_backdrop=False)
+
+    units_by_id = {u["unit_id"]: u for u in units_list}
+    resolved_uid = (
+        unit_id
+        if (unit_id and unit_id in units_by_id)
+        else (units_list[0]["unit_id"] if units_list else "3-1")
+    )
+
+    spatial_gov = ctx.recommender.build_spatial_governance(
+        zone_summaries=zones_raw,
+        units=units_list,
+        cameras=cams_list,
+        site_map=smap_meta,
+        selected_unit_id=resolved_uid,
+    )
+
+    sanitized_zones = []
+    for z in zones_raw:
+        placed_spots = []
+        for sp in z.get("spots") or []:
+            if not sp.get("map_placed", True) or sp.get("map_x") is None or sp.get("map_y") is None:
+                continue
+            is_assigned = str(sp.get("camera_id") or "UNASSIGNED") != "UNASSIGNED"
+            placed_spots.append(
+                {
+                    "spot_id": sp.get("spot_id"),
+                    "label": sp.get("label", ""),
+                    "zone_id": sp.get("zone_id", z["zone_id"]),
+                    "group_code": sp.get("group_code", ""),
+                    "group_name": sp.get("group_name", ""),
+                    "camera_id": "BOUND" if is_assigned else "UNASSIGNED",
+                    "spot_type": sp.get("spot_type", "standard"),
+                    "capacity": int(sp.get("capacity") or 1),
+                    "free_units": int(sp.get("free_units") or 0),
+                    "compact_only": int(sp.get("compact_only") or 0),
+                    "status": sp.get("status", "UNKNOWN"),
+                    "effective_status": sp.get("effective_status") or sp.get("status") or "UNKNOWN",
+                    "pending_status": sp.get("pending_status"),
+                    "obstacle_type": sp.get("obstacle_type", "NONE"),
+                    "action_hint": sp.get("action_hint", ""),
+                    "map_x": sp.get("map_x"),
+                    "map_y": sp.get("map_y"),
+                    "map_w": sp.get("map_w"),
+                    "map_h": sp.get("map_h"),
+                    "map_angle": sp.get("map_angle", 0.0),
+                    "map_placed": True,
+                }
+            )
+        sanitized_zones.append(
+            {
+                "zone_id": z["zone_id"],
+                "name": z["name"],
+                "map_x": z["map_x"],
+                "map_y": z["map_y"],
+                "map_w": z["map_w"],
+                "map_h": z["map_h"],
+                "map_angle": z.get("map_angle", 0.0),
+                "total_capacity": z["total_capacity"],
+                "raw_free": z["raw_free"],
+                "soft_locked": z["soft_locked"],
+                "effective_free": z["effective_free"],
+                "occupied": z["occupied"],
+                "blocked": z["blocked"],
+                "unknown": z["unknown"],
+                "spots": placed_spots,
+            }
+        )
+
+    sanitized_groups = [
+        {
+            "group_code": g["group_code"],
+            "group_name": g["group_name"],
+            "building_id": g["building_id"],
+            "building_name": g["building_name"],
+            "center_x": g["center_x"],
+            "center_y": g["center_y"],
+            "is_bound": bool(g["is_bound"]),
+            "spot_count": g["spot_count"],
+            "total_capacity": g["total_capacity"],
+            "raw_free": g["raw_free"],
+            "soft_locked": g["soft_locked"],
+            "effective_free": g["effective_free"],
+            "occupied": g["occupied"],
+            "blocked": g["blocked"],
+            "unknown": g["unknown"],
+            "pending": g.get("pending", 0),
+            "selected_door_walk": g.get("selected_door_walk"),
+        }
+        for g in (spatial_gov.get("spot_groups") or [])
+    ]
+
+    sanitized_locks = [
+        {
+            "zone_id": lk.get("zone_id", ""),
+            "group_code": lk.get("group_code", ""),
+            "expires_at": lk.get("expires_at", 0),
+        }
+        for lk in ctx.recommender.list_active_locks()
+    ]
+
+    rec_raw = ctx.recommender.recommend(
+        unit_id=resolved_uid,
+        vehicle_type=vtype,
+        driver_tag="手机端查看",
+        acquire_lock=False,
+        entry_gate_id=entry_gate_id or None,
+    )
+    sanitized_rec = {
+        "has_recommendation": bool(rec_raw.get("has_recommendation")),
+        "unit": rec_raw.get("unit"),
+        "vehicle_type": rec_raw.get("vehicle_type", vtype),
+        "primary": rec_raw.get("primary"),
+        "backup": rec_raw.get("backup"),
+        "voice_text": rec_raw.get("voice_text", ""),
+        "recommended_route": rec_raw.get("recommended_route"),
+        "door_walk_path": rec_raw.get("door_walk_path"),
+    }
+
+    total_free = sum(z["effective_free"] for z in zones_raw)
+    total_cap = sum(z["total_capacity"] for z in zones_raw)
+
+    return {
+        "community_name": cfg["community_name"],
+        "mobile_version": _compute_mobile_version(),
+        "selected_unit_id": resolved_uid,
+        "vehicle_type": vtype,
+        "total_capacity": total_cap,
+        "total_effective_free": total_free,
+        "units": units_list,
+        "zones": sanitized_zones,
+        "spot_groups": sanitized_groups,
+        "active_locks": sanitized_locks,
+        "site_map": smap_meta,
+        "recommendation": sanitized_rec,
+        "ts": time.time(),
+    }
+
+
 class PayloadTooLargeError(Exception):
     """Raised when an incoming HTTP payload exceeds MAX_HTTP_BODY_BYTES."""
 
@@ -378,6 +543,53 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                             "config": cfg,
                         },
                         extra_headers=extra_hdrs,
+                    )
+                    return
+
+                if path == "/api/mobile/overview":
+                    vtype = (qs.get("vehicle_type") or ["sedan"])[0]
+                    sel_uid = (qs.get("unit_id") or qs.get("unit") or [""])[0] or None
+                    gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    self._send_json(
+                        _build_mobile_overview_payload(
+                            ctx, unit_id=sel_uid, vehicle_type=vtype, entry_gate_id=gate_id
+                        )
+                    )
+                    return
+
+                if path == "/api/mobile/backdrop":
+                    smap_bg = ctx.db.get_site_map(include_backdrop=True)
+                    self._send_json(
+                        {
+                            "has_backdrop": bool(smap_bg.get("has_backdrop")),
+                            "backdrop_jpeg_b64": smap_bg.get("backdrop_jpeg_b64") or "",
+                            "updated_at": smap_bg.get("updated_at"),
+                        }
+                    )
+                    return
+
+                if path == "/api/mobile/recommend":
+                    unit_id = (qs.get("unit_id") or qs.get("unit") or ["3-1"])[0]
+                    vtype = (qs.get("vehicle_type") or ["sedan"])[0]
+                    entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    res = ctx.recommender.recommend(
+                        unit_id=unit_id,
+                        vehicle_type=vtype if vtype in ("sedan", "suv", "compact") else "sedan",
+                        driver_tag="手机端查看",
+                        acquire_lock=False,
+                        entry_gate_id=entry_gate_id,
+                    )
+                    self._send_json(
+                        {
+                            "has_recommendation": bool(res.get("has_recommendation")),
+                            "unit": res.get("unit"),
+                            "vehicle_type": res.get("vehicle_type", "sedan"),
+                            "primary": res.get("primary"),
+                            "backup": res.get("backup"),
+                            "voice_text": res.get("voice_text", ""),
+                            "recommended_route": res.get("recommended_route"),
+                            "door_walk_path": res.get("door_walk_path"),
+                        }
                     )
                     return
 
@@ -1691,7 +1903,12 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
 
         def _serve_static(self, req_path: str, head_only: bool = False) -> None:
             clean_path = unquote(req_path)
-            rel = "index.html" if clean_path in ("/", "") else clean_path.lstrip("/")
+            if clean_path in ("/", ""):
+                rel = "index.html"
+            elif clean_path in ("/mobile", "/mobile/"):
+                rel = "mobile.html"
+            else:
+                rel = clean_path.lstrip("/")
             file_path = (STATIC_DIR / rel).resolve()
             if not str(file_path).startswith(str(STATIC_DIR.resolve())) or not file_path.is_file():
                 self._send_json({"error": "Not found"}, 404)
@@ -1709,9 +1926,23 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                     html_txt,
                 )
                 content = html_txt.encode("utf-8")
+            elif rel == "mobile.html":
+                mob_ver = _compute_mobile_version()
+                html_txt = content.decode("utf-8")
+                html_txt = re.sub(r'/mobile\.css(?:\?v=[^"]*)?', f"/mobile.css?v={mob_ver}", html_txt)
+                html_txt = re.sub(r'/mobile\.js(?:\?v=[^"]*)?', f"/mobile.js?v={mob_ver}", html_txt)
+                html_txt = re.sub(
+                    r'<meta\s+name="parking-mobile-version"\s+content="[^"]*"\s*/?>',
+                    f'<meta name="parking-mobile-version" content="{mob_ver}" />',
+                    html_txt,
+                )
+                content = html_txt.encode("utf-8")
             try:
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", (mime or "application/octet-stream") + "; charset=utf-8" if (mime or "").startswith("text/") or str(file_path).endswith(".js") else (mime or "application/octet-stream"))
+                content_type = mime or "application/octet-stream"
+                if content_type.startswith("text/") or str(file_path).endswith((".js", ".webmanifest")):
+                    content_type = f"{content_type}; charset=utf-8"
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
                 self.send_header("Pragma", "no-cache")
@@ -1723,6 +1954,214 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                 pass
 
     return ParkingRequestHandler
+
+
+MOBILE_ALLOWED_STATIC_FILES = frozenset(
+    {
+        "mobile.html",
+        "mobile.css",
+        "mobile.js",
+        "manifest.webmanifest",
+    }
+)
+
+
+def make_mobile_http_handler(ctx: ParkingAppContext = app_ctx):
+    """
+    Strictly read-only HTTP handler dedicated to the mobile owner viewer port (:18790).
+    Exposes ONLY the minimalist mobile floor-plan & voice broadcast UI and sanitized viewer APIs.
+    """
+
+    class MobileViewerRequestHandler(BaseHTTPRequestHandler):
+        server_version = "CommunityParkingMobile/1.0"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def _send_json(self, data: Any, status: int = 200) -> None:
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _reject_readonly(self) -> None:
+            self.close_connection = True
+            self._send_json(
+                {"error": "当前端口仅供业主手机端寻位查看与语音播报，不支持后台管理或写入操作"},
+                403,
+            )
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Parking-Mobile-Client")
+            self.end_headers()
+
+        def do_POST(self) -> None:
+            self._reject_readonly()
+
+        def do_PUT(self) -> None:
+            self._reject_readonly()
+
+        def do_DELETE(self) -> None:
+            self._reject_readonly()
+
+        def do_PATCH(self) -> None:
+            self._reject_readonly()
+
+        def do_HEAD(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/health":
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            self._serve_mobile_static(parsed.path, head_only=True)
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = parse_qs(parsed.query)
+
+            try:
+                if path == "/api/health":
+                    self._send_json({"ok": True, "role": "mobile_viewer", "ts": time.time()})
+                    return
+
+                if path == "/api/mobile/overview":
+                    vtype = (qs.get("vehicle_type") or ["sedan"])[0]
+                    sel_uid = (qs.get("unit_id") or qs.get("unit") or [""])[0] or None
+                    gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    self._send_json(
+                        _build_mobile_overview_payload(
+                            ctx, unit_id=sel_uid, vehicle_type=vtype, entry_gate_id=gate_id
+                        )
+                    )
+                    return
+
+                if path == "/api/mobile/backdrop":
+                    smap_bg = ctx.db.get_site_map(include_backdrop=True)
+                    self._send_json(
+                        {
+                            "has_backdrop": bool(smap_bg.get("has_backdrop")),
+                            "backdrop_jpeg_b64": smap_bg.get("backdrop_jpeg_b64") or "",
+                            "updated_at": smap_bg.get("updated_at"),
+                        }
+                    )
+                    return
+
+                if path == "/api/mobile/recommend":
+                    unit_id = (qs.get("unit_id") or qs.get("unit") or ["3-1"])[0]
+                    vtype = (qs.get("vehicle_type") or ["sedan"])[0]
+                    entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    res = ctx.recommender.recommend(
+                        unit_id=unit_id,
+                        vehicle_type=vtype if vtype in ("sedan", "suv", "compact") else "sedan",
+                        driver_tag="手机端查看",
+                        acquire_lock=False,
+                        entry_gate_id=entry_gate_id,
+                    )
+                    self._send_json(
+                        {
+                            "has_recommendation": bool(res.get("has_recommendation")),
+                            "unit": res.get("unit"),
+                            "vehicle_type": res.get("vehicle_type", "sedan"),
+                            "primary": res.get("primary"),
+                            "backup": res.get("backup"),
+                            "voice_text": res.get("voice_text", ""),
+                            "recommended_route": res.get("recommended_route"),
+                            "door_walk_path": res.get("door_walk_path"),
+                        }
+                    )
+                    return
+
+                if path.startswith("/api/"):
+                    self._reject_readonly()
+                    return
+
+                self._serve_mobile_static(path, head_only=False)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 500)
+
+        def _serve_mobile_static(self, req_path: str, head_only: bool = False) -> None:
+            clean_path = unquote(req_path)
+            if clean_path in ("/", "", "/index.html", "/mobile", "/mobile/", "/mobile.html"):
+                rel = "mobile.html"
+            elif clean_path == "/favicon.ico":
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+            else:
+                rel = clean_path.lstrip("/")
+
+            if rel not in MOBILE_ALLOWED_STATIC_FILES:
+                self._send_json({"error": "Not found"}, 404)
+                return
+
+            file_path = (STATIC_DIR / rel).resolve()
+            if not str(file_path).startswith(str(STATIC_DIR.resolve())) or not file_path.is_file():
+                self._send_json({"error": "Not found"}, 404)
+                return
+
+            mime, _ = mimetypes.guess_type(str(file_path))
+            if rel.endswith(".webmanifest"):
+                mime = "application/manifest+json"
+            content = file_path.read_bytes()
+            if rel == "mobile.html":
+                mob_ver = _compute_mobile_version()
+                html_txt = content.decode("utf-8")
+                html_txt = re.sub(r'/mobile\.css(?:\?v=[^"]*)?', f"/mobile.css?v={mob_ver}", html_txt)
+                html_txt = re.sub(r'/mobile\.js(?:\?v=[^"]*)?', f"/mobile.js?v={mob_ver}", html_txt)
+                html_txt = re.sub(
+                    r'<meta\s+name="parking-mobile-version"\s+content="[^"]*"\s*/?>',
+                    f'<meta name="parking-mobile-version" content="{mob_ver}" />',
+                    html_txt,
+                )
+                content = html_txt.encode("utf-8")
+
+            try:
+                self.send_response(HTTPStatus.OK)
+                content_type = mime or "application/octet-stream"
+                if (
+                    content_type.startswith("text/")
+                    or str(file_path).endswith((".js", ".webmanifest"))
+                    or content_type == "application/manifest+json"
+                ):
+                    content_type = f"{content_type}; charset=utf-8"
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.end_headers()
+                if not head_only:
+                    self.wfile.write(content)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    return MobileViewerRequestHandler
+
+
+class MobileThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def create_mobile_http_server(
+    host: str = "0.0.0.0", port: int = 18790, ctx: ParkingAppContext = app_ctx
+) -> ThreadingHTTPServer:
+    handler_cls = make_mobile_http_handler(ctx)
+    return MobileThreadingHTTPServer((host, port), handler_cls)
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):

@@ -31,23 +31,32 @@
 
 ---
 
+## 文档导航（部署 · 运维 · 技术说明）
+
+- 📦 **[跨平台安装与部署手册 (`docs/DEPLOYMENT_GUIDE.md`)](docs/DEPLOYMENT_GUIDE.md)**：涵盖 **macOS（Apple Silicon M 芯片）**、**Windows（x86_64 与 ARM64）** 及 **Linux（Ubuntu / Debian 等）** 三大环境从零部署、局域网开放与防火墙配置。
+- 🛠️ **[日常运维与排障速查手册 (`docs/OPERATIONS_GUIDE.md`)](docs/OPERATIONS_GUIDE.md)**：跨平台启动 / 关闭 / 重启 / 状态巡检 / 日志跟随 / 开机自启守护、SQLite WAL 在线热备份恢复、版本升级回滚及 1 分钟排障速查表。
+- 📐 **[系统方案、架构设计与关键技术说明 (`docs/TECHNICAL_ARCHITECTURE.md`)](docs/TECHNICAL_ARCHITECTURE.md)**：总体分层架构、零落盘 64MB 有界内存防爆设计、16+ 品牌摄像头接入协议栈、RootSIFT 刚体对齐与双层多边形标定、三级视觉漏斗、双帧防抖悲观净空位状态机、2F 车行/人行双路网寻位算法及 `18790` 手机端专属只读寻位架构。
+
+---
+
 ## 快速启动
 
 ```bash
-# 1. 安装轻量依赖（仅需 OpenCV、NumPy、Pillow、Requests）
-pip install -r requirements.txt
+# 1. 创建虚拟环境并安装轻量依赖（仅需 OpenCV、NumPy、Pillow、Requests）
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
-# 2. 使用一键运维脚本启动 / 查看状态 / 重启 / 开启守护（默认 127.0.0.1:8790）
+# 2. macOS / Linux 一键启停与巡检（Windows 请在 PowerShell 使用 .\parking-ctl.ps1）
 ./parking-ctl.sh start
 ./parking-ctl.sh status
-# 可选：注册 macOS launchd 崩溃自愈与开机自启
-./parking-ctl.sh install-launchd
+# 可选：注册开机自启与崩溃守护（macOS: install-launchd | Linux: install-systemd | Windows: install-task）
 ```
 
-浏览器打开 `http://127.0.0.1:8790`：
+浏览器打开管理控制台 `http://127.0.0.1:8790`（手机端极简寻位页默认同步开启于 `http://<本机局域网IP>:18790`）：
 1. 点击右上角 **「配置 Azure 模型」**，粘贴 Azure AI Foundry 部署的 `Target URI`、模型名与 `API Key`，点击「发送测试图验证连通性」。
 2. 在 **「空间标定」** 导入基准图，用 4 点透视切分或异形多边形框选车位并保存。
 3. 在 **「抓拍测试」** 拖入 AI 生成或实拍的测试图片，实时查看逐车位识别报告与 **「寻位导览」** 语音播报变化。
+4. 业主手机连入同一 Wi-Fi（或反向代理）直接访问 `http://<局域网IP>:18790`：每台手机可独立记忆回家目的地单元，自由设置 **1遍 / 2遍 / 静音** 与 **持续播报**，并支持单指平移、双指缩放实时态势平面图（纯只读隔离，零后台管理入口）。
 
 ## 运行自动化测试
 

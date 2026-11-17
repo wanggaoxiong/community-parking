@@ -15,7 +15,7 @@ from app.config import DEFAULT_CONFIG, config_manager
 from app.database import Database
 from app.homography import extract_spot_patch, subdivide_perspective_row
 from app.recommender import ParkingRecommender
-from app.server import ParkingAppContext, create_http_server
+from app.server import ParkingAppContext, create_http_server, create_mobile_http_server
 from app.state_machine import SpotStateMachine
 from app.vision_pipeline import VisionPipeline
 
@@ -5737,6 +5737,140 @@ class CommunityParkingSystemTests(unittest.TestCase):
             srv.server_close()
             cam_srv.shutdown()
             cam_srv.server_close()
+
+    def test_mobile_viewer_18790_readonly_isolation_and_per_user_broadcast_payload(self) -> None:
+        """
+        Dedicated mobile viewer server (`:18790` default):
+        - Serves minimalist mobile UI (`/`, `/mobile.css`, `/mobile.js`, `/manifest.webmanifest`)
+        - Computes personalized destination recommendation + voice text per user (`unit_id`) WITHOUT consuming soft locks
+        - Strips camera IPs/URLs/credentials from mobile overview payload
+        - Blocks all admin endpoints and mutating HTTP methods (`POST`/`PUT`/`DELETE`) with 403
+        """
+        import urllib.error
+
+        self.assertEqual(DEFAULT_CONFIG["mobile_http_port"], 18790)
+        self.assertEqual(DEFAULT_CONFIG["mobile_http_host"], "0.0.0.0")
+
+        # Seed a camera with private LAN IP & credentials to ensure zero leakage on mobile port
+        self.db.upsert_camera(
+            camera_id="CAM_SECRET_RTSP",
+            name="机房内网球机",
+            zone_id="Z_BLDG3_EAST",
+            ingest_config={
+                "enabled": True,
+                "brand": "hikvision",
+                "mode": "pull_http",
+                "ip": "192.168.99.208",
+                "username": "admin",
+                "password": "TopSecretPassword!99",
+                "snapshot_url": "http://192.168.99.208/ISAPI/Streaming/channels/101/picture",
+            },
+        )
+        self.db.save_camera_spots(
+            "CAM_SECRET_RTSP",
+            "Z_BLDG3_EAST",
+            [
+                {
+                    "spot_id": "CAM_SECRET_RTSP-S01",
+                    "label": "01",
+                    "spot_type": "standard",
+                    "polygon": [[40.0, 40.0], [180.0, 40.0], [180.0, 220.0], [40.0, 220.0]],
+                    "status": "FREE",
+                }
+            ],
+            640,
+            360,
+        )
+
+        ctx = ParkingAppContext(database=self.db)
+        mob_srv = create_mobile_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        mob_port = mob_srv.server_address[1]
+        t_mob = threading.Thread(target=mob_srv.serve_forever, daemon=True)
+        t_mob.start()
+        try:
+            # 1. Static assets & minimalist UI elements (destination + 1x/2x/mute + continuous toggle + floorplan SVG)
+            with urllib.request.urlopen(f"http://127.0.0.1:{mob_port}/", timeout=5) as r_html:
+                html = r_html.read().decode("utf-8")
+            self.assertIn("mobileUnitSelect", html)
+            self.assertIn("repeatModeGroup", html)
+            self.assertIn('data-repeat="1"', html)
+            self.assertIn('data-repeat="2"', html)
+            self.assertIn("btnContinuousToggle", html)
+            self.assertIn("mobileMapSvg", html)
+            self.assertNotIn("摄像头管理", html)
+            self.assertNotIn("空间标定", html)
+
+            for asset_path in ("/mobile.css", "/mobile.js", "/manifest.webmanifest"):
+                with urllib.request.urlopen(f"http://127.0.0.1:{mob_port}{asset_path}", timeout=5) as r_asset:
+                    self.assertEqual(r_asset.status, 200)
+                    self.assertGreater(len(r_asset.read()), 120)
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{mob_port}/api/health", timeout=5) as r_hlth:
+                hlth = json.loads(r_hlth.read().decode("utf-8"))
+            self.assertTrue(hlth["ok"])
+            self.assertEqual(hlth["role"], "mobile_viewer")
+
+            # 2. Per-user destination recommendation & floorplan overview, ZERO soft locks created, ZERO secret leakage
+            with urllib.request.urlopen(f"http://127.0.0.1:{mob_port}/api/mobile/overview?unit_id=3-1", timeout=5) as r_ov1:
+                raw_ov1 = r_ov1.read().decode("utf-8")
+                ov1 = json.loads(raw_ov1)
+            self.assertEqual(ov1["selected_unit_id"], "3-1")
+            self.assertIn("voice_text", ov1["recommendation"])
+            self.assertTrue(bool(ov1["recommendation"]["voice_text"]))
+            self.assertIn("site_map", ov1)
+            self.assertGreater(ov1["total_capacity"], 0)
+            self.assertGreaterEqual(ov1["total_effective_free"], 0)
+            # No camera credentials, IPs, or raw camera registry exposed!
+            self.assertNotIn("cameras", ov1)
+            self.assertNotIn("192.168.99.208", raw_ov1)
+            self.assertNotIn("TopSecretPassword", raw_ov1)
+            self.assertNotIn("CAM_SECRET_RTSP", [sp["camera_id"] for z in ov1["zones"] for sp in z["spots"]])
+
+            # Different resident choosing another unit (`1-1` or second unit in DB) gets tailored recommendation
+            other_uid = next((u["unit_id"] for u in ov1["units"] if u["unit_id"] != "3-1"), "3-1")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{mob_port}/api/mobile/recommend?unit_id={other_uid}", timeout=5
+            ) as r_rec2:
+                rec2 = json.loads(r_rec2.read().decode("utf-8"))
+            self.assertEqual(rec2["unit"]["unit_id"], other_uid)
+            self.assertIsNone(rec2.get("lock_created"))
+            # Soft-lock pool must remain completely untouched after multiple mobile user polls!
+            self.assertEqual(len(ctx.recommender.list_active_locks()), 0)
+
+            # 3. Admin API paths return 403, unlisted admin static files return 404, and write verbs return 403
+            for forbidden_api in ("/api/cameras", "/api/config", "/api/overview"):
+                with self.assertRaises(urllib.error.HTTPError) as cm_get:
+                    urllib.request.urlopen(f"http://127.0.0.1:{mob_port}{forbidden_api}", timeout=5)
+                self.assertEqual(cm_get.exception.code, 403)
+
+            for unlisted_static in ("/app.js", "/styles.css"):
+                with self.assertRaises(urllib.error.HTTPError) as cm_st:
+                    urllib.request.urlopen(f"http://127.0.0.1:{mob_port}{unlisted_static}", timeout=5)
+                self.assertEqual(cm_st.exception.code, 404)
+
+            # `/index.html` on :18790 routes to mobile.html, NEVER the admin console index.html
+            with urllib.request.urlopen(f"http://127.0.0.1:{mob_port}/index.html", timeout=5) as r_idx:
+                idx_html = r_idx.read().decode("utf-8")
+            self.assertIn("mobileUnitSelect", idx_html)
+            self.assertNotIn("空间标定", idx_html)
+
+            for method, forbidden_write in (
+                ("POST", "/api/recommend"),
+                ("POST", "/api/config"),
+                ("DELETE", "/api/locks"),
+            ):
+                req_forbid = urllib.request.Request(
+                    f"http://127.0.0.1:{mob_port}{forbidden_write}",
+                    data=b"{}" if method == "POST" else None,
+                    headers={"Content-Type": "application/json"},
+                    method=method,
+                )
+                with self.assertRaises(urllib.error.HTTPError) as cm_wr:
+                    urllib.request.urlopen(req_forbid, timeout=5)
+                self.assertEqual(cm_wr.exception.code, 403)
+        finally:
+            mob_srv.shutdown()
+            mob_srv.server_close()
 
 
 if __name__ == "__main__":

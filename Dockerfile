@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # ==============================================================================
 # 邻里停 (Community Parking) 多架构生产容器镜像
 # 原生支持: linux/amd64 (x86_64 云主机/Windows) & linux/arm64 (Mac M芯片/ARM Spot)

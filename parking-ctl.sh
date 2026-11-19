@@ -121,7 +121,7 @@ wait_healthy() {
   target_host="$(probe_host)"
   mobile_target="$(probe_mobile_host)"
   voice_target="$(probe_voice_host)"
-  local retries=25
+  local retries=45
   for ((i = 1; i <= retries; i++)); do
     if curl --noproxy '*' -fsS -m 2 "http://${target_host}:${PORT}/api/health" >/dev/null 2>&1 \
       && curl --noproxy '*' -fsS -m 2 "http://${mobile_target}:${MOBILE_PORT}/api/health" >/dev/null 2>&1 \
@@ -367,6 +367,33 @@ cmd_uninstall_systemd() {
   fi
 }
 
+DOCKER_CMD=(docker)
+
+ensure_docker_ready() {
+  if ! command -v docker >/dev/null 2>&1; then
+    if [[ "${OS_NAME}" == "Linux" ]] && command -v apt-get >/dev/null 2>&1; then
+      echo "📦 检测到当前 Ubuntu/Debian 尚未安装 Docker，正在自动安装 Docker Engine 与 Compose v2..."
+      if curl -fsSL --connect-timeout 10 -m 30 https://get.docker.com -o /tmp/get-docker.sh 2>/dev/null; then
+        sudo sh /tmp/get-docker.sh && rm -f /tmp/get-docker.sh
+      else
+        sudo apt-get update && sudo apt-get install -y docker.io docker-buildx docker-compose-v2
+      fi
+      sudo systemctl enable --now docker
+      sudo usermod -aG docker "${USER:-$(whoami)}" || true
+      echo "✅ Docker 安装完成并已设为开机自启"
+    else
+      echo "❌ 未检测到 docker 命令，请先安装 Docker Desktop 或 Docker Engine。"
+      exit 1
+    fi
+  fi
+  if docker info >/dev/null 2>&1; then
+    DOCKER_CMD=(docker)
+  else
+    echo "🔐 当前 SSH 会话尚未刷新 docker 用户组，本次自动使用 sudo 调用 Docker..."
+    DOCKER_CMD=(sudo --preserve-env=CLOUDFLARE_TUNNEL_TOKEN,PUBLIC_MOBILE_URL,PUBLIC_VOICE_URL,VOICE_GATEWAY_TOKEN,VOICE_ICLOUD_SHORTCUT_URL,PARKING_ADMIN_BIND,PARKING_PORT,PARKING_MOBILE_PORT,PARKING_VOICE_PORT,PARKING_FTP_PORT docker)
+  fi
+}
+
 case "${1:-status}" in
   start)             cmd_start ;;
   stop)              cmd_stop ;;
@@ -381,25 +408,30 @@ case "${1:-status}" in
   uninstall-systemd) cmd_uninstall_systemd ;;
   docker-up)
     cd "${APP_DIR}"
+    ensure_docker_ready
+    if [[ ! -f "${APP_DIR}/.env" && -f "${APP_DIR}/.env.example" ]]; then
+      cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
+      echo "📝 已自动从 .env.example 初始化 .env 配置文件"
+    fi
     CF_TOK="${CLOUDFLARE_TUNNEL_TOKEN:-}"
     if [[ -z "${CF_TOK}" && -f "${APP_DIR}/.env" ]]; then
       CF_TOK="$(grep -E '^CLOUDFLARE_TUNNEL_TOKEN=' "${APP_DIR}/.env" | tail -n 1 | cut -d'=' -f2- | tr -d '[:space:]\"'\''')"
     fi
     if [[ -n "${CF_TOK}" ]]; then
-      CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" docker compose --profile tunnel up -d --build
+      CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" "${DOCKER_CMD[@]}" compose --profile tunnel up -d --build
     else
-      docker compose up -d --build
+      "${DOCKER_CMD[@]}" compose up -d --build
     fi
     wait_healthy && cmd_health
     ;;
   docker-down)
-    cd "${APP_DIR}" && docker compose --profile tunnel down
+    cd "${APP_DIR}" && ensure_docker_ready && "${DOCKER_CMD[@]}" compose --profile tunnel down
     ;;
   docker-restart)
-    cd "${APP_DIR}" && docker compose restart && wait_healthy && cmd_health
+    cd "${APP_DIR}" && ensure_docker_ready && "${DOCKER_CMD[@]}" compose restart && wait_healthy && cmd_health
     ;;
   docker-logs)
-    cd "${APP_DIR}" && docker compose logs -f --tail=80
+    cd "${APP_DIR}" && ensure_docker_ready && "${DOCKER_CMD[@]}" compose logs -f --tail=80
     ;;
   sign-pack)
     # Pre-sign full multi-mode Ubuntu-Ready Apple Shortcut pack (`text`, `map`, `both`, `silent`, `ask` + `menu` + fixed units)

@@ -9,5 +9,7 @@ data/*.db-wal
 data/*.pid
 data/*.log*
 data/runtime_config.json
+data/workspaces/
+data/shortcuts/
 .env
 .DS_Store

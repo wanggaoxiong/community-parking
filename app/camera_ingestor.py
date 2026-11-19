@@ -526,11 +526,14 @@ def mask_url_credentials(url: str) -> str:
     return masked
 
 
-def normalize_ingest_config(
+MAX_STANDBY_SLOTS = 3
+
+
+def _normalize_single_slot_fields(
     raw_cfg: Optional[Dict[str, Any]],
     existing_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Normalize and merge camera ingestion config, preserving secrets when omitted."""
+    """Normalize stream/auth connection fields for a single camera slot (primary or standby)."""
     prev = dict(existing_cfg or {})
     src = dict(raw_cfg or {})
 
@@ -567,8 +570,12 @@ def normalize_ingest_config(
             iv = fallback
         return max(lo, min(hi, iv))
 
-    host = str(src.get("host") if "host" in src else prev.get("host", "")).strip()
-    # Strip accidental http:// or path if user pasted into host field
+    if "host" in src:
+        host = str(src.get("host") or "").strip()
+    elif "ip" in src:
+        host = str(src.get("ip") or "").strip()
+    else:
+        host = str(prev.get("host", "")).strip()
     if "://" in host:
         try:
             parsed_h = urllib.parse.urlsplit(host)
@@ -583,7 +590,6 @@ def normalize_ingest_config(
         else prev.get("username", p_defaults.get("username", ""))
     ).strip()
 
-    # Secret preservation: keep existing password/token unless explicitly cleared or overwritten
     clear_password = bool(src.get("clear_password", False))
     if clear_password:
         password = ""
@@ -695,7 +701,15 @@ def normalize_ingest_config(
             src.get("custom_url") if "custom_url" in src else prev.get("custom_url", "")
         ).strip(),
         "override_url": str(
-            src.get("override_url") if "override_url" in src else prev.get("override_url", "")
+            src.get("override_url")
+            if "override_url" in src
+            else (
+                src.get("snapshot_url")
+                or src.get("rtsp_url")
+                or src.get("stream_url")
+                or src.get("url")
+                or prev.get("override_url", "")
+            )
         ).strip(),
         "onvif_profile_token": str(
             src.get("onvif_profile_token")
@@ -723,6 +737,191 @@ def normalize_ingest_config(
     urls = synthesize_ingest_urls(cfg)
     cfg["resolved_preview_masked"] = urls["masked_url"]
     return cfg
+
+
+def is_slot_pull_ready(slot_cfg: Optional[Dict[str, Any]]) -> bool:
+    """Return True if a normalized camera slot config has active-pull parameters configured."""
+    if not isinstance(slot_cfg, dict):
+        return False
+    proto = str(slot_cfg.get("protocol") or "").strip().lower()
+    if proto not in ACTIVE_PULL_PROTOCOLS:
+        return False
+    if proto == "usb":
+        return True
+    return bool(
+        slot_cfg.get("host")
+        or slot_cfg.get("override_url")
+        or slot_cfg.get("custom_url")
+        or slot_cfg.get("onvif_snapshot_uri")
+        or slot_cfg.get("onvif_rtsp_uri")
+    )
+
+
+def normalize_ingest_config(
+    raw_cfg: Optional[Dict[str, Any]],
+    existing_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize and merge camera ingestion config (including Active-Standby cold failover slots)."""
+    prev = dict(existing_cfg or {})
+    src = dict(raw_cfg or {})
+
+    cfg = _normalize_single_slot_fields(src, prev)
+    cfg["primary_label"] = (
+        str(src.get("primary_label") if "primary_label" in src else prev.get("primary_label", "主机位")).strip()[:36]
+        or "主机位"
+    )
+
+    prev_standbys_raw = prev.get("standby_slots")
+    prev_standbys: List[Dict[str, Any]] = (
+        [dict(x) for x in prev_standbys_raw if isinstance(x, dict)]
+        if isinstance(prev_standbys_raw, list)
+        else []
+    )
+    prev_by_id: Dict[str, Dict[str, Any]] = {
+        str(item.get("slot_id")): item for item in prev_standbys if item.get("slot_id")
+    }
+
+    raw_standbys = src.get("standby_slots") if "standby_slots" in src else prev_standbys
+    norm_standbys: List[Dict[str, Any]] = []
+    if isinstance(raw_standbys, list):
+        for idx, raw_slot in enumerate(raw_standbys):
+            if len(norm_standbys) >= MAX_STANDBY_SLOTS:
+                break
+            if not isinstance(raw_slot, dict):
+                continue
+            slot_id = str(raw_slot.get("slot_id") or "").strip() or f"standby_{idx + 1}"
+            matched_prev = prev_by_id.get(slot_id)
+            if matched_prev is None and idx < len(prev_standbys):
+                matched_prev = prev_standbys[idx]
+            slot_norm = _normalize_single_slot_fields(raw_slot, matched_prev)
+            # Skip completely blank unconfigured rows
+            if slot_norm.get("protocol") != "usb" and not (
+                slot_norm.get("host")
+                or slot_norm.get("custom_url")
+                or slot_norm.get("override_url")
+                or slot_norm.get("onvif_snapshot_uri")
+                or slot_norm.get("onvif_rtsp_uri")
+            ):
+                continue
+            slot_idx = len(norm_standbys) + 1
+            slot_norm["slot_id"] = slot_id
+            slot_norm["slot_index"] = slot_idx
+            slot_norm["slot_label"] = (
+                str(
+                    raw_slot.get("slot_label")
+                    if "slot_label" in raw_slot
+                    else (
+                        raw_slot.get("label")
+                        if "label" in raw_slot
+                        else (matched_prev or {}).get("slot_label", f"备机 #{slot_idx}")
+                    )
+                ).strip()[:36]
+                or f"备机 #{slot_idx}"
+            )
+            norm_standbys.append(slot_norm)
+
+    cfg["standby_slots"] = norm_standbys
+
+    if "failover_enabled" in src and src.get("failover_enabled") is not None:
+        failover_enabled = bool(src.get("failover_enabled"))
+    elif "failover_enabled" in prev and "standby_slots" not in src:
+        failover_enabled = bool(prev.get("failover_enabled")) and len(norm_standbys) > 0
+    else:
+        failover_enabled = len(norm_standbys) > 0
+    cfg["failover_enabled"] = failover_enabled if len(norm_standbys) > 0 else False
+
+    try:
+        ft_raw = src.get("failover_threshold", prev.get("failover_threshold", 2))
+        failover_threshold = max(1, min(10, int(ft_raw)))
+    except (TypeError, ValueError):
+        failover_threshold = 2
+    cfg["failover_threshold"] = failover_threshold
+
+    cfg["auto_restore_primary"] = bool(
+        src.get("auto_restore_primary", prev.get("auto_restore_primary", True))
+    )
+
+    try:
+        probe_raw = src.get("primary_probe_interval_sec", prev.get("primary_probe_interval_sec", 180))
+        probe_sec = max(15, min(3600, int(probe_raw)))
+    except (TypeError, ValueError):
+        probe_sec = 180
+    cfg["primary_probe_interval_sec"] = probe_sec
+
+    try:
+        act_raw = src.get("active_slot_index", prev.get("active_slot_index", 0))
+        active_slot_index = max(0, min(len(norm_standbys), int(act_raw)))
+    except (TypeError, ValueError):
+        active_slot_index = 0
+    cfg["active_slot_index"] = active_slot_index
+
+    # Preserve per-slot calibration snapshots across config edits
+    if bool(src.get("clear_calibration_profiles", False)):
+        calib_profiles: Dict[str, Any] = {}
+    else:
+        calib_profiles = {}
+        if isinstance(prev.get("calibration_profiles"), dict):
+            calib_profiles.update(prev["calibration_profiles"])
+        if isinstance(src.get("calibration_profiles"), dict):
+            calib_profiles.update(src["calibration_profiles"])
+    cfg["calibration_profiles"] = calib_profiles
+    return cfg
+
+
+def resolve_slot_ingest_config(
+    cfg: Dict[str, Any],
+    slot_index: Optional[int] = None,
+) -> Tuple[int, str, Dict[str, Any]]:
+    """Return (resolved_slot_index, slot_label, single_slot_cfg) for active-standby camera groups."""
+    standbys = cfg.get("standby_slots")
+    standby_list = standbys if isinstance(standbys, list) else []
+    max_idx = len(standby_list)
+    if slot_index is None:
+        try:
+            idx = int(cfg.get("active_slot_index") or 0)
+        except (TypeError, ValueError):
+            idx = 0
+    else:
+        try:
+            idx = int(slot_index)
+        except (TypeError, ValueError):
+            idx = 0
+    idx = max(0, min(max_idx, idx))
+    if idx == 0:
+        label = str(cfg.get("primary_label") or "主机位")
+        primary_cfg = {
+            k: v
+            for k, v in cfg.items()
+            if k not in ("standby_slots", "calibration_profiles")
+        }
+        return 0, label, primary_cfg
+
+    slot_dict = dict(standby_list[idx - 1])
+    slot_dict["enabled"] = bool(cfg.get("enabled", True))
+    slot_dict["poll_interval_sec"] = int(cfg.get("poll_interval_sec") or slot_dict.get("poll_interval_sec") or 15)
+    label = str(slot_dict.get("slot_label") or f"备机 #{idx}")
+    return idx, label, slot_dict
+
+
+def _sanitize_single_slot_for_public(slot_norm: Dict[str, Any]) -> Dict[str, Any]:
+    has_pwd = bool(slot_norm.get("password"))
+    has_tok = bool(slot_norm.get("auth_token"))
+    has_push_tok = bool(slot_norm.get("push_token"))
+    urls = synthesize_ingest_urls(slot_norm)
+    pub = dict(slot_norm)
+    pub["password"] = ""
+    pub["auth_token"] = ""
+    pub["push_token"] = ""
+    pub["has_password"] = has_pwd
+    pub["has_auth_token"] = has_tok
+    pub["has_push_token"] = has_push_tok
+    pub["custom_url"] = mask_url_credentials(pub.get("custom_url", ""))
+    pub["override_url"] = mask_url_credentials(pub.get("override_url", ""))
+    pub["onvif_snapshot_uri"] = mask_url_credentials(pub.get("onvif_snapshot_uri", ""))
+    pub["onvif_rtsp_uri"] = mask_url_credentials(pub.get("onvif_rtsp_uri", ""))
+    pub["resolved_preview_masked"] = urls["masked_url"]
+    pub["fallback_preview_masked"] = urls.get("masked_fallback_url", "")
+    return pub
 
 
 def sanitize_ingest_config_for_public(
@@ -758,29 +957,38 @@ def sanitize_ingest_config_for_public(
             "usb_index": 0,
             "poll_interval_sec": 15,
             "resolved_preview_masked": "",
+            "primary_label": "主机位",
+            "standby_slots": [],
+            "standby_count": 0,
+            "failover_enabled": False,
+            "failover_threshold": 2,
+            "auto_restore_primary": True,
+            "primary_probe_interval_sec": 180,
+            "active_slot_index": 0,
+            "active_slot_label": "主机位",
+            "calibrated_slots": [],
             "ftp_push_hint": f"ftp://<服务器IP>:{ftp_port}/{camera_id or 'CAM_ID'}/snap.jpg",
             "http_push_path": f"/api/cameras/{camera_id or 'CAM_ID'}/snapshot",
         }
 
     norm = normalize_ingest_config(cfg)
-    has_pwd = bool(norm.get("password"))
-    has_tok = bool(norm.get("auth_token"))
-    has_push_tok = bool(norm.get("push_token"))
-    urls = synthesize_ingest_urls(norm)
-    pub = dict(norm)
+    pub = _sanitize_single_slot_for_public(norm)
     pub["configured"] = True
-    pub["password"] = ""
-    pub["auth_token"] = ""
-    pub["push_token"] = ""
-    pub["has_password"] = has_pwd
-    pub["has_auth_token"] = has_tok
-    pub["has_push_token"] = has_push_tok
-    pub["custom_url"] = mask_url_credentials(pub.get("custom_url", ""))
-    pub["override_url"] = mask_url_credentials(pub.get("override_url", ""))
-    pub["onvif_snapshot_uri"] = mask_url_credentials(pub.get("onvif_snapshot_uri", ""))
-    pub["onvif_rtsp_uri"] = mask_url_credentials(pub.get("onvif_rtsp_uri", ""))
-    pub["resolved_preview_masked"] = urls["masked_url"]
-    pub["fallback_preview_masked"] = urls.get("masked_fallback_url", "")
+    raw_standbys = norm.get("standby_slots") or []
+    pub["standby_slots"] = [
+        _sanitize_single_slot_for_public(s) for s in raw_standbys if isinstance(s, dict)
+    ]
+    pub["standby_count"] = len(pub["standby_slots"])
+    act_idx, act_label, _ = resolve_slot_ingest_config(norm)
+    pub["active_slot_index"] = act_idx
+    pub["active_slot_label"] = act_label
+    calib_profiles = norm.get("calibration_profiles")
+    pub.pop("calibration_profiles", None)
+    pub["calibrated_slots"] = (
+        sorted([int(k) for k in calib_profiles.keys() if str(k).isdigit()])
+        if isinstance(calib_profiles, dict)
+        else []
+    )
     pub["ftp_push_hint"] = f"ftp://<服务器IP>:{ftp_port}/{camera_id or 'CAM_ID'}/snap.jpg"
     pub["http_push_path"] = f"/api/cameras/{camera_id or 'CAM_ID'}/snapshot"
     return pub
@@ -1983,6 +2191,7 @@ class CameraIngestionScheduler:
         tick_sec: float = 2.0,
     ) -> None:
         self.db = db
+        self.vision_pipeline = vision_pipeline
         if process_frame_fn is not None:
             self.process_frame_fn = process_frame_fn
         elif vision_pipeline is not None:
@@ -1997,6 +2206,7 @@ class CameraIngestionScheduler:
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._next_due: Dict[str, float] = {}
+        self._last_primary_probe_ts: Dict[str, float] = {}
         self._in_flight: set[str] = set()
         self._lock = threading.Lock()
         self._worker_pool: Optional[ThreadPoolExecutor] = None
@@ -2041,6 +2251,139 @@ class CameraIngestionScheduler:
                 self._next_due.clear()
         self._wake_event.set()
 
+    def _persist_discovered_onvif_uris(
+        self,
+        camera_id: str,
+        full_cfg: Dict[str, Any],
+        slot_index: int,
+        discovered: Any,
+    ) -> None:
+        if not isinstance(discovered, dict) or not (
+            discovered.get("snapshot_uri") or discovered.get("rtsp_uri")
+        ):
+            return
+        merged_cfg = dict(full_cfg)
+        if slot_index == 0:
+            if discovered.get("snapshot_uri"):
+                merged_cfg["onvif_snapshot_uri"] = discovered["snapshot_uri"]
+            if discovered.get("rtsp_uri"):
+                merged_cfg["onvif_rtsp_uri"] = discovered["rtsp_uri"]
+            if discovered.get("profile_token"):
+                merged_cfg["onvif_profile_token"] = discovered["profile_token"]
+        else:
+            standbys = [dict(x) for x in (merged_cfg.get("standby_slots") or []) if isinstance(x, dict)]
+            if 0 <= slot_index - 1 < len(standbys):
+                target_s = standbys[slot_index - 1]
+                if discovered.get("snapshot_uri"):
+                    target_s["onvif_snapshot_uri"] = discovered["snapshot_uri"]
+                if discovered.get("rtsp_uri"):
+                    target_s["onvif_rtsp_uri"] = discovered["rtsp_uri"]
+                if discovered.get("profile_token"):
+                    target_s["onvif_profile_token"] = discovered["profile_token"]
+                merged_cfg["standby_slots"] = standbys
+        self.db.save_camera_ingest_config(camera_id, merged_cfg)
+
+    def _finalize_grabbed_frame(
+        self,
+        *,
+        camera_id: str,
+        full_cfg: Dict[str, Any],
+        slot_index: int,
+        slot_label: str,
+        slot_cfg: Dict[str, Any],
+        cam_secret: Dict[str, Any],
+        jpg_bytes: bytes,
+        w: int,
+        h: int,
+        grab_meta: Dict[str, Any],
+        now_ts: float,
+        process_vision: bool,
+        save_reference_frame: bool,
+        save_reference_if_empty: bool,
+        force_save_reference: bool,
+        raise_on_error: bool,
+        failover_switched: bool = False,
+        failover_restored_primary: bool = False,
+        failover_reason: str = "",
+    ) -> Dict[str, Any]:
+        self._persist_discovered_onvif_uris(
+            camera_id, full_cfg, slot_index, grab_meta.get("onvif_discovered")
+        )
+        preview_b64 = ""
+        should_save_ref = bool(
+            save_reference_frame
+            or force_save_reference
+            or failover_switched
+            or failover_restored_primary
+            or (save_reference_if_empty and not cam_secret.get("has_reference_frame"))
+        )
+        if should_save_ref or not raise_on_error:
+            preview_b64 = base64.b64encode(jpg_bytes).decode("ascii")
+            if should_save_ref:
+                self.db.save_camera_latest_frame(camera_id, preview_b64, w, h)
+
+        vision_res: Optional[Dict[str, Any]] = None
+        if process_vision:
+            src_label = f"ingest:slot{slot_index}:{slot_cfg.get('protocol', 'pull')}"
+            vision_res = self.process_frame_fn(
+                camera_id,
+                jpg_bytes,
+                src_label,
+            )
+            if self.event_callback and isinstance(vision_res, dict):
+                slot_tag = f" · {slot_label}" if (full_cfg.get("standby_slots") or slot_index > 0) else ""
+                self.event_callback(
+                    {
+                        "ts": now_ts,
+                        "source": f"相机自动拉流{slot_tag} ({slot_cfg.get('vendor_label', slot_cfg.get('protocol', 'pull'))})",
+                        "camera_id": camera_id,
+                        "elapsed_ms": vision_res.get("elapsed_ms", 0.0),
+                        "processed_spots": len(vision_res.get("reports") or vision_res.get("spots") or []),
+                    }
+                )
+        del jpg_bytes
+
+        # Refresh ingest_status in case switch_camera_active_slot updated failover counters
+        latest_rec = self.db.get_camera_ingest_record(camera_id) or cam_secret
+        prev_st = latest_rec.get("ingest_status") or {}
+        standby_cnt = len(full_cfg.get("standby_slots") or [])
+        frames_cnt = int(prev_st.get("frames_pulled") or 0) + 1
+        status_obj: Dict[str, Any] = {
+            "state": "online",
+            "last_pull_at": now_ts,
+            "last_ok_ts": now_ts,
+            "last_ok_at": format_local_ts(now_ts),
+            "frames_pulled": frames_cnt,
+            "last_latency_ms": grab_meta.get("latency_ms", 0.0),
+            "last_resolution": f"{w}x{h}",
+            "transport": grab_meta.get("transport", slot_cfg.get("protocol", "")),
+            "consecutive_failures": 0,
+            "last_error": "",
+            "active_slot_index": slot_index,
+            "active_slot_label": slot_label,
+            "standby_count": standby_cnt,
+            "failover_active": bool(slot_index > 0),
+        }
+        if failover_reason:
+            status_obj["last_failover_reason"] = failover_reason[:200]
+            status_obj["last_failover_at"] = format_local_ts(now_ts)
+        self.db.update_camera_ingest_status(camera_id, status_obj)
+        out: Dict[str, Any] = {
+            "ok": True,
+            "camera_id": camera_id,
+            "slot_index": slot_index,
+            "slot_label": slot_label,
+            "failover_switched": failover_switched,
+            "failover_restored_primary": failover_restored_primary,
+            "width": w,
+            "height": h,
+            "ingest_status": status_obj,
+            "vision": vision_res,
+        }
+        if preview_b64 and not raise_on_error:
+            out["preview_jpeg_b64"] = preview_b64
+        return out
+
     def pull_camera_once(
         self,
         camera_id: str,
@@ -2049,6 +2392,7 @@ class CameraIngestionScheduler:
         save_reference_if_empty: bool = True,
         force_save_reference: bool = False,
         raise_on_error: bool = False,
+        slot_override: Optional[int] = None,
     ) -> Dict[str, Any]:
         cam_secret = self.db.get_camera_ingest_record(camera_id)
         if not cam_secret:
@@ -2064,81 +2408,158 @@ class CameraIngestionScheduler:
             return {"ok": False, "camera_id": camera_id, "error": err}
 
         now_ts = time.time()
+        standby_slots = cfg.get("standby_slots") or []
+        active_idx, active_label, active_cfg = resolve_slot_ingest_config(cfg, slot_override)
+
+        # Periodic primary-camera health probe when currently running on a standby slot
+        if (
+            slot_override is None
+            and active_idx > 0
+            and bool(cfg.get("failover_enabled"))
+            and bool(cfg.get("auto_restore_primary", True))
+        ):
+            probe_interval = max(15.0, float(cfg.get("primary_probe_interval_sec") or 180.0))
+            last_probe = self._last_primary_probe_ts.get(camera_id, 0.0)
+            if now_ts - last_probe >= probe_interval:
+                self._last_primary_probe_ts[camera_id] = now_ts
+                _, pri_label, pri_cfg = resolve_slot_ingest_config(cfg, 0)
+                if is_slot_pull_ready(pri_cfg):
+                    try:
+                        pri_bytes, pw, ph, pri_meta = grab_camera_frame_bytes(pri_cfg)
+                        restore_reason = f"{pri_label}恢复在线，自动从{active_label}切回主路"
+                        if hasattr(self.db, "switch_camera_active_slot"):
+                            self.db.switch_camera_active_slot(camera_id, 0, reason=restore_reason)
+                        if self.vision_pipeline is not None and hasattr(
+                            self.vision_pipeline, "clear_frame_cache"
+                        ):
+                            self.vision_pipeline.clear_frame_cache(camera_id)
+                        if self.event_callback:
+                            self.event_callback(
+                                {
+                                    "ts": now_ts,
+                                    "source": "主备相机自动回切",
+                                    "camera_id": camera_id,
+                                    "detail": restore_reason,
+                                }
+                            )
+                        refreshed_rec = self.db.get_camera_ingest_record(camera_id) or cam_secret
+                        refreshed_cfg = refreshed_rec.get("ingest_config") or cfg
+                        return self._finalize_grabbed_frame(
+                            camera_id=camera_id,
+                            full_cfg=refreshed_cfg,
+                            slot_index=0,
+                            slot_label=pri_label,
+                            slot_cfg=pri_cfg,
+                            cam_secret=refreshed_rec,
+                            jpg_bytes=pri_bytes,
+                            w=pw,
+                            h=ph,
+                            grab_meta=pri_meta,
+                            now_ts=now_ts,
+                            process_vision=process_vision,
+                            save_reference_frame=save_reference_frame,
+                            save_reference_if_empty=save_reference_if_empty,
+                            force_save_reference=force_save_reference,
+                            raise_on_error=raise_on_error,
+                            failover_restored_primary=True,
+                            failover_reason=restore_reason,
+                        )
+                    except Exception as probe_exc:
+                        logger.debug(
+                            "Primary slot recovery probe still unreachable for %s: %s",
+                            camera_id,
+                            probe_exc,
+                        )
+
         try:
-            jpg_bytes, w, h, grab_meta = grab_camera_frame_bytes(cfg)
-            # Persist discovered ONVIF URIs so subsequent pulls are instantaneous
-            discovered = grab_meta.get("onvif_discovered")
-            if isinstance(discovered, dict) and (discovered.get("snapshot_uri") or discovered.get("rtsp_uri")):
-                merged_cfg = dict(cfg)
-                if discovered.get("snapshot_uri"):
-                    merged_cfg["onvif_snapshot_uri"] = discovered["snapshot_uri"]
-                if discovered.get("rtsp_uri"):
-                    merged_cfg["onvif_rtsp_uri"] = discovered["rtsp_uri"]
-                if discovered.get("profile_token"):
-                    merged_cfg["onvif_profile_token"] = discovered["profile_token"]
-                self.db.save_camera_ingest_config(camera_id, merged_cfg)
-
-            preview_b64 = ""
-            should_save_ref = bool(
-                save_reference_frame
-                or force_save_reference
-                or (save_reference_if_empty and not cam_secret.get("has_reference_frame"))
+            jpg_bytes, w, h, grab_meta = grab_camera_frame_bytes(active_cfg)
+            return self._finalize_grabbed_frame(
+                camera_id=camera_id,
+                full_cfg=cfg,
+                slot_index=active_idx,
+                slot_label=active_label,
+                slot_cfg=active_cfg,
+                cam_secret=cam_secret,
+                jpg_bytes=jpg_bytes,
+                w=w,
+                h=h,
+                grab_meta=grab_meta,
+                now_ts=now_ts,
+                process_vision=process_vision,
+                save_reference_frame=save_reference_frame,
+                save_reference_if_empty=save_reference_if_empty,
+                force_save_reference=force_save_reference,
+                raise_on_error=raise_on_error,
             )
-            if should_save_ref or not raise_on_error:
-                preview_b64 = base64.b64encode(jpg_bytes).decode("ascii")
-                if should_save_ref:
-                    self.db.save_camera_latest_frame(camera_id, preview_b64, w, h)
-
-            vision_res: Optional[Dict[str, Any]] = None
-            if process_vision:
-                src_label = f"ingest:{cfg.get('protocol', 'pull')}"
-                vision_res = self.process_frame_fn(
-                    camera_id,
-                    jpg_bytes,
-                    src_label,
-                )
-                if self.event_callback and isinstance(vision_res, dict):
-                    self.event_callback(
-                        {
-                            "ts": now_ts,
-                            "source": f"相机自动拉流 ({cfg.get('vendor_label', cfg.get('protocol', 'pull'))})",
-                            "camera_id": camera_id,
-                            "elapsed_ms": vision_res.get("elapsed_ms", 0.0),
-                            "processed_spots": len(vision_res.get("reports") or vision_res.get("spots") or []),
-                        }
-                    )
-            del jpg_bytes
-
-            prev_st = cam_secret.get("ingest_status") or {}
-            frames_cnt = int(prev_st.get("frames_pulled") or 0) + 1
-            status_obj = {
-                "state": "online",
-                "last_pull_at": now_ts,
-                "last_ok_ts": now_ts,
-                "last_ok_at": format_local_ts(now_ts),
-                "frames_pulled": frames_cnt,
-                "last_latency_ms": grab_meta.get("latency_ms", 0.0),
-                "last_resolution": f"{w}x{h}",
-                "transport": grab_meta.get("transport", cfg.get("protocol", "")),
-                "consecutive_failures": 0,
-                "last_error": "",
-            }
-            self.db.update_camera_ingest_status(camera_id, status_obj)
-            out: Dict[str, Any] = {
-                "ok": True,
-                "camera_id": camera_id,
-                "width": w,
-                "height": h,
-                "ingest_status": status_obj,
-                "vision": vision_res,
-            }
-            if preview_b64 and not raise_on_error:
-                out["preview_jpeg_b64"] = preview_b64
-            return out
         except Exception as exc:
             prev_st = cam_secret.get("ingest_status") or {}
             fails = int(prev_st.get("consecutive_failures") or 0) + 1
             err_msg = str(exc)
+            threshold = max(1, int(cfg.get("failover_threshold") or 2))
+
+            # Cold Failover: only probe standby slots when active slot reaches consecutive failure threshold
+            if (
+                slot_override is None
+                and bool(cfg.get("failover_enabled"))
+                and len(standby_slots) > 0
+                and fails >= threshold
+            ):
+                total_slots = len(standby_slots) + 1
+                candidate_indices = [
+                    (active_idx + offset) % total_slots for offset in range(1, total_slots)
+                ]
+                for cand_idx in candidate_indices:
+                    _, cand_label, cand_cfg = resolve_slot_ingest_config(cfg, cand_idx)
+                    if not is_slot_pull_ready(cand_cfg):
+                        continue
+                    try:
+                        cand_bytes, cw, ch, cand_meta = grab_camera_frame_bytes(cand_cfg)
+                        switch_reason = (
+                            f"{active_label}连续{fails}次拉流失败，自动冷切至{cand_label}"
+                        )
+                        if hasattr(self.db, "switch_camera_active_slot"):
+                            self.db.switch_camera_active_slot(
+                                camera_id, cand_idx, reason=switch_reason
+                            )
+                        if self.vision_pipeline is not None and hasattr(
+                            self.vision_pipeline, "clear_frame_cache"
+                        ):
+                            self.vision_pipeline.clear_frame_cache(camera_id)
+                        self._last_primary_probe_ts[camera_id] = now_ts
+                        if self.event_callback:
+                            self.event_callback(
+                                {
+                                    "ts": now_ts,
+                                    "source": "主备相机自动冷切容灾",
+                                    "camera_id": camera_id,
+                                    "detail": switch_reason,
+                                }
+                            )
+                        refreshed_rec = self.db.get_camera_ingest_record(camera_id) or cam_secret
+                        refreshed_cfg = refreshed_rec.get("ingest_config") or cfg
+                        return self._finalize_grabbed_frame(
+                            camera_id=camera_id,
+                            full_cfg=refreshed_cfg,
+                            slot_index=cand_idx,
+                            slot_label=cand_label,
+                            slot_cfg=cand_cfg,
+                            cam_secret=refreshed_rec,
+                            jpg_bytes=cand_bytes,
+                            w=cw,
+                            h=ch,
+                            grab_meta=cand_meta,
+                            now_ts=now_ts,
+                            process_vision=process_vision,
+                            save_reference_frame=save_reference_frame,
+                            save_reference_if_empty=save_reference_if_empty,
+                            force_save_reference=force_save_reference,
+                            raise_on_error=raise_on_error,
+                            failover_switched=True,
+                            failover_reason=switch_reason,
+                        )
+                    except Exception as cand_exc:
+                        err_msg = f"{active_label}失败({exc}); {cand_label}亦不可达({cand_exc})"
+
             status_obj = {
                 "state": "error",
                 "last_pull_at": now_ts,
@@ -2147,9 +2568,13 @@ class CameraIngestionScheduler:
                 "frames_pulled": int(prev_st.get("frames_pulled") or 0),
                 "last_latency_ms": prev_st.get("last_latency_ms"),
                 "last_resolution": prev_st.get("last_resolution", ""),
-                "transport": cfg.get("protocol", ""),
+                "transport": active_cfg.get("protocol", ""),
                 "consecutive_failures": fails,
                 "last_error": err_msg[:260],
+                "active_slot_index": active_idx,
+                "active_slot_label": active_label,
+                "standby_count": len(standby_slots),
+                "failover_active": bool(active_idx > 0),
             }
             self.db.update_camera_ingest_status(camera_id, status_obj)
             if raise_on_error:
@@ -2157,6 +2582,8 @@ class CameraIngestionScheduler:
             return {
                 "ok": False,
                 "camera_id": camera_id,
+                "slot_index": active_idx,
+                "slot_label": active_label,
                 "error": err_msg,
                 "ingest_status": status_obj,
             }
@@ -2181,13 +2608,10 @@ class CameraIngestionScheduler:
                     break
                 cid = str(rec["camera_id"])
                 cfg = rec.get("ingest_config") or {}
-                protocol = str(cfg.get("protocol") or "")
-                if not cfg.get("enabled") or protocol not in ACTIVE_PULL_PROTOCOLS:
+                if not cfg.get("enabled"):
                     continue
-                if protocol != "usb" and not (
-                    cfg.get("host") or cfg.get("override_url") or cfg.get("custom_url")
-                    or cfg.get("onvif_snapshot_uri") or cfg.get("onvif_rtsp_uri")
-                ):
+                _, _, active_slot_cfg = resolve_slot_ingest_config(cfg)
+                if not is_slot_pull_ready(active_slot_cfg):
                     continue
 
                 base_interval = max(5.0, float(cfg.get("poll_interval_sec") or 15.0))

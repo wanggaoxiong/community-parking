@@ -3,7 +3,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from app.camera_naming import VEHICLE_MODEL_PRESETS, extract_route_guidance_path
 from app.config import config_manager
@@ -13,6 +13,11 @@ from app.database import (
     compute_walk_between_map_points,
     extract_building_info,
     natural_unit_sort_key,
+)
+from app.workspaces import (
+    render_workspace_broadcast_text,
+    render_workspace_display_card_text,
+    render_workspace_repeat_core_text,
 )
 
 
@@ -30,8 +35,13 @@ class ParkingRecommender:
                    - 14.0 * min(effective_free_spots(z), 3)
     """
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        profile_getter: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+    ) -> None:
         self.db = database
+        self._profile_getter = profile_getter
         self._lock = threading.RLock()
         # List of active soft locks: {lock_id, zone_id, driver_tag, unit_id, expires_at}
         self._soft_locks: List[Dict[str, Any]] = []
@@ -582,7 +592,8 @@ class ParkingRecommender:
             for u in units_list:
                 dx = float(u.get("door_x") if u.get("door_x") is not None else u["map_x"])
                 dy = float(u.get("door_y") if u.get("door_y") is not None else u["map_y"])
-                w_res = compute_walk_between_map_points(dx, dy, cx, cy, road_graph=road_graph)
+                # Direction: parked spot group (cx, cy) -> walking home to unit door (dx, dy)
+                w_res = compute_walk_between_map_points(cx, cy, dx, dy, road_graph=road_graph)
                 door_distances[u["unit_id"]] = int(w_res["walk_meters"])
                 if u["unit_id"] == target_walk_uid:
                     selected_walk = {
@@ -910,10 +921,10 @@ class ParkingRecommender:
                     best_sp_obj: Optional[Dict[str, Any]] = None
                     for sp in eligible_free_spots:
                         w_res = compute_walk_between_map_points(
-                            u_door_x,
-                            u_door_y,
                             float(sp["map_x"]),
                             float(sp["map_y"]),
+                            u_door_x,
+                            u_door_y,
                             road_graph=road_graph,
                         )
                         if best_sp_walk is None or w_res["walk_meters"] < best_sp_walk["walk_meters"]:
@@ -1006,10 +1017,10 @@ class ParkingRecommender:
             best_sp_obj = None
             for sp in placed_free_spots:
                 w_res = compute_walk_between_map_points(
-                    u_door_x,
-                    u_door_y,
                     float(sp["map_x"]),
                     float(sp["map_y"]),
+                    u_door_x,
+                    u_door_y,
                     road_graph=road_graph,
                 )
                 if best_sp_walk is None or w_res["walk_meters"] < best_sp_walk["walk_meters"]:
@@ -1067,13 +1078,35 @@ class ParkingRecommender:
             )
 
         candidates.sort(key=lambda c: c["score"])
+        ws_profile = self._profile_getter() if self._profile_getter else None
+        total_raw = sum(int(z["raw_free"]) for z in zone_summaries)
+        total_eff = sum(int(z["effective_free"]) for z in zone_summaries)
+        total_cap = sum(int(z["total_capacity"]) for z in zone_summaries)
 
+        u_label = str(unit_info.get("name") or unit_info["unit_id"])
         if not candidates:
-            total_raw = sum(z["raw_free"] for z in zone_summaries)
-            if total_raw > 0:
-                voice = f"小区仅剩的 {total_raw} 个空位当前均有前车正在驶往，建议在主干道临时等候或前往地下访客区。"
-            else:
-                voice = "抱歉，当前小区地面监测车位已全部停满，建议直接前往周边备选停车场。"
+            voice = render_workspace_broadcast_text(
+                ws_profile,
+                has_recommendation=False,
+                total_free=total_eff,
+                total_raw_free=total_raw,
+                total_spots=total_cap,
+                unit_name=u_label,
+                unit_id=str(unit_info["unit_id"]),
+            )
+            repeat_core = render_workspace_repeat_core_text(
+                ws_profile,
+                has_recommendation=False,
+                total_raw_free=total_raw,
+                unit_name=u_label,
+            )
+            display_card = render_workspace_display_card_text(
+                ws_profile,
+                has_recommendation=False,
+                total_free=total_eff,
+                total_raw_free=total_raw,
+                unit_name=u_label,
+            )
             return {
                 "has_recommendation": False,
                 "unit": unit_info,
@@ -1081,6 +1114,8 @@ class ParkingRecommender:
                 "primary": None,
                 "backup": None,
                 "voice_text": voice,
+                "repeat_voice_text": repeat_core,
+                "display_text": display_card,
                 "lock_created": None,
                 "all_candidates": [],
             }
@@ -1113,20 +1148,52 @@ class ParkingRecommender:
 
         handling_note = ""
         p_hints = primary.get("actionable_hints") or []
-        if p_hints and (primary.get("clean_free", 0) == 0 or len(p_hints) == primary["effective_free"]):
-            brief_items = [f"{h['label']}号位{h['hint']}" for h in p_hints[:2]]
-            handling_note = f"提示：{'；'.join(brief_items)}。"
-        elif p_hints:
-            h0 = p_hints[0]
-            handling_note = f"另{h0['label']}号位{h0['hint']}。"
+        if p_hints:
+            seen_hints: List[str] = []
+            for h in p_hints:
+                htxt = str(h.get("hint") or "").strip()
+                if htxt and htxt not in seen_hints:
+                    seen_hints.append(htxt)
+                if len(seen_hints) >= 2:
+                    break
+            if seen_hints:
+                if primary.get("clean_free", 0) == 0 or len(p_hints) == primary["effective_free"]:
+                    handling_note = f"提示：空位处{'；'.join(seen_hints)}。"
+                else:
+                    handling_note = f"另有空位{seen_hints[0]}。"
 
-        voice = (
-            f"欢迎回家！为您推荐 {primary['zone_name']}，"
-            f"当前净余 {primary['effective_free']} 个可停车位，步行至您单元门约 {primary['walk_meters']} 米{compact_note}。"
-            f"{handling_note}"
+        voice = render_workspace_broadcast_text(
+            ws_profile,
+            has_recommendation=True,
+            total_free=total_eff,
+            total_raw_free=total_raw,
+            total_spots=total_cap,
+            unit_name=u_label,
+            unit_id=str(unit_info["unit_id"]),
+            primary=primary,
+            backup=backup,
+            compact_note=compact_note,
+            handling_note=handling_note,
         )
-        if backup:
-            voice += f"备选 {backup['zone_name']}，余 {backup['effective_free']} 位，步行 {backup['walk_meters']} 米。"
+        repeat_core = render_workspace_repeat_core_text(
+            ws_profile,
+            has_recommendation=True,
+            total_raw_free=total_raw,
+            unit_name=u_label,
+            primary=primary,
+            backup=backup,
+            compact_note=compact_note,
+        )
+        display_card = render_workspace_display_card_text(
+            ws_profile,
+            has_recommendation=True,
+            total_free=total_eff,
+            total_raw_free=total_raw,
+            unit_name=u_label,
+            primary=primary,
+            backup=backup,
+            handling_note=handling_note,
+        )
 
         # Extract planned driving route polyline & exact unit-door walking path to the recommended stall
         primary_zs = next((z for z in zone_summaries if z["zone_id"] == primary["zone_id"]), None)
@@ -1156,7 +1223,7 @@ class ParkingRecommender:
             }
         else:
             w_fallback = compute_walk_between_map_points(
-                u_door_x, u_door_y, target_x, target_y, road_graph=road_graph
+                target_x, target_y, u_door_x, u_door_y, road_graph=road_graph
             )
             door_walk_path = {
                 "unit_id": unit_info["unit_id"],
@@ -1201,9 +1268,9 @@ class ParkingRecommender:
             eg_name = str(recommended_route.get("entry_gate_name") or "").strip()
             if eg_name and len(conn_gates) >= 2:
                 if strict_gate:
-                    voice += f"已按{eg_name}进场为您规划顺向路线。"
+                    voice += f"已按{eg_name}进场规划顺向路线。"
                 else:
-                    voice += f"建议从{eg_name}驶入更顺路。"
+                    voice += f"建议从{eg_name}驶入。"
 
         return {
             "has_recommendation": True,
@@ -1215,6 +1282,8 @@ class ParkingRecommender:
             "recommended_route": recommended_route,
             "door_walk_path": door_walk_path,
             "voice_text": voice,
+            "repeat_voice_text": repeat_core,
+            "display_text": display_card,
             "lock_created": lock_created,
             "all_candidates": candidates,
         }

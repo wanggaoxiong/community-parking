@@ -77,9 +77,30 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "http_port": int(os.environ.get("PORT", "8790")),
     "mobile_http_host": os.environ.get("MOBILE_HOST", "0.0.0.0"),
     "mobile_http_port": int(os.environ.get("MOBILE_PORT", "18790")),
+    "voice_http_host": os.environ.get("VOICE_HOST", "0.0.0.0"),
+    "voice_http_port": int(os.environ.get("VOICE_PORT", "18791")),
     "ftp_port": int(os.environ.get("FTP_PORT", "2121")),
     "ftp_user": "camera",
     "ftp_password": "parking2026",
+    "voice_gateway": {
+        "enabled": True,
+        "access_token": os.environ.get("VOICE_GATEWAY_TOKEN", ""),
+        "default_unit_id": os.environ.get("VOICE_DEFAULT_UNIT", "8-1"),
+        "default_repeat": 2,
+        "public_mobile_url": os.environ.get("PUBLIC_MOBILE_URL", ""),
+        "public_voice_url": os.environ.get("PUBLIC_VOICE_URL", ""),
+        "icloud_shortcut_url": os.environ.get("VOICE_ICLOUD_SHORTCUT_URL", ""),
+        "arrival_place": os.environ.get("VOICE_ARRIVAL_PLACE", ""),
+        "arrival_radius_m": int(os.environ.get("VOICE_ARRIVAL_RADIUS_M", "200")),
+        "llm_qa_enabled": True,
+        "rate_limit_per_minute": int(os.environ.get("VOICE_RATE_LIMIT_PER_MIN", "12")),
+        "daily_llm_call_limit": int(os.environ.get("VOICE_DAILY_LLM_LIMIT", "300")),
+        "max_question_chars": 300,
+        "weixin_enabled": os.environ.get("OPENCLAW_WEIXIN_ENABLED", "").lower() in ("1", "true", "yes"),
+        "weixin_api_base": os.environ.get("OPENCLAW_WEIXIN_BASE", "https://ilinkai.weixin.qq.com"),
+        "weixin_bot_token": os.environ.get("OPENCLAW_WEIXIN_TOKEN", ""),
+        "weixin_account_name": "",
+    },
     "vlm": {
         "mode": "hybrid",  # hybrid | always_vlm | local_only
         "preset": "azure_foundry",
@@ -169,6 +190,17 @@ class ConfigManager:
         else:
             cfg["vlm"]["api_key_masked"] = ""
         cfg["vlm"].pop("api_key", None)
+        vg = cfg.get("voice_gateway")
+        if isinstance(vg, dict):
+            raw_vt = str(vg.get("access_token") or "")
+            vg["has_access_token"] = bool(raw_vt)
+            vg["access_token_masked"] = (
+                raw_vt[:2] + "****" + raw_vt[-2:] if len(raw_vt) > 4 else ("****" if raw_vt else "")
+            )
+            vg.pop("access_token", None)
+            raw_wx = str(vg.get("weixin_bot_token") or "")
+            vg["has_weixin_bot_token"] = bool(raw_wx)
+            vg.pop("weixin_bot_token", None)
         cfg["vlm_presets"] = VLM_PRESETS
         return cfg
 
@@ -184,6 +216,20 @@ class ConfigManager:
                     vlm_patch.pop("api_key", None)
                 patch = dict(patch)
                 patch["vlm"] = vlm_patch
+            if "voice_gateway" in patch and isinstance(patch["voice_gateway"], dict):
+                vg_patch = dict(patch["voice_gateway"])
+                if vg_patch.get("clear_access_token"):
+                    vg_patch["access_token"] = ""
+                    vg_patch.pop("clear_access_token", None)
+                elif "access_token" in vg_patch and vg_patch["access_token"] == "":
+                    vg_patch.pop("access_token", None)
+                if vg_patch.get("clear_weixin_bot_token"):
+                    vg_patch["weixin_bot_token"] = ""
+                    vg_patch.pop("clear_weixin_bot_token", None)
+                elif "weixin_bot_token" in vg_patch and vg_patch["weixin_bot_token"] == "":
+                    vg_patch.pop("weixin_bot_token", None)
+                patch = dict(patch)
+                patch["voice_gateway"] = vg_patch
             self._deep_merge(self._config, patch)
             try:
                 RUNTIME_CONFIG_PATH.write_text(

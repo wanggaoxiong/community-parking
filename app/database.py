@@ -808,12 +808,13 @@ DEFAULT_SITE_MAP_TOPOLOGY: Dict[str, Any] = {
 
 
 class Database:
-    def __init__(self, db_path: str = str(DB_PATH)) -> None:
+    def __init__(self, db_path: str = str(DB_PATH), seed_default: bool = True) -> None:
         self.db_path = db_path
         self._lock = threading.RLock()
         self._site_map_cache: Optional[Dict[str, Any]] = None
         self._init_schema()
-        self._seed_if_empty()
+        if seed_default:
+            self._seed_if_empty()
         self.reconcile_spot_groups_and_doors()
 
     def _connect(self) -> sqlite3.Connection:
@@ -908,9 +909,118 @@ class Database:
                     meta_json TEXT NOT NULL DEFAULT '{}',
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS im_user_bindings (
+                    binding_key TEXT PRIMARY KEY,
+                    channel TEXT NOT NULL DEFAULT 'siri',
+                    external_uid TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    unit_id TEXT NOT NULL DEFAULT '8-1',
+                    repeat_count INTEGER NOT NULL DEFAULT 2,
+                    vehicle_type TEXT NOT NULL DEFAULT 'standard',
+                    updated_at REAL NOT NULL
+                );
                 """
             )
             self._ensure_migrations(conn)
+
+    def checkpoint_wal(self, mode: str = "TRUNCATE") -> Dict[str, Any]:
+        """Flush SQLite WAL pages to disk cleanly before container / Spot VM shutdown."""
+        clean_mode = str(mode or "TRUNCATE").strip().upper()
+        if clean_mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            clean_mode = "TRUNCATE"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(f"PRAGMA wal_checkpoint({clean_mode})").fetchone()
+            if row is not None and len(row) >= 3:
+                return {
+                    "ok": int(row[0]) == 0,
+                    "mode": clean_mode,
+                    "busy": int(row[0]),
+                    "log": int(row[1]),
+                    "checkpointed": int(row[2]),
+                }
+            return {"ok": True, "mode": clean_mode, "busy": 0, "log": 0, "checkpointed": 0}
+
+    def get_im_user_binding(
+        self, channel: str, external_uid: str
+    ) -> Optional[Dict[str, Any]]:
+        ch = str(channel or "siri").strip().lower()[:24] or "siri"
+        uid = str(external_uid or "").strip()[:128]
+        if not uid:
+            return None
+        bkey = f"{ch}:{uid}"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM im_user_bindings WHERE binding_key = ?", (bkey,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def upsert_im_user_binding(
+        self,
+        channel: str,
+        external_uid: str,
+        unit_id: str,
+        repeat_count: int = 2,
+        vehicle_type: str = "standard",
+        display_name: str = "",
+    ) -> Dict[str, Any]:
+        ch = str(channel or "siri").strip().lower()[:24] or "siri"
+        uid = str(external_uid or "").strip()[:128]
+        if not uid:
+            raise ValueError("external_uid 不能为空")
+        uid_clean = str(unit_id or "8-1").strip()[:24] or "8-1"
+        rep = 1 if int(repeat_count or 2) <= 1 else 2
+        vtype = "compact" if str(vehicle_type or "").strip().lower() == "compact" else "standard"
+        dname = str(display_name or "").strip()[:64]
+        bkey = f"{ch}:{uid}"
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            prev = conn.execute(
+                "SELECT display_name FROM im_user_bindings WHERE binding_key = ?", (bkey,)
+            ).fetchone()
+            if not dname and prev and prev["display_name"]:
+                dname = str(prev["display_name"])
+            conn.execute(
+                """
+                INSERT INTO im_user_bindings (
+                    binding_key, channel, external_uid, display_name,
+                    unit_id, repeat_count, vehicle_type, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(binding_key) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    unit_id = excluded.unit_id,
+                    repeat_count = excluded.repeat_count,
+                    vehicle_type = excluded.vehicle_type,
+                    updated_at = excluded.updated_at
+                """,
+                (bkey, ch, uid, dname, uid_clean, rep, vtype, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM im_user_bindings WHERE binding_key = ?", (bkey,)
+            ).fetchone()
+            return dict(row) if row else {
+                "binding_key": bkey,
+                "channel": ch,
+                "external_uid": uid,
+                "display_name": dname,
+                "unit_id": uid_clean,
+                "repeat_count": rep,
+                "vehicle_type": vtype,
+                "updated_at": now,
+            }
+
+    def list_im_user_bindings(self, channel: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            if channel:
+                rows = conn.execute(
+                    "SELECT * FROM im_user_bindings WHERE channel = ? ORDER BY updated_at DESC",
+                    (str(channel).strip().lower(),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM im_user_bindings ORDER BY updated_at DESC"
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     @staticmethod
     def _ensure_migrations(conn: sqlite3.Connection) -> None:
@@ -1888,6 +1998,7 @@ class Database:
                 "UPDATE cameras SET anchor_points_json = ? WHERE camera_id = ?",
                 (serialized, camera_id),
             )
+            self._snapshot_active_slot_calibration_conn(conn, camera_id)
         return self.get_camera(camera_id, include_blobs=False)
 
     def save_camera_template(
@@ -1941,6 +2052,7 @@ class Database:
                         camera_id,
                     ),
                 )
+            self._snapshot_active_slot_calibration_conn(conn, camera_id)
         return self.get_camera(camera_id, include_blobs=False)
 
     def save_camera_vehicle_template(
@@ -1960,6 +2072,7 @@ class Database:
                 """,
                 (vehicle_template_jpeg_b64, meta_json, now, camera_id),
             )
+            self._snapshot_active_slot_calibration_conn(conn, camera_id)
         return self.get_camera(camera_id, include_blobs=False)
 
     def get_camera_template(self, camera_id: str) -> Optional[Dict[str, Any]]:
@@ -2106,7 +2219,12 @@ class Database:
                 except Exception:
                     continue
                 cfg = normalize_ingest_config(raw_cfg)
-                if not cfg.get("enabled") or cfg.get("mode") != "active_pull":
+                if not cfg.get("enabled"):
+                    continue
+                from app.camera_ingestor import resolve_slot_ingest_config
+
+                _, _, act_slot_cfg = resolve_slot_ingest_config(cfg)
+                if act_slot_cfg.get("mode") != "active_pull" and cfg.get("mode") != "active_pull":
                     continue
                 raw_st: Dict[str, Any] = {"state": "idle"}
                 if r["ingest_status_json"]:
@@ -2154,6 +2272,7 @@ class Database:
                 "UPDATE cameras SET ingest_config_json = ? WHERE camera_id = ?",
                 (json.dumps(merged, ensure_ascii=False), camera_id),
             )
+            self._snapshot_active_slot_calibration_conn(conn, camera_id)
         return self.get_camera(camera_id)  # type: ignore
 
     def update_camera_ingest_status(
@@ -2248,7 +2367,249 @@ class Database:
                 f"UPDATE cameras SET {', '.join(updates)} WHERE camera_id = ?",
                 tuple(params),
             )
+            self._snapshot_active_slot_calibration_conn(conn, camera_id)
         return self.get_camera(camera_id, include_blobs=False)
+
+    def _snapshot_active_slot_calibration_conn(
+        self,
+        conn: sqlite3.Connection,
+        camera_id: str,
+        force: bool = False,
+    ) -> None:
+        """Persist current camera slot's calibration & reference templates into ingest_config_json."""
+        cam_row = conn.execute(
+            """
+            SELECT ingest_config_json, image_width, image_height, crop_roi_json, anchor_points_json,
+                   template_jpeg_b64, template_gray_b64, template_meta_json,
+                   vehicle_template_jpeg_b64, vehicle_template_meta_json, full_frame_jpeg_b64
+            FROM cameras
+            WHERE camera_id = ?
+            """,
+            (camera_id,),
+        ).fetchone()
+        if not cam_row or not cam_row["ingest_config_json"]:
+            return
+        try:
+            cfg = json.loads(cam_row["ingest_config_json"])
+            if not isinstance(cfg, dict):
+                return
+        except Exception:
+            return
+        standbys = cfg.get("standby_slots") or []
+        profiles = cfg.get("calibration_profiles")
+        if not force and not standbys and not profiles:
+            return
+        if not isinstance(profiles, dict):
+            profiles = {}
+        try:
+            cur_slot = max(0, int(cfg.get("active_slot_index") or 0))
+        except (TypeError, ValueError):
+            cur_slot = 0
+
+        spot_rows = conn.execute(
+            """
+            SELECT spot_id, label, polygon_json, vehicle_polygon_json, vehicle_poly_custom, ref_free_sig_b64
+            FROM spots
+            WHERE camera_id = ?
+            ORDER BY spot_id
+            """,
+            (camera_id,),
+        ).fetchall()
+        spot_polys: List[Dict[str, Any]] = [
+            {
+                "spot_id": str(sr["spot_id"]),
+                "label": str(sr["label"]),
+                "polygon_json": sr["polygon_json"],
+                "vehicle_polygon_json": sr["vehicle_polygon_json"],
+                "vehicle_poly_custom": int(sr["vehicle_poly_custom"] or 0),
+                "ref_free_sig_b64": sr["ref_free_sig_b64"],
+            }
+            for sr in spot_rows
+        ]
+        profiles[str(cur_slot)] = {
+            "saved_at": time.time(),
+            "image_width": int(cam_row["image_width"] or 1280),
+            "image_height": int(cam_row["image_height"] or 720),
+            "crop_roi_json": cam_row["crop_roi_json"],
+            "anchor_points_json": cam_row["anchor_points_json"],
+            "template_jpeg_b64": cam_row["template_jpeg_b64"],
+            "template_gray_b64": cam_row["template_gray_b64"],
+            "template_meta_json": cam_row["template_meta_json"],
+            "vehicle_template_jpeg_b64": cam_row["vehicle_template_jpeg_b64"],
+            "vehicle_template_meta_json": cam_row["vehicle_template_meta_json"],
+            "full_frame_jpeg_b64": cam_row["full_frame_jpeg_b64"],
+            "spots": spot_polys,
+        }
+        cfg["calibration_profiles"] = profiles
+        conn.execute(
+            "UPDATE cameras SET ingest_config_json = ? WHERE camera_id = ?",
+            (json.dumps(cfg, ensure_ascii=False), camera_id),
+        )
+
+    def switch_camera_active_slot(
+        self,
+        camera_id: str,
+        target_slot_index: int,
+        reason: str = "手动切换主备镜头",
+    ) -> Dict[str, Any]:
+        """Switch the active ingestion camera slot (0=Primary, 1..3=Standby) and hot-swap per-slot calibration."""
+        from app.camera_ingestor import (
+            format_local_ts,
+            normalize_ingest_config,
+            resolve_slot_ingest_config,
+        )
+
+        now_ts = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT camera_id, ingest_config_json, ingest_status_json FROM cameras WHERE camera_id = ?",
+                (camera_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"未找到摄像头: {camera_id}")
+            raw_cfg: Dict[str, Any] = {}
+            if row["ingest_config_json"]:
+                try:
+                    loaded = json.loads(row["ingest_config_json"])
+                    if isinstance(loaded, dict):
+                        raw_cfg = loaded
+                except Exception:
+                    raw_cfg = {}
+            cfg = normalize_ingest_config(raw_cfg)
+            standbys = cfg.get("standby_slots") or []
+            max_slot = len(standbys)
+            target_idx = int(target_slot_index)
+            if target_idx < 0 or target_idx > max_slot:
+                raise ValueError(f"目标槽位 #{target_idx} 超出已配置主备范围 (0..{max_slot})")
+
+            prev_idx = int(cfg.get("active_slot_index") or 0)
+            # Snapshot current active slot's calibration before switching
+            self._snapshot_active_slot_calibration_conn(conn, camera_id, force=True)
+
+            # Re-read updated cfg with latest calibration_profiles
+            refreshed = conn.execute(
+                "SELECT ingest_config_json FROM cameras WHERE camera_id = ?", (camera_id,)
+            ).fetchone()
+            if refreshed and refreshed["ingest_config_json"]:
+                try:
+                    cfg = json.loads(refreshed["ingest_config_json"])
+                except Exception:
+                    pass
+
+            profiles = cfg.get("calibration_profiles")
+            if not isinstance(profiles, dict):
+                profiles = {}
+            target_prof = profiles.get(str(target_idx))
+            restored_profile = False
+            if isinstance(target_prof, dict):
+                restored_profile = True
+                conn.execute(
+                    """
+                    UPDATE cameras
+                    SET image_width = ?,
+                        image_height = ?,
+                        crop_roi_json = ?,
+                        anchor_points_json = ?,
+                        template_jpeg_b64 = ?,
+                        template_gray_b64 = ?,
+                        template_meta_json = ?,
+                        vehicle_template_jpeg_b64 = ?,
+                        vehicle_template_meta_json = ?,
+                        full_frame_jpeg_b64 = ?
+                    WHERE camera_id = ?
+                    """,
+                    (
+                        int(target_prof.get("image_width") or 1280),
+                        int(target_prof.get("image_height") or 720),
+                        target_prof.get("crop_roi_json"),
+                        target_prof.get("anchor_points_json"),
+                        target_prof.get("template_jpeg_b64"),
+                        target_prof.get("template_gray_b64"),
+                        target_prof.get("template_meta_json"),
+                        target_prof.get("vehicle_template_jpeg_b64"),
+                        target_prof.get("vehicle_template_meta_json"),
+                        target_prof.get("full_frame_jpeg_b64"),
+                        camera_id,
+                    ),
+                )
+                saved_spots = target_prof.get("spots")
+                if isinstance(saved_spots, list) and saved_spots:
+                    cur_spots = [
+                        dict(sr)
+                        for sr in conn.execute(
+                            "SELECT spot_id, label FROM spots WHERE camera_id = ? ORDER BY spot_id",
+                            (camera_id,),
+                        ).fetchall()
+                    ]
+                    by_id = {str(s["spot_id"]): s for s in saved_spots if isinstance(s, dict) and s.get("spot_id")}
+                    by_label = {str(s["label"]): s for s in saved_spots if isinstance(s, dict) and s.get("label")}
+                    for idx_sp, cur_sp in enumerate(cur_spots):
+                        sid = str(cur_sp["spot_id"])
+                        slbl = str(cur_sp["label"])
+                        hit = by_id.get(sid) or by_label.get(slbl)
+                        if hit is None and idx_sp < len(saved_spots) and isinstance(saved_spots[idx_sp], dict):
+                            hit = saved_spots[idx_sp]
+                        if hit and hit.get("polygon_json"):
+                            conn.execute(
+                                """
+                                UPDATE spots
+                                SET polygon_json = ?,
+                                    vehicle_polygon_json = COALESCE(?, vehicle_polygon_json),
+                                    vehicle_poly_custom = ?,
+                                    ref_free_sig_b64 = ?
+                                WHERE spot_id = ?
+                                """,
+                                (
+                                    hit["polygon_json"],
+                                    hit.get("vehicle_polygon_json"),
+                                    int(hit.get("vehicle_poly_custom") or 0),
+                                    hit.get("ref_free_sig_b64"),
+                                    sid,
+                                ),
+                            )
+
+            cfg["active_slot_index"] = target_idx
+            _, target_label, _ = resolve_slot_ingest_config(cfg, target_idx)
+            conn.execute(
+                "UPDATE cameras SET ingest_config_json = ? WHERE camera_id = ?",
+                (json.dumps(cfg, ensure_ascii=False), camera_id),
+            )
+
+            st_merged: Dict[str, Any] = {"state": "idle"}
+            if row["ingest_status_json"]:
+                try:
+                    loaded_st = json.loads(row["ingest_status_json"])
+                    if isinstance(loaded_st, dict):
+                        st_merged.update(loaded_st)
+                except Exception:
+                    pass
+            failover_cnt = int(st_merged.get("failover_count") or 0)
+            if target_idx != prev_idx:
+                failover_cnt += 1
+            st_merged.update(
+                {
+                    "active_slot_index": target_idx,
+                    "active_slot_label": target_label,
+                    "standby_count": max_slot,
+                    "failover_active": bool(target_idx > 0),
+                    "consecutive_failures": 0,
+                    "last_failover_at": format_local_ts(now_ts),
+                    "last_failover_ts": now_ts,
+                    "last_failover_reason": str(reason or "切换主备镜头")[:200],
+                    "failover_count": failover_cnt,
+                }
+            )
+            conn.execute(
+                "UPDATE cameras SET ingest_status_json = ? WHERE camera_id = ?",
+                (json.dumps(st_merged, ensure_ascii=False), camera_id),
+            )
+
+        cam_info = self.get_camera(camera_id, include_blobs=False) or {"camera_id": camera_id}
+        cam_info["switched_from_slot"] = prev_idx
+        cam_info["active_slot_index"] = target_idx
+        cam_info["active_slot_label"] = target_label
+        cam_info["restored_calibration_profile"] = restored_profile
+        return cam_info
 
     def save_camera_calib_schedule(
         self, camera_id: str, schedule_payload: Dict[str, Any]
@@ -2694,6 +3055,7 @@ class Database:
                     image_width=image_width,
                     image_height=image_height,
                 )
+            self._snapshot_active_slot_calibration_conn(conn, cam_id_clean)
 
         if explicit_bind or unbind_spot_groups:
             self.reconcile_spot_groups_and_doors()
@@ -2873,6 +3235,7 @@ class Database:
                     image_width=img_w,
                     image_height=img_h,
                 )
+            self._snapshot_active_slot_calibration_conn(conn, new_cam_id)
 
         if explicit_bind_raw is not None or unbind_flag:
             self.reconcile_spot_groups_and_doors()
@@ -3629,6 +3992,7 @@ class Database:
                         veh_model,
                     ),
                 )
+            self._snapshot_active_slot_calibration_conn(conn, camera_id)
         return self.list_spots(camera_id=camera_id)
 
     def update_spot_state(self, spot_id: str, updates: Dict[str, Any]) -> None:

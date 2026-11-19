@@ -4,9 +4,10 @@ set -euo pipefail
 # ==============================================================================
 # 邻里停 (Community Parking) 跨平台服务一键运维脚本 (macOS Apple Silicon/Intel & Linux)
 # 用法:
-#   ./parking-ctl.sh {start|stop|restart|status|health|logs|foreground}
+#   原生进程模式: ./parking-ctl.sh {start|stop|restart|status|health|logs|foreground}
 #   macOS 自启守护: ./parking-ctl.sh {install-launchd|uninstall-launchd}
 #   Linux 自启守护: ./parking-ctl.sh {install-systemd|uninstall-systemd}
+#   Docker / Spot 容器模式: ./parking-ctl.sh {docker-up|docker-down|docker-restart|docker-logs}
 # ==============================================================================
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +20,8 @@ HOST="${PARKING_HOST:-127.0.0.1}"
 PORT="${PARKING_PORT:-8790}"
 MOBILE_HOST="${PARKING_MOBILE_HOST:-0.0.0.0}"
 MOBILE_PORT="${PARKING_MOBILE_PORT:-18790}"
+VOICE_HOST="${PARKING_VOICE_HOST:-0.0.0.0}"
+VOICE_PORT="${PARKING_VOICE_PORT:-18791}"
 FTP_PORT="${PARKING_FTP_PORT:-2121}"
 OS_NAME="$(uname -s)"
 
@@ -70,6 +73,14 @@ probe_mobile_host() {
   fi
 }
 
+probe_voice_host() {
+  if [[ "${VOICE_HOST}" == "0.0.0.0" || "${VOICE_HOST}" == "::" ]]; then
+    echo "127.0.0.1"
+  else
+    echo "${VOICE_HOST}"
+  fi
+}
+
 detect_lan_ip() {
   "${VENV_PY}" -c "
 import socket
@@ -106,13 +117,15 @@ get_running_pid() {
 }
 
 wait_healthy() {
-  local target_host mobile_target
+  local target_host mobile_target voice_target
   target_host="$(probe_host)"
   mobile_target="$(probe_mobile_host)"
-  local retries=20
+  voice_target="$(probe_voice_host)"
+  local retries=25
   for ((i = 1; i <= retries; i++)); do
     if curl --noproxy '*' -fsS -m 2 "http://${target_host}:${PORT}/api/health" >/dev/null 2>&1 \
-      && curl --noproxy '*' -fsS -m 2 "http://${mobile_target}:${MOBILE_PORT}/api/health" >/dev/null 2>&1; then
+      && curl --noproxy '*' -fsS -m 2 "http://${mobile_target}:${MOBILE_PORT}/api/health" >/dev/null 2>&1 \
+      && curl --noproxy '*' -fsS -m 2 "http://${voice_target}:${VOICE_PORT}/api/health" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.4
@@ -124,18 +137,20 @@ cmd_start() {
   if pid=$(get_running_pid); then
     local lan_ip
     lan_ip="$(detect_lan_ip)"
-    echo "✅ 服务已在运行 (PID: ${pid}) -> 控制台 http://${HOST}:${PORT} | 手机寻位 http://${lan_ip}:${MOBILE_PORT}"
+    echo "✅ 服务已在运行 (PID: ${pid}) -> 控制台 :${PORT} | 微信看图 :${MOBILE_PORT} | Siri语音 :${VOICE_PORT}"
     cmd_health
     return 0
   fi
 
   rotate_log_if_needed
-  echo "🚀 正在启动邻里停服务 (控制台 ${HOST}:${PORT}, 手机寻位 ${MOBILE_HOST}:${MOBILE_PORT}, FTP:${FTP_PORT})..."
+  echo "🚀 正在启动邻里停服务 (控制台 ${HOST}:${PORT}, 手机看图 ${MOBILE_HOST}:${MOBILE_PORT}, Siri语音网关 ${VOICE_HOST}:${VOICE_PORT}, FTP:${FTP_PORT})..."
   nohup "${VENV_PY}" "${APP_DIR}/run.py" \
     --host "${HOST}" \
     --port "${PORT}" \
     --mobile-host "${MOBILE_HOST}" \
     --mobile-port "${MOBILE_PORT}" \
+    --voice-host "${VOICE_HOST}" \
+    --voice-port "${VOICE_PORT}" \
     --ftp-port "${FTP_PORT}" \
     >> "${LOG_FILE}" 2>&1 &
   local new_pid=$!
@@ -146,7 +161,8 @@ cmd_start() {
     lan_ip="$(detect_lan_ip)"
     echo "✅ 启动成功! PID=${new_pid}"
     echo "   🖥️  管理控制台 : http://${HOST}:${PORT}"
-    echo "   📱 手机寻位端 : http://${lan_ip}:${MOBILE_PORT}  (本机 http://127.0.0.1:${MOBILE_PORT})"
+    echo "   📱 微信看图端 : http://${lan_ip}:${MOBILE_PORT}  (本机 http://127.0.0.1:${MOBILE_PORT})"
+    echo "   🎙️  Siri语音端 : http://${lan_ip}:${VOICE_PORT}  (本机 http://127.0.0.1:${VOICE_PORT})"
     echo "   📡 内存 FTP   : ftp://${HOST}:${FTP_PORT}"
     echo "   📜 日志文件   : ${LOG_FILE}"
   else
@@ -187,22 +203,29 @@ cmd_status() {
     lan_ip="$(detect_lan_ip)"
     echo "🟢 运行中 | PID: ${pid} | 物理内存(RSS): ${rss_mb} MB"
     echo "   🖥️  管理控制台 : http://${HOST}:${PORT}"
-    echo "   📱 手机寻位端 : http://${lan_ip}:${MOBILE_PORT}  (本机 http://127.0.0.1:${MOBILE_PORT})"
+    echo "   📱 微信看图端 : http://${lan_ip}:${MOBILE_PORT}  (本机 http://127.0.0.1:${MOBILE_PORT})"
+    echo "   🎙️  Siri语音端 : http://${lan_ip}:${VOICE_PORT}  (本机 http://127.0.0.1:${VOICE_PORT})"
     cmd_health
   else
-    echo "⚪ 未运行 | 端口 ${PORT} / ${MOBILE_PORT} 未监听"
+    echo "⚪ 未运行 | 端口 ${PORT} / ${MOBILE_PORT} / ${VOICE_PORT} 未监听"
     return 1
   fi
 }
 
 cmd_health() {
-  local target_host mobile_target resp mob_status
+  local target_host mobile_target voice_target resp mob_status voice_status
   target_host="$(probe_host)"
   mobile_target="$(probe_mobile_host)"
+  voice_target="$(probe_voice_host)"
   if curl --noproxy '*' -fsS -m 2 "http://${mobile_target}:${MOBILE_PORT}/api/health" >/dev/null 2>&1; then
     mob_status="在线(:${MOBILE_PORT})"
   else
     mob_status="未响应(:${MOBILE_PORT})"
+  fi
+  if curl --noproxy '*' -fsS -m 2 "http://${voice_target}:${VOICE_PORT}/api/health" >/dev/null 2>&1; then
+    voice_status="在线(:${VOICE_PORT})"
+  else
+    voice_status="未响应(:${VOICE_PORT})"
   fi
   if resp=$(curl --noproxy '*' -fsS -m 3 "http://${target_host}:${PORT}/api/overview" 2>/dev/null); then
     "${VENV_PY}" -c "
@@ -214,7 +237,7 @@ budget_mb = ps.get('cache_budget_mb', 64.0)
 human_cache = f'{used_kb/1024:.2f} MB' if used_kb >= 1024 else f'{used_kb:.1f} KB'
 vlm_hits = ps.get('vlm_cache_hits', 0)
 tpl_hits = ps.get('template_cache_hits', 0)
-print(f\"   📊 概览: 总车位 {d.get('total_capacity')} | 净余空位 {d.get('total_effective_free')} | 手机端 ${mob_status} | 落盘 {ps.get('raw_images_written_to_disk', 0)} | 瞬时销毁 {ps.get('frames_processed_in_ram', 0)} 帧 | 热快取 {human_cache}/{budget_mb:.0f}MB (命中: 模板{tpl_hits}/VLM{vlm_hits})\")
+print(f\"   📊 概览: 总车位 {d.get('total_capacity')} | 净余空位 {d.get('total_effective_free')} | 手机看图 ${mob_status} | Siri语音 ${voice_status} | 落盘 {ps.get('raw_images_written_to_disk', 0)} | 瞬时销毁 {ps.get('frames_processed_in_ram', 0)} 帧 | 热快取 {human_cache}/{budget_mb:.0f}MB (命中: 模板{tpl_hits}/VLM{vlm_hits})\")
 " <<< "${resp}"
   else
     echo "⚠️  健康检查未响应: http://${target_host}:${PORT}/api/health"
@@ -230,6 +253,8 @@ cmd_foreground() {
     --port "${PORT}" \
     --mobile-host "${MOBILE_HOST}" \
     --mobile-port "${MOBILE_PORT}" \
+    --voice-host "${VOICE_HOST}" \
+    --voice-port "${VOICE_PORT}" \
     --ftp-port "${FTP_PORT}"
 }
 
@@ -262,6 +287,10 @@ cmd_install_launchd() {
     <string>${MOBILE_HOST}</string>
     <string>--mobile-port</string>
     <string>${MOBILE_PORT}</string>
+    <string>--voice-host</string>
+    <string>${VOICE_HOST}</string>
+    <string>--voice-port</string>
+    <string>${VOICE_PORT}</string>
     <string>--ftp-port</string>
     <string>${FTP_PORT}</string>
   </array>
@@ -307,7 +336,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-ExecStart=${VENV_PY} ${APP_DIR}/run.py --host ${HOST} --port ${PORT} --mobile-host ${MOBILE_HOST} --mobile-port ${MOBILE_PORT} --ftp-port ${FTP_PORT}
+ExecStart=${VENV_PY} ${APP_DIR}/run.py --host ${HOST} --port ${PORT} --mobile-host ${MOBILE_HOST} --mobile-port ${MOBILE_PORT} --voice-host ${VOICE_HOST} --voice-port ${VOICE_PORT} --ftp-port ${FTP_PORT}
 Restart=always
 RestartSec=3
 StandardOutput=append:${LOG_FILE}
@@ -346,8 +375,46 @@ case "${1:-status}" in
   uninstall-launchd) cmd_uninstall_launchd ;;
   install-systemd)   cmd_install_systemd ;;
   uninstall-systemd) cmd_uninstall_systemd ;;
+  docker-up)
+    cd "${APP_DIR}"
+    if [[ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
+      docker compose --profile tunnel up -d --build
+    else
+      docker compose up -d --build
+    fi
+    wait_healthy && cmd_health
+    ;;
+  docker-down)
+    cd "${APP_DIR}" && docker compose --profile tunnel down
+    ;;
+  docker-restart)
+    cd "${APP_DIR}" && docker compose restart && wait_healthy && cmd_health
+    ;;
+  docker-logs)
+    cd "${APP_DIR}" && docker compose logs -f --tail=80
+    ;;
+  sign-shortcut)
+    # Pre-sign universal Apple Shortcut (AEA1) on macOS into data/shortcuts/universal-signed.shortcut
+    # so Docker / Ubuntu / Windows deployments mounting ./data can distribute signed .shortcut files directly.
+    BASE_ARG="${2:-}"
+    UNIT_ARG="${3:-8-1}"
+    "${VENV_PY}" -c "
+import sys
+from app.voice_gateway import VoiceGatewayService
+class _DummyCtx:
+    pass
+svc = VoiceGatewayService(_DummyCtx())
+res = svc.pre_sign_universal_shortcut(default_base_url=sys.argv[1], default_unit_id=sys.argv[2])
+if not res.get('ok'):
+    print('❌ 签名失败:', res.get('error'))
+    sys.exit(1)
+print(f\"✅ 已生成 Apple 官方签名通用快捷指令 (AEA1, {res['bytes']} bytes): {res['path']}\")
+print(f\"   默认网关地址: {res['default_base_url']} | 默认单元: {res['default_unit_id']}\")
+print('   提示: 将 data/ 目录随 Docker 挂载至 Linux/Windows 云端后，车主点击下载即可直接导入，不再提示未签名！')
+" "${BASE_ARG}" "${UNIT_ARG}"
+    ;;
   *)
-    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd}"
+    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|sign-shortcut|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd|docker-up|docker-tunnel|docker-down|docker-restart|docker-logs}"
     exit 1
     ;;
 esac

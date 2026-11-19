@@ -243,3 +243,39 @@ flowchart LR
      - **持续播报开关**：开启后在驶入小区途中持续监测车位变化并周期自动播报最新空位与步行距离，解放驾驶员双手；支持添加到手机主屏幕（PWA 全屏模式）。
 3. **移动端原生 Pointer 手势平面图**：
    - 1:1 还原 2F 车行环路单双向箭头、人行步道、行车引导线、到目标单元门的步行虚线及旋转车位框，原生支持**单指拖拽平移、双指捏合缩放（`1x ~ 4.5x`）与轻触车位状态微提示**。
+
+---
+
+## 6. 黄金双层升级架构：`:18791` 免手语音/大模型网关、多摄像头冷切与 Spot 容器化
+
+### 6.1 为什么采用「`:18791` Siri 免手语音 + `:18790` 微信浮窗看图 + Cloudflare 免费隧道」？
+
+1. **驾驶安全第一（全程手不离方向盘、眼不看屏幕）**：
+   - 普通微信内的语音消息受客户端安全沙箱限制无法后台自动外放，且开车打字危险。
+   - `:18791` 专门提供 `<20ms` 零大模型延迟的极速纯文本/JSON 播报口 `GET /api/voice/brief?unit=8-1&repeat=2&token=...`，并动态生成免签 plist 格式的 iOS/CarPlay `.shortcut` 快捷指令。车主连上车载蓝牙或 CarPlay 喊一句 **“嘿 Siri，小区车位”**（或配置“到达小区围栏自动运行”），车载音响直接朗读两遍最新净空位与步行米数。
+2. **自有大模型自然语言问答与平滑防白嫖护栏（`/api/voice/ask`）**：
+   - 当车主口述复杂问题（如“我开 SUV 回 8 栋 1 单元，带小孩走哪边最近？”）时，`:18791` 从口语中自动提取目标楼栋单元与车型并记忆到 `im_user_bindings` 表，随后仅将**当前小区实时车位快照 + 单元门步行距离表**注入精简 System Prompt（`max_tokens=220`），复用 `runtime_config.json` 中已配置的 Azure AI Foundry 模型生成 `<90` 字车载口语答复。
+   - **温和多层防护（不牺牲正常体验）**：共享访问口令校验 + 单用户/单 IP 滑动窗口软限流 + 严格封闭的小区实时上下文（无联网/无代码执行能力）+ 礼貌领域引导（遇到写代码、翻译长文等无关请求直接一句话礼貌婉拒，不死板卡正则）。
+3. **可选普通微信 `openclaw-weixin` 出站长轮询桥接（免备案 · 免公网 Webhook）**：
+   - 内置兼容腾讯官方 `https://ilinkai.weixin.qq.com` ClawBot iLink 协议的 `WeixinClawBridge`，由本地容器主动发起 HTTPS 出站 `getupdates` 长轮询。只需用准备好的微信助手号在 `:8790` 扫码配对一次，邻居即可在普通微信里发语音转文字或输入 `8-1` 问车位，无需 ICP 备案或企业微信迁移。
+4. **Cloudflare Zero Trust Tunnel 零成本承载 1,000+ 业主**：
+   - Cloudflare Free 计划的 50 席位限制仅针对 Zero Trust 内部员工鉴权门户；公开绑定的 Tunnel 子域名（映射只读 `:18790` 与口令保护的 `:18791`）对外部访客数量无上限、自动签发 HTTPS 证书且常规 JSON/SVG 流量完全免费，同时确保内网摄像头与 `:8790` 管理后台零公网暴露。
+
+### 6.2 多摄像头主备冷切冗余（Active-Standby Cold Failover）
+
+针对物业监控 + 热心业主阳台窗机多视角覆盖同一车位带的场景，系统采用**“1 主活跃 + 最多 3 备休眠冷切”**架构，既保持原有单源状态机零冲突，又实现硬件级高可用：
+
+1. **平时零额外带宽与算力开销**：
+   - `CameraIngestScheduler` 仅对当前 `active_slot`（默认 `#0` 主摄像头）发起定时拉流与三级视觉漏斗推理；`#1 ~ #3` 备用摄像头处于完全冷休眠态（零 RTSP 连接、零 CPU 解码）。
+2. **断流自动冷切 + 按槽位独立标定热切换（`slot_calibrations`）**：
+   - 当活跃槽位连续拉流失败达到 `failover_threshold`（默认 `3` 次）时，调度器自动探测首个在线的备用槽位 `#k`，并调用 `db.switch_camera_active_slot(camera_id, k)`：
+     - 将原槽位的多边形地面框 `polygon_json`、车身框 `vehicle_polygon_json`、脱敏参考模板 `reference_jpeg`、空位签名锚点 `empty_anchor_json` 及 `crop_roi_json` 快照存入 `ingest_config.slot_calibrations[prev_slot]`；
+     - 原子热加载目标槽位 `#k` 预标定的几何多边形与参考底板，**同时完整保留 2F 态势平面图上的车位组绑定关系与实时占用状态**，实现无缝接管。
+3. **主机位 `#0` 自动健康回探切回**：
+   - 当系统运行在备用槽位 `#1..#3` 且开启 `auto_recover_primary` 时，每隔 `primary_probe_interval_sec`（默认 `180s`）后台轻量试探一次 `#0` 主摄像头，一旦恢复出图立即自动切回 `#0` 并还原主机标定框。
+
+### 6.3 容器化与云端 Spot 实例抗抢占设计
+
+1. **多架构极简镜像（`linux/amd64` + `linux/arm64`）**：基于 `python:3.11-slim` + `opencv-python-headless` + `ffmpeg` + `fonts-noto-cjk` + `tini` 构建，同一份 `docker-compose.yml` 可无缝运行于本地 Mac Apple Silicon、AWS Graviton / 阿里云 ARM Spot 实例、Ubuntu x86 云主机及物业 Windows 主机。
+2. **优雅 `SIGTERM` 与 SQLite WAL 截断落盘**：`run.py` 与 `ReusableThreadingHTTPServer` 注册了 `SIGTERM / SIGINT` 钩子，在 Spot 实例 30 秒回收通知期内有序停止拉流线程与微信长轮询，并执行 `PRAGMA wal_checkpoint(TRUNCATE)` 将内存与 `-wal` 事务彻底刷入 `./data/parking.db`，配合 `restart: always` 实现实例重启后秒级满血上线。
+

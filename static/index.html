@@ -29,8 +29,18 @@
           </svg>
         </div>
         <div class="brand-copy">
-          <h1 id="communityTitle">邻里停</h1>
-          <span class="brand-sub">原图零落盘 · 透视自适应 · 社区公益寻位</span>
+          <div class="brand-title-row">
+            <h1 id="communityTitle">邻里停</h1>
+            <div class="ws-switcher-capsule" title="切换或新建独立的小区/办公园区工作空间">
+              <select id="workspaceSwitcherSelect" class="ws-switcher-select" aria-label="切换小区或园区工作空间">
+                <option value="default">🏘️ 加载站点中…</option>
+              </select>
+              <button id="btnOpenWorkspaceModal" class="ws-manage-btn" type="button" title="自定义当前小区/园区名称、尊享欢迎播报语、身份访问码或新建独立站点">
+                ⚙️ 站点与播报语
+              </button>
+            </div>
+          </div>
+          <span class="brand-sub">多站点独立空间 · 自定义尊享播报语 · 原图零落盘寻位</span>
         </div>
       </div>
 
@@ -86,88 +96,133 @@
           </button>
 
           <div id="driverExpandedBody" class="driver-expanded-body">
-            <div class="card-head">
-              <div>
-                <span class="eyebrow">CarPlay &amp; 小程序体验</span>
+            <!-- 1. 极简无拥挤顶栏 -->
+            <div class="drv-hero-head">
+              <div class="drv-hero-titles">
+                <span class="drv-eyebrow">CARPLAY · 车载寻位模拟</span>
                 <h2>进门免手语音寻位</h2>
               </div>
-              <div class="driver-head-controls">
-                <label class="apple-toggle">
-                  <input type="checkbox" id="ttsEnabled" checked />
-                  <span class="toggle-label">语音播报</span>
-                </label>
-                <button
-                  id="btnCollapseDriverPanel"
-                  class="driver-fold-btn"
-                  type="button"
-                  title="向左折叠寻位面板，为右侧平面图腾出横向对比与编辑空间"
-                >
-                  ⟨ 折叠
-                </button>
-              </div>
+              <button
+                id="btnCollapseDriverPanel"
+                class="driver-fold-btn"
+                type="button"
+                title="向左收起寻位面板，为右侧平面图腾出更大编辑空间"
+              >
+                ⟨ 收起
+              </button>
             </div>
 
-            <div class="field-grid-2">
-              <div class="field">
-                <div class="field-label-row">
-                  <label for="unitSelect">目的地单元</label>
-                  <button
-                    id="btnOpenUnitsModal"
-                    class="link-btn unit-manage-trigger"
-                    type="button"
-                    title="添加、修改或删除目的地单元（如新增 9-2 单元），并校准单元门位置"
-                  >
-                    ⚙️ 管理目的地
-                  </button>
+            <!-- 2. Apple iOS 分组内嵌设置表（标签左对齐 · 控件右对齐 · 0.5px 细分割线） -->
+            <div class="drv-ios-group">
+              <div class="drv-ios-row">
+                <div class="drv-row-meta">
+                  <div class="drv-row-title-line">
+                    <label for="unitSelect">目的地单元</label>
+                    <button
+                      id="btnOpenUnitsModal"
+                      class="drv-mini-badge-btn unit-manage-trigger"
+                      type="button"
+                      title="添加、修改或删除目的地单元，并校准单元门位置"
+                    >
+                      管理
+                    </button>
+                  </div>
+                  <span class="drv-row-sub">按步行至单元门最近优先推荐</span>
                 </div>
-                <select id="unitSelect"></select>
+                <div class="drv-row-ctrl">
+                  <select id="unitSelect" class="drv-clean-select"></select>
+                </div>
               </div>
-              <div class="field">
-                <label for="vehicleTypeSelect">车辆尺寸</label>
-                <select id="vehicleTypeSelect">
-                  <option value="sedan">标准轿车 / 紧凑型</option>
-                  <option value="suv">中大型 SUV（过滤迷你转角位）</option>
-                </select>
+
+              <div class="drv-ios-row">
+                <div class="drv-row-meta">
+                  <label for="entryGateSelect">驶入大门</label>
+                  <span class="drv-row-sub">规划进场顺向蓝色引导线</span>
+                </div>
+                <div class="drv-row-ctrl">
+                  <select id="entryGateSelect" class="drv-clean-select">
+                    <option value="auto">✨ 自动匹配顺路大门</option>
+                  </select>
+                </div>
               </div>
-              <div class="field" style="grid-column: 1 / -1;">
-                <label for="entryGateSelect" title="无论从哪个小区大门驶入，推荐车位始终按步行到楼栋单元门最近排序；此处仅影响蓝色进场行车引导线起点">🚗 驶入小区大门 <span class="subtle-text" style="font-weight:400;font-size:11px;">（选位始终按步行至 🚪 单元门最近 · 多门小区可切换进场引导）</span></label>
-                <select id="entryGateSelect">
-                  <option value="auto">✨ 自动匹配顺路车行大门</option>
-                </select>
+
+              <div class="drv-ios-row">
+                <div class="drv-row-meta">
+                  <label for="vehicleTypeSelect">车辆尺寸</label>
+                  <span class="drv-row-sub">SUV 自动过滤紧凑转角位</span>
+                </div>
+                <div class="drv-row-ctrl">
+                  <select id="vehicleTypeSelect" class="drv-clean-select">
+                    <option value="sedan">🚗 标准轿车</option>
+                    <option value="suv">🚙 中大型 SUV</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="drv-ios-row">
+                <div class="drv-row-meta">
+                  <span class="drv-row-title-text">语音播报</span>
+                  <select
+                    id="adminVoiceSelect"
+                    class="drv-voice-inline-select"
+                    title="可选播报音色（支持普通话、善怡粤语及多方言）"
+                    aria-label="选择语音音色"
+                  >
+                    <option value="">🎙️ 默认音色</option>
+                  </select>
+                </div>
+                <label class="drv-ios-switch" title="开启或关闭现场语音合成播报">
+                  <input type="checkbox" id="ttsEnabled" checked />
+                  <span class="drv-ios-slider"></span>
+                </label>
               </div>
             </div>
 
-            <div class="action-stack">
-              <button id="btnRecommendPrimary" class="btn-apple btn-apple-primary btn-apple-lg" type="button">
-                刚进大门 · 推荐离家最近空位
+            <!-- 3. 主次分明的 Apple 触感操作区 -->
+            <div class="drv-cta-stack">
+              <button id="btnRecommendPrimary" class="drv-btn-hero" type="button">
+                <span>🔊 刚进大门 · 推荐最近空位</span>
               </button>
-              <button id="btnRecommendSecondCar" class="btn-apple btn-apple-tinted" type="button" title="模拟同单元第2辆车紧随进门，验证40秒在途软锁自动分流">
-                模拟同单元后车进门（验证防抢位分流）
+              <button
+                id="btnRecommendSecondCar"
+                class="drv-btn-secondary"
+                type="button"
+                title="模拟同单元第 2 辆车紧随进门，验证 40 秒在途软锁自动分流"
+              >
+                模拟后车紧随进门 · 验证防抢位分流
               </button>
             </div>
 
-            <div id="voiceResultBox" class="transcript-card hidden">
-              <div class="transcript-header">
-                <span class="wave-badge">语音播报已就绪</span>
+            <!-- 4. 实时播报文案预览卡片 -->
+            <div id="voiceResultBox" class="drv-transcript-card hidden">
+              <div class="drv-transcript-top">
+                <span class="drv-live-wave"><i></i>实时语音导引</span>
               </div>
-              <p id="voiceText" class="transcript-body"></p>
-              <div id="recMeta" class="transcript-foot"></div>
+              <p id="voiceText" class="drv-transcript-body"></p>
+              <div id="recMeta" class="drv-transcript-foot"></div>
             </div>
 
-            <div class="inset-group">
-              <div class="inset-head">
-                <h3>在途软锁队列（40 秒预占防撞车）</h3>
-                <button id="btnClearLocks" class="link-btn" type="button">清空队列</button>
+            <!-- 5. 在途预占软锁队列 -->
+            <div class="drv-module-box">
+              <div class="drv-module-head">
+                <h3>在途预占队列 <span class="drv-muted-weight">· 40s 防撞车</span></h3>
+                <button id="btnClearLocks" class="link-btn" type="button">清空</button>
               </div>
-              <div id="softLocksList" class="locks-container">当前无在途车辆，全部空位开放推荐</div>
+              <div id="softLocksList" class="locks-container">暂无在途预占车辆，空位全部开放</div>
             </div>
 
-            <div class="inset-group shortcut-box">
-              <div class="inset-head">
-                <h3>Siri / iOS 快捷指令直连地址</h3>
-                <button id="btnCopySiri" class="link-btn" type="button">复制链接</button>
+            <!-- 6. Siri 快捷指令与车载语音端入口 -->
+            <div class="drv-module-box drv-shortcut-module">
+              <div class="drv-module-head">
+                <h3>Siri 与车载快捷指令</h3>
+                <div class="drv-module-links">
+                  <a id="drvOpenVoicePortalLink" class="drv-portal-pill" href="http://127.0.0.1:18791" target="_blank" rel="noopener">
+                    打开 :18791 ↗
+                  </a>
+                  <button id="btnCopySiri" class="link-btn" type="button">复制链接</button>
+                </div>
               </div>
-              <code id="siriEndpointCode">GET /api/recommend/voice?unit_id=3-1&amp;vehicle_type=sedan</code>
+              <code id="siriEndpointCode" class="drv-endpoint-code">GET /api/recommend/voice?unit_id=3-1&amp;vehicle_type=sedan</code>
             </div>
           </div>
         </div>
@@ -1549,6 +1604,69 @@
           </label>
         </div>
 
+        <!-- 18791 Voice / Siri / Android Shortcuts / Cloudflare Config -->
+        <div class="vg-admin-panel">
+          <div class="vg-admin-head">
+            <div>
+              <strong>🎙️ :18791 免手语音 · iOS/macOS 快捷指令 · Android 快捷命令 · 自有大模型问答</strong>
+              <p>供车主桌面/车载一键播报（<code>&lt;20ms</code> 极速口令）、到达小区自动播报及自有大模型互动问答</p>
+            </div>
+            <a id="vgOpenPortalLink" class="btn-apple btn-apple-secondary btn-apple-xs" href="http://127.0.0.1:18791" target="_blank" rel="noopener">
+              打开 :18791 车主端 ↗
+            </a>
+          </div>
+
+          <div class="field-grid-3" style="margin-top:10px;">
+            <div class="field">
+              <label for="vgCfgAccessToken">
+                共享访问口令 <span id="vgTokenSavedPill" class="saved-key-pill"></span>
+              </label>
+              <input type="password" id="vgCfgAccessToken" placeholder="如 xiaoqu888（留空保持原状态）" />
+            </div>
+            <div class="field">
+              <label for="vgCfgDefaultUnit">未指定时默认单元门</label>
+              <input type="text" id="vgCfgDefaultUnit" placeholder="8-1" value="8-1" />
+            </div>
+            <div class="field">
+              <label for="vgCfgDailyLimit">单用户每日大模型软上限</label>
+              <input type="number" id="vgCfgDailyLimit" value="60" min="5" max="1000" step="5" />
+            </div>
+          </div>
+
+          <div class="field-grid-2" style="margin-top:8px;">
+            <div class="field">
+              <label for="vgCfgPublicMobileUrl">Cloudflare 映射 :18790 平面图公网地址（可选）</label>
+              <input type="url" id="vgCfgPublicMobileUrl" placeholder="例如 https://parking.yourdomain.com" />
+            </div>
+            <div class="field">
+              <label for="vgCfgPublicVoiceUrl">Cloudflare 映射 :18791 语音/快捷指令公网地址（可选）</label>
+              <input type="url" id="vgCfgPublicVoiceUrl" placeholder="例如 https://voice.yourdomain.com" />
+            </div>
+          </div>
+
+          <div class="field-grid-2" style="margin-top:8px;">
+            <div class="field">
+              <label for="vgCfgArrivalPlace">默认到达触发地点（供业主进小区自动播报预设，可选）</label>
+              <input type="text" id="vgCfgArrivalPlace" placeholder="例如：阳光花园东门" />
+            </div>
+            <div class="field">
+              <label for="vgCfgIcloudShortcutUrl">iCloud 快捷指令分享链接（可选 · Linux/Docker 免签分发）</label>
+              <input type="url" id="vgCfgIcloudShortcutUrl" placeholder="https://www.icloud.com/shortcuts/xxxx（Mac 本机已自动签名，可留空）" />
+            </div>
+          </div>
+
+          <div class="options-row" style="margin-top:8px;flex-direction:column;align-items:flex-start;gap:6px;">
+            <label class="apple-check">
+              <input type="checkbox" id="vgCfgClearAccessToken" />
+              清空访问口令（勾选保存后局域网免口令直调；若经 Cloudflare 公网暴露强烈建议设置口令）
+            </label>
+            <label class="apple-check">
+              <input type="checkbox" id="vgCfgLlmQaEnabled" checked />
+              开启 :18791 自有大模型语音对话机器人（复用上方模型配置，结合实时车位与步行路网互动解答）
+            </label>
+          </div>
+        </div>
+
         <div id="vlmTestResultBox" class="test-result-banner hidden"></div>
         <p id="cfgSaveMsg" class="feedback-note"></p>
       </div>
@@ -2053,6 +2171,41 @@
           </div>
         </div>
 
+        <!-- STEP 2.5: Active-Standby Multi-Camera Cold Failover Redundancy -->
+        <div class="cam-wiz-section cam-failover-section">
+          <div class="cam-wiz-step-head">
+            <span class="cam-wiz-step-num" style="background:linear-gradient(135deg,#0EA5E9,#0284C7);">2+</span>
+            <div style="flex:1;">
+              <h3>多摄像头主备冷切冗余（可选 · 1 主 + 最多 3 备）</h3>
+              <p>平时仅主机位 #0 采集，备用摄像头零拉流零算力负载；当主机位连续断流达到阈值时自动冷切至备用机并热切换各自独立标定框，主机恢复后自动切回。</p>
+            </div>
+            <button id="btnCamAddStandbySlot" class="btn-apple btn-apple-secondary btn-apple-xs" type="button">
+              ➕ 添加备用摄像头
+            </button>
+          </div>
+
+          <div class="cam-failover-policy-bar">
+            <label class="apple-check">
+              <input type="checkbox" id="camCfgFailoverEnabled" checked />
+              启用断流自动冷备切换
+            </label>
+            <div class="cam-failover-inline-field">
+              <label for="camCfgFailoverThreshold">连续失败切换阈值（次）</label>
+              <input type="number" id="camCfgFailoverThreshold" value="3" min="1" max="20" step="1" />
+            </div>
+            <label class="apple-check">
+              <input type="checkbox" id="camCfgAutoRestorePrimary" checked />
+              主机位 #0 恢复在线后自动切回
+            </label>
+            <div class="cam-failover-inline-field">
+              <label for="camCfgPrimaryProbeSec">主机健康回探间隔（秒）</label>
+              <input type="number" id="camCfgPrimaryProbeSec" value="180" min="15" max="3600" step="15" />
+            </div>
+          </div>
+
+          <div id="camCfgStandbySlotsList" class="cam-standby-slots-list"></div>
+        </div>
+
         <!-- STEP 3: Naming, Zone & 2F Floor-Plan Spot Group Binding -->
         <div class="cam-wiz-section">
           <div class="cam-wiz-step-head">
@@ -2127,6 +2280,180 @@
           <button id="btnSaveCameraConfigModal" class="btn-apple btn-apple-primary" type="button">
             保存接入与绑定
           </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== APPLE SHEET MODAL: MULTI-WORKSPACE & CUSTOM BROADCAST GREETING ==================== -->
+  <div id="workspaceModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="wsModalTitle">
+    <div id="workspaceModalBackdrop" class="modal-backdrop"></div>
+    <div class="modal-sheet modal-sheet-wide">
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow">多小区 / 办公区 / 医院 / 场馆独立空间 · 身份权限隔离 · 差异化欢迎播报语</span>
+          <h2 id="wsModalTitle">工作空间（站点）与播报语定制</h2>
+        </div>
+        <button id="btnCloseWorkspaceModal" class="icon-close-btn" type="button" aria-label="关闭">✕</button>
+      </div>
+
+      <div class="sheet-body">
+        <div class="ws-mode-bar">
+          <div class="ws-mode-seg" id="wsModalModeSeg">
+            <button type="button" class="ws-mode-btn is-active" data-wsmode="edit">✏️ 编辑当前工作空间</button>
+            <button type="button" class="ws-mode-btn" data-wsmode="create">＋ 新建独立小区 / 办公区空间</button>
+          </div>
+          <span id="wsCurrentSlugPill" class="saved-key-pill">workspace: default</span>
+        </div>
+
+        <div class="field-grid-3" style="margin-top:12px;">
+          <div class="field">
+            <label for="wsNameInput">场所全称（显示在顶栏与平面图标题）</label>
+            <input type="text" id="wsNameInput" placeholder="例如：阳光花园 · 邻里公益寻位 / 万科中心办公园区" maxlength="48" />
+          </div>
+          <div class="field">
+            <label for="wsShortNameInput">播报简称（用于 `{site_name}`）</label>
+            <input type="text" id="wsShortNameInput" placeholder="例如：阳光花园 / 万科中心" maxlength="24" />
+          </div>
+          <div class="field" id="wsSlugFieldWrap">
+            <label for="wsSlugInput">英文空间标识 (URL 独立路由)</label>
+            <input type="text" id="wsSlugInput" placeholder="例如：wanke-office / xingfu-garden" maxlength="36" />
+          </div>
+        </div>
+
+        <div class="field-grid-3" style="margin-top:10px;">
+          <div class="field">
+            <label for="wsSceneTypeSelect">场所场景类型</label>
+            <select id="wsSceneTypeSelect">
+              <option value="community">🏘️ 住宅小区</option>
+              <option value="office">🏢 办公园区</option>
+              <option value="hospital">🏥 医院院区</option>
+              <option value="school">🏫 学校园区</option>
+              <option value="venue">🏛️ 场馆景区</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="wsRoleTitleInput">欢迎人群称谓（用于 `{role_title}`）</label>
+            <input type="text" id="wsRoleTitleInput" placeholder="例如：业主 / 同仁与访客 / 贵宾" maxlength="20" />
+          </div>
+          <div class="field">
+            <label for="wsPrefVoiceLangSelect">站点默认推荐语种/方言</label>
+            <select id="wsPrefVoiceLangSelect">
+              <option value="">🌐 跟随浏览器系统默认（普通话优先）</option>
+              <option value="zh-CN">🗣️ 普通话 (zh-CN)</option>
+              <option value="zh-HK">🗣️ 粤语 · 广东话 (zh-HK · 善怡等)</option>
+              <option value="zh-TW">🗣️ 台湾国语 (zh-TW · 美佳等)</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="wsCreateInitRow" class="field hidden" style="margin-top:10px;">
+          <label for="wsTemplateInitSelect">新空间初始平面图模板</label>
+          <select id="wsTemplateInitSelect">
+            <option value="blank" selected>✨ 洁净空白模板（含2个示例目的地锚点，可直接上传本小区/园区平面底图）</option>
+            <option value="demo">📦 完整演示车位模板（含4路示例机位与多排车位，便于快速体验）</option>
+          </select>
+        </div>
+
+        <!-- Custom Greeting & Broadcast Template Designer -->
+        <div class="vg-admin-panel" style="margin-top:14px;">
+          <div class="vg-admin-head">
+            <div>
+              <strong>🎙️ 自定义尊享语音播报模板（同步应用于 :8790 / :18790 / :18791 与手机快捷指令）</strong>
+              <p>可用占位符：<code>{site_name}</code> 简称 · <code>{role_title}</code> 称谓 · <code>{total_free}</code> 全场尚余车位 · <code>{unit_name}</code> 目的单元 · <code>{primary_zone}</code> 首选区域 · <code>{primary_free}</code> 首选净余 · <code>{walk_m}</code> 步行米数 · <code>{backup_clause}</code> 备选播报</p>
+            </div>
+            <button id="btnWsPreviewSpeak" class="btn-apple btn-apple-secondary btn-apple-xs" type="button">
+              🔊 实时试听播报语
+            </button>
+          </div>
+
+          <div class="ws-tpl-preset-chips" id="wsTplPresetChips" style="margin:8px 0;">
+            <button type="button" class="ws-chip-btn" data-tplkey="vip_community">✨ 尊享业主欢迎版</button>
+            <button type="button" class="ws-chip-btn" data-tplkey="office_welcome">🏢 商务办公园区版</button>
+            <button type="button" class="ws-chip-btn" data-tplkey="classic">🏠 经典亲切回家版</button>
+            <button type="button" class="ws-chip-btn" data-tplkey="concise">⚡ 极简速报版</button>
+          </div>
+
+          <div class="field">
+            <label for="wsGreetingTplInput">有空位时的推荐播报模板</label>
+            <textarea id="wsGreetingTplInput" rows="3" class="ws-textarea"></textarea>
+          </div>
+
+          <div class="field" style="margin-top:8px;">
+            <label for="wsFullTplInput">满位时的温馨提示模板</label>
+            <input type="text" id="wsFullTplInput" />
+          </div>
+
+          <div id="wsLivePreviewBox" class="ws-live-preview-box">
+            <strong>播报预览：</strong><span id="wsLivePreviewText">--</span>
+          </div>
+        </div>
+
+        <!-- Per-Workspace Identity Access & Exclusive Shortcut Links -->
+        <div class="vg-admin-panel" style="margin-top:12px;">
+          <div class="vg-admin-head">
+            <div>
+              <strong>🔐 场所身份权限隔离与专属快捷指令入口</strong>
+              <p>设置访问口令后，仅持有本场所专属链接/口令的业主或员工可查看该空间的车位图与设定快捷指令</p>
+            </div>
+          </div>
+
+          <div class="field-grid-3" style="margin-top:8px;">
+            <div class="field">
+              <label for="wsAccessTokenInput">
+                业主/员工查看与播报口令 <span id="wsViewerTokPill" class="saved-key-pill"></span>
+              </label>
+              <input type="password" id="wsAccessTokenInput" placeholder="留空不修改（新空间留空则免口令）" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="wsAdminTokenInput">
+                物业站点管理口令（选填） <span id="wsAdminTokPill" class="saved-key-pill"></span>
+              </label>
+              <input type="password" id="wsAdminTokenInput" placeholder="可选独立后台管理口令" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="wsArrivalPlaceInput">到达自动播报地标（选填）</label>
+              <input type="text" id="wsArrivalPlaceInput" placeholder="如：阳光花园东门 / 万科中心南门" />
+            </div>
+          </div>
+
+          <div class="options-row" style="margin-top:6px;gap:16px;">
+            <label class="apple-check">
+              <input type="checkbox" id="wsClearAccessTokenChk" />
+              清空业主/员工查看口令
+            </label>
+            <label class="apple-check">
+              <input type="checkbox" id="wsClearAdminTokenChk" />
+              清空物业管理口令
+            </label>
+          </div>
+
+          <div id="wsExclusiveLinksBox" class="ws-links-bar">
+            <div class="ws-link-item">
+              <span>📱 本场所专属 :18790 交互平面图：</span>
+              <code id="wsLink18790">--</code>
+              <button type="button" id="btnCopyWs18790" class="btn-apple btn-apple-ghost btn-apple-xs">复制</button>
+            </div>
+            <div class="ws-link-item">
+              <span>🎙️ 本场所专属 :18791 快捷指令与语音助手：</span>
+              <code id="wsLink18791">--</code>
+              <button type="button" id="btnCopyWs18791" class="btn-apple btn-apple-ghost btn-apple-xs">复制</button>
+            </div>
+          </div>
+        </div>
+
+        <p id="wsModalFeedback" class="feedback-note"></p>
+      </div>
+
+      <div class="sheet-footer" style="justify-content:space-between;">
+        <div>
+          <button id="btnDeleteWorkspace" class="btn-apple btn-apple-secondary btn-apple-sm map-danger-btn hidden" type="button">
+            🗑 删除当前工作空间
+          </button>
+        </div>
+        <div style="display:flex;gap:10px;">
+          <button id="btnCancelWorkspaceModal" class="btn-apple btn-apple-ghost" type="button">取消</button>
+          <button id="btnSaveWorkspaceModal" class="btn-apple btn-apple-primary" type="button">保存工作空间设置</button>
         </div>
       </div>
     </div>

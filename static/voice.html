@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+  />
+  <meta name="theme-color" content="#F5F5F7" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="小区车位" />
+  <title>邻里寻位 · 语音与快捷指令</title>
+  <link rel="stylesheet" href="/voice.css?v=__ASSET_VER__" />
+</head>
+<body>
+  <div class="vg-app">
+    <!-- 顶部极简状态栏 -->
+    <header class="vg-topbar">
+      <div class="vg-brand">
+        <span class="live-dot" id="vgLiveDot" aria-hidden="true"></span>
+        <h1 class="vg-title" id="vgTitle">邻里公益寻位</h1>
+      </div>
+      <div class="vg-net-pill" id="vgFreeBadge">
+        <span>余</span>
+        <strong id="vgFreeNum">--</strong>
+        <span>位</span>
+      </div>
+    </header>
+
+    <!-- 苹果式三页分段导航（一屏展示、清晰分页） -->
+    <nav class="vg-page-tabs" id="vgPageTabs" role="tablist" aria-label="功能分页">
+      <button type="button" class="vg-page-tab is-active" data-page="live" role="tab" aria-selected="true">
+        📍 寻位播报
+      </button>
+      <button type="button" class="vg-page-tab" data-page="ai" role="tab" aria-selected="false">
+        💬 语音助手
+      </button>
+      <button type="button" class="vg-page-tab" data-page="shortcut" role="tab" aria-selected="false">
+        ⚡ 快捷指令
+      </button>
+    </nav>
+
+    <!-- 访问口令验证栏（仅站点开启口令保护且未验证时显示） -->
+    <section id="vgAuthBar" class="vg-card vg-auth-card hidden" aria-label="访问口令验证">
+      <div class="vg-inline-form">
+        <input id="vgTokenInput" type="password" class="vg-input" placeholder="🔐 请输入站点访问口令" autocomplete="off" />
+        <button id="vgSaveTokenBtn" type="button" class="vg-btn vg-btn-primary">验证</button>
+      </div>
+    </section>
+
+    <!-- ==================== 分页 1：实时动态图 + 极速播报 ==================== -->
+    <main id="vgPageLive" class="vg-page is-active" role="tabpanel">
+      <section class="vg-card vg-live-shell">
+        <div class="vg-control-strip">
+          <div class="vg-dest-row">
+            <div class="vg-select-wrap vg-flex-1">
+              <select id="vgUnitSelect" class="vg-unit-select" aria-label="选择目的地单元门"></select>
+            </div>
+            <button id="vgSpeakBriefBtn" type="button" class="vg-speak-btn" aria-live="polite">
+              🔊 播报
+            </button>
+          </div>
+
+          <div id="vgManualUnitRow" class="vg-manual-unit-row hidden">
+            <input
+              id="vgManualUnitInput"
+              type="text"
+              class="vg-input vg-input-sm"
+              maxlength="24"
+              placeholder="输入单元号，如 8-1 或 3-1"
+            />
+            <button id="vgApplyManualUnitBtn" type="button" class="vg-btn vg-btn-soft vg-btn-sm">确定</button>
+          </div>
+
+          <div class="vg-sub-controls">
+            <div class="vg-seg-group" id="vgRepeatSeg" role="radiogroup" aria-label="播报遍数">
+              <button type="button" class="vg-seg-btn" data-repeat="1" role="radio" aria-checked="false">1遍</button>
+              <button type="button" class="vg-seg-btn is-active" data-repeat="2" role="radio" aria-checked="true">2遍</button>
+            </div>
+
+            <div class="vg-select-wrap vg-compact-select">
+              <select id="vgVehicleSelect" class="vg-sub-select" aria-label="选择车型">
+                <option value="sedan">🚗 轿车</option>
+                <option value="suv">🚙 大型SUV</option>
+                <option value="compact">🛵 小车</option>
+              </select>
+            </div>
+
+            <div class="vg-select-wrap vg-compact-select" title="语音音色">
+              <select id="vgVoiceSelect" class="vg-sub-select" aria-label="选择语音音色">
+                <option value="">🎙️ 默认音色</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- 精炼一行寻位摘要（绝不重复显示两遍文字） -->
+        <div class="vg-summary-bar" aria-live="polite">
+          <div class="vg-summary-main">
+            <span class="vg-rec-badge" id="vgRecTag">推荐</span>
+            <span class="vg-rec-zone" id="vgBriefSummary">正在同步实时车位…</span>
+          </div>
+          <div class="vg-summary-right">
+            <span id="vgAlternatives" class="vg-alt-inline"></span>
+            <span class="vg-walk-pill" id="vgBriefWalk">🚶 --m</span>
+          </div>
+        </div>
+
+        <!-- 原生内联实时动态交互态势图（支持单指上下滑页面、双指缩放、点楼栋秒切单元） -->
+        <div class="vg-map-stage" id="vgMapStage">
+          <svg
+            id="vgMapSvg"
+            class="vg-map-svg"
+            viewBox="0 0 145 100"
+            preserveAspectRatio="xMidYMid meet"
+            aria-label="小区车位实时态势平面图"
+          ></svg>
+
+          <div class="vg-map-tools">
+            <button type="button" id="vgZoomInBtn" class="vg-tool-btn" aria-label="放大平面图">＋</button>
+            <button type="button" id="vgZoomOutBtn" class="vg-tool-btn" aria-label="缩小平面图">－</button>
+            <button type="button" id="vgBackdropBtn" class="vg-tool-btn vg-tool-text hidden" aria-label="切换底图叠显">底图</button>
+          </div>
+
+          <div class="vg-map-toast hidden" id="vgMapSpotToast"></div>
+
+          <div class="vg-map-legend" aria-label="图例说明">
+            <span class="vg-lg-item"><i class="vg-lg-dot vg-lg-free"></i>空闲</span>
+            <span class="vg-lg-item"><i class="vg-lg-dot vg-lg-occ"></i>已停</span>
+            <span class="vg-lg-item"><i class="vg-lg-dot vg-lg-blk"></i>禁停</span>
+            <span class="vg-lg-item"><i class="vg-lg-line vg-lg-walk"></i>步行至单元门</span>
+            <span class="vg-lg-item"><i class="vg-lg-line vg-lg-drive"></i>行车引导</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ==================== 分页 2：自有大模型语音助手 ==================== -->
+    <section id="vgPageAi" class="vg-page hidden" role="tabpanel" aria-label="智能语音问答助手">
+      <div class="vg-card vg-ai-shell">
+        <div class="vg-ai-head">
+          <div>
+            <h2>智能语音寻位助手</h2>
+            <p>基于实时余位、车型尺寸与步行路网互动解答</p>
+          </div>
+          <span id="vgLlmBadge" class="vg-subtle-tag vg-tag-accent">大模型就绪</span>
+        </div>
+
+        <div class="vg-quick-chips" id="vgQuickChipsRow">
+          <button type="button" class="vg-chip" data-q="现在停哪个区域走回家最近？还有几个位？">停哪最近？</button>
+          <button type="button" class="vg-chip" data-q="我是大型SUV，现在有哪些好停的车位？">大型SUV好停吗？</button>
+          <button type="button" class="vg-chip" data-q="除了首选区域，还有哪些备选空位？">备选空位</button>
+          <span id="vgCustomChipsList" class="vg-custom-chips-inline"></span>
+          <button type="button" id="vgToggleAddChipBtn" class="vg-chip vg-chip-add" title="添加自定义常用问题">
+            ＋ 自定义问题
+          </button>
+        </div>
+
+        <div id="vgCustomChipEditor" class="vg-custom-chip-editor hidden">
+          <input
+            id="vgCustomChipInput"
+            type="text"
+            class="vg-input vg-input-sm"
+            maxlength="120"
+            placeholder="输入您常问的问题（如：回9栋2单元从北门进停哪最近？）"
+          />
+          <button type="button" id="vgSaveCustomChipBtn" class="vg-btn vg-btn-primary vg-btn-sm">保存</button>
+          <button type="button" id="vgCancelCustomChipBtn" type="button" class="vg-btn vg-btn-soft vg-btn-sm">取消</button>
+        </div>
+
+        <div class="vg-ai-stage">
+          <div id="vgAiEmptyHint" class="vg-ai-empty">
+            点击上方快捷问题，或点下方「🎤 说话」直接提问
+          </div>
+          <div id="vgAnswerCard" class="vg-answer-bubble hidden">
+            <div class="vg-answer-meta">
+              <span id="vgAnswerSource" class="vg-answer-tag">AI 实时解答</span>
+              <div class="vg-answer-actions">
+                <button id="vgPinQuestionBtn" type="button" class="vg-mini-link" title="将刚问的问题保存为上方快捷标签">☆ 存为常用</button>
+                <button id="vgReplayAnswerBtn" type="button" class="vg-mini-link">🔊 重播</button>
+              </div>
+            </div>
+            <p id="vgAnswerText" class="vg-answer-body"></p>
+          </div>
+        </div>
+
+        <div class="vg-composer">
+          <button id="vgMicBtn" type="button" class="vg-mic-pill" title="语音提问">
+            <span aria-hidden="true">🎤</span>
+            <span id="vgMicLabel">说话</span>
+          </button>
+          <input
+            id="vgAskInput"
+            type="text"
+            class="vg-composer-input"
+            maxlength="160"
+            placeholder="问一句：如“回3栋1单元停哪最近？”"
+          />
+          <button id="vgAskSendBtn" type="button" class="vg-composer-send">发送</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 分页 3：手机与车载快捷指令 ==================== -->
+    <section id="vgPageShortcut" class="vg-page hidden" role="tabpanel" aria-label="快捷指令设置">
+      <div class="vg-card vg-sc-shell">
+        <div class="vg-seg-group vg-platform-seg" id="vgPlatformTabs" role="tablist">
+          <button type="button" class="vg-seg-btn is-active" data-platform="apple" role="tab" aria-selected="true">
+             iPhone / Mac
+          </button>
+          <button type="button" class="vg-seg-btn" data-platform="android" role="tab" aria-selected="false">
+            🤖 Android
+          </button>
+        </div>
+
+        <!-- Apple iOS / macOS 极简设置表 -->
+        <div id="vgPanelApple" class="vg-platform-panel">
+          <div class="ios-group">
+            <div class="ios-row">
+              <label class="ios-row-label" for="vgShortcutNameInput">
+                <strong>指令名称与唤醒词</strong>
+                <span>“嘿 Siri，<em id="vgWakeNamePreview">小区车位</em>”</span>
+              </label>
+              <input
+                id="vgShortcutNameInput"
+                type="text"
+                class="ios-row-input"
+                maxlength="32"
+                value="小区车位"
+                placeholder="小区车位"
+              />
+            </div>
+
+            <div class="ios-row">
+              <label class="ios-row-label" for="vgUnitModeSelect">
+                <strong>目的单元</strong>
+                <span id="vgUnitTargetHint">已绑定当前所选单元，一键添加直接用</span>
+              </label>
+              <select id="vgUnitModeSelect" class="ios-row-select">
+                <option value="fixed" selected>绑定上方单元（一键秒加）</option>
+                <option value="setup_once">首次运行选一次，之后免选</option>
+                <option value="menu">每次运行时弹窗选单元</option>
+              </select>
+            </div>
+
+            <div class="ios-row">
+              <label class="ios-row-label" for="vgShortcutActionSelect">
+                <strong>执行模式</strong>
+                <span>极速播报或语音提问大模型</span>
+              </label>
+              <select id="vgShortcutActionSelect" class="ios-row-select">
+                <option value="brief" selected>极速车位播报</option>
+                <option value="ask">Siri 提问大模型</option>
+              </select>
+            </div>
+
+            <div class="ios-row">
+              <label class="ios-row-label" for="vgPopupModeSelect">
+                <strong>弹出显示内容</strong>
+                <span id="vgShowMapHint">与语音播报相继同时弹出，无需等待播完</span>
+              </label>
+              <select id="vgPopupModeSelect" class="ios-row-select">
+                <option value="text" selected>仅弹出寻位文字</option>
+                <option value="map">仅弹出动态平面图</option>
+                <option value="both">文字 + 平面图同屏</option>
+                <option value="silent">纯语音（不弹窗）</option>
+              </select>
+            </div>
+
+            <div class="ios-row">
+              <div class="ios-row-label">
+                <strong>到达小区自动播报</strong>
+                <span>可选预设驶入地点提醒</span>
+              </div>
+              <label class="ios-switch" aria-label="到达小区自动播报">
+                <input type="checkbox" id="vgOptArrival" />
+                <span class="ios-slider"></span>
+              </label>
+            </div>
+
+            <div id="vgArrivalConfigBox" class="ios-sub-box hidden">
+              <div class="vg-place-picker">
+                <div class="vg-arrival-inputs">
+                  <div class="vg-place-input-wrap">
+                    <input
+                      id="vgArrivalPlaceInput"
+                      type="text"
+                      class="vg-input vg-input-sm"
+                      maxlength="80"
+                      autocomplete="off"
+                      placeholder="🔍 输入小区或大门名称检索标准地址…"
+                    />
+                  </div>
+                  <button id="vgLocateMeBtn" type="button" class="vg-btn vg-btn-soft vg-btn-sm" title="定位当前所在位置">
+                    📍 定位
+                  </button>
+                  <select id="vgArrivalRadiusSelect" class="vg-sub-select vg-radius-select" aria-label="触发距离">
+                    <option value="150">150m</option>
+                    <option value="200" selected>200m</option>
+                    <option value="300">300m</option>
+                  </select>
+                </div>
+
+                <!-- 定位权限开启指引条（当定位受限或局域网 HTTP 拦截时展开） -->
+                <div id="vgGeoPermGuide" class="vg-geo-guide hidden" role="region" aria-label="位置权限开启指引">
+                  <div class="vg-geo-guide-body" id="vgGeoPermGuideText"></div>
+                  <div class="vg-geo-guide-actions">
+                    <button id="vgGeoOpenMapFallbackBtn" type="button" class="vg-btn vg-btn-primary vg-btn-sm">
+                      🗺️ 打开手机地图选点
+                    </button>
+                    <button id="vgGeoDismissBtn" type="button" class="vg-btn vg-btn-soft vg-btn-sm">知道了</button>
+                  </div>
+                </div>
+
+                <!-- 地图实时候选地址下拉框 -->
+                <div id="vgPlaceDropdown" class="vg-place-dropdown hidden" role="listbox" aria-label="候选地址"></div>
+
+                <!-- 地图 App 选择与查看/复制栏（支持高德 / 苹果 / 百度 / 腾讯地图） -->
+                <div class="vg-place-actions-bar">
+                  <span id="vgSelectedPlaceMeta" class="vg-place-meta">输入小区关键字检索大门，或用手机地图选点</span>
+                  <div class="vg-place-btns">
+                    <select id="vgMapAppSelect" class="vg-sub-select vg-map-app-select" aria-label="选择手机地图应用">
+                      <option value="amap">🧭 高德地图</option>
+                      <option value="apple"> 苹果地图</option>
+                      <option value="baidu">🐾 百度地图</option>
+                      <option value="tencent">🐧 腾讯地图</option>
+                    </select>
+                    <button id="vgOpenNativeMapBtn" type="button" class="vg-btn vg-btn-soft vg-btn-sm">
+                      打开地图
+                    </button>
+                    <button id="vgCopyPlaceBtn" type="button" class="vg-btn vg-btn-soft vg-btn-sm">复制地址</button>
+                  </div>
+                </div>
+              </div>
+              <p class="vg-arrival-tip">
+                添加指令后，在「快捷指令 → 自动化 → 到达」粘贴上述地址、选「立即运行」并关联「<strong id="vgArrivalScNameRef">小区车位</strong>」即可驶入自动播报。
+              </p>
+            </div>
+          </div>
+
+          <div class="vg-cta-stack">
+            <button id="vgDownloadShortcutBtn" type="button" class="vg-btn vg-btn-primary vg-btn-cta">
+               生成并添加「小区车位」快捷指令
+            </button>
+            <p id="vgShortcutStatusHint" class="vg-wake-caption">
+              Apple 官方签名 · 支持添加至主屏幕图标、Siri 与 CarPlay
+            </p>
+          </div>
+        </div>
+
+        <!-- Android 极简快捷面板（支持局域网 HTTP 无障碍一键复制与直达打开） -->
+        <div id="vgPanelAndroid" class="vg-platform-panel hidden">
+          <div class="android-box">
+            <div class="android-item">
+              <strong>方式一 · 桌面「即点即播」快捷方式（零门槛推荐）</strong>
+              <p>点击「直接打开即播页」后在浏览器右上角菜单选「添加到主屏幕」，或复制链接备用：</p>
+              <div class="vg-code-bar">
+                <input id="vgAndroidQuickLaunchCode" type="text" class="vg-copy-input" readonly value="--" aria-label="桌面即点即播链接" />
+                <button id="vgOpenQuickLaunchBtn" type="button" class="vg-btn vg-btn-soft vg-btn-sm">直接打开</button>
+                <button id="vgCopyQuickLaunchBtn" type="button" class="vg-btn vg-btn-primary vg-btn-sm">复制链接</button>
+              </div>
+            </div>
+
+            <div class="android-item">
+              <strong>方式二 · 语音助手 &amp; 到达小区大门自动播报</strong>
+              <p>小艺场景 / 小米自动连招 / Breeno：触发口令「<span id="vgAndroidWakeRef">小区车位</span>」或「到达小区大门」→ HTTP GET 下方地址并系统朗读：</p>
+              <div class="vg-code-bar">
+                <input id="vgBriefUrlCode" type="text" class="vg-copy-input" readonly value="--" aria-label="极速语音播报 API" />
+                <button id="vgCopyBriefUrlBtn" type="button" class="vg-btn vg-btn-primary vg-btn-sm">复制 API</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="vgToast" class="vg-toast hidden" role="status" aria-live="polite"></div>
+  <script src="/voice.js?v=__ASSET_VER__"></script>
+</body>
+</html>

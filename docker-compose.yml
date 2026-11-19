@@ -1,0 +1,62 @@
+# ==============================================================================
+# 邻里停 (Community Parking) 容器化与 Spot 实例抗抢占编排 (Docker Compose v2)
+#
+# 1) 仅启动核心服务 (本地 Mac / Windows 物业机 / Ubuntu 云端 / Spot 实例):
+#      docker compose up -d --build
+#
+# 2) 连同免费 Cloudflare Tunnel 一键打通公网 HTTPS (免公网IP、免备案、0元服务1000+车主):
+#      CLOUDFLARE_TUNNEL_TOKEN=你的隧道Token docker compose --profile tunnel up -d --build
+#
+# Spot 竞价实例重启/回收保护机制:
+# - restart: always -> 宿主机断电、云厂商 Spot 重启恢复、Docker 守护进程拉起时自动在线
+# - stop_grace_period: 25s -> 利用云平台 Spot 30s 回收窗口优雅响应 SIGTERM，停止拉流并执行
+#   PRAGMA wal_checkpoint(TRUNCATE)，确保 data/parking.db 与 runtime_config.json 零损毁
+# ==============================================================================
+
+services:
+  community-parking:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: community-parking:latest
+    container_name: community-parking
+    restart: always
+    stop_grace_period: 25s
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      # 管理控制台默认仅暴露给宿主机回环口 (127.0.0.1:8790)，防止公网误扫管理端；
+      # 如需局域网其他电脑管理，可设环境变量 PARKING_ADMIN_BIND=0.0.0.0
+      - "${PARKING_ADMIN_BIND:-127.0.0.1}:${PARKING_PORT:-8790}:8790"
+      # :18790 极简手机看图与播报端（只读无管理接口）
+      - "${PARKING_MOBILE_PORT:-18790}:18790"
+      # :18791 Siri CarPlay 免手语音 / 自有大模型问答 / 普通微信 ClawBot 网关
+      - "${PARKING_VOICE_PORT:-18791}:18791"
+      # :2121 局域网摄像头 FTP 内存接收口
+      - "${PARKING_FTP_PORT:-2121}:2121"
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 可选侧车: Cloudflare Zero Trust 免费出站隧道 (--profile tunnel 启用)
+  # 在 Cloudflare Zero Trust 后台将:
+  #   parking.你的域名.com -> http://community-parking:18790  (微信浮窗看图+播报)
+  #   voice.你的域名.com   -> http://community-parking:18791  (Siri 车载免手唤醒+AI问答)
+  # 注意: :8790 管理后台与内网摄像头完全无需暴露到公网！
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: community-parking-tunnel
+    profiles: ["tunnel"]
+    restart: always
+    depends_on:
+      - community-parking
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"

@@ -40,6 +40,13 @@ from app.recommender import ParkingRecommender
 from app.sitemap_generator import SiteMapGenerator
 from app.state_machine import SpotStateMachine
 from app.vision_pipeline import VisionPipeline
+from app.voice_gateway import VoiceGatewayService, create_voice_http_server
+from app.workspaces import (
+    BROADCAST_STYLE_TEMPLATES,
+    SCENE_PRESETS,
+    WorkspaceRegistry,
+    render_workspace_broadcast_text,
+)
 
 STATIC_DIR = BASE_DIR / "static"
 MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024  # 16 MB hard memory-safety limit
@@ -202,9 +209,12 @@ def _build_mobile_overview_payload(
 
     total_free = sum(z["effective_free"] for z in zones_raw)
     total_cap = sum(z["total_capacity"] for z in zones_raw)
+    ws_pub = ctx.get_public_workspace_profile(include_templates=False)
 
     return {
-        "community_name": cfg["community_name"],
+        "workspace_id": ctx.workspace_id,
+        "workspace": ws_pub,
+        "community_name": ctx.community_name(),
         "mobile_version": _compute_mobile_version(),
         "selected_unit_id": resolved_uid,
         "vehicle_type": vtype,
@@ -220,18 +230,61 @@ def _build_mobile_overview_payload(
     }
 
 
+def extract_workspace_from_request(
+    raw_path: str, qs: Dict[str, list[str]], headers: Any
+) -> Tuple[str, str]:
+    """
+    Extract `(normalized_path, workspace_id)` from `/w/<ws_id>/...`, `?ws=`, or `X-Parking-Workspace`.
+    """
+    m = re.match(r"^/w/([a-zA-Z0-9_-]{1,40})(?:/(.*))?$", raw_path or "/")
+    if m:
+        ws_from_path = m.group(1)
+        rest = m.group(2) or ""
+        norm_path = "/" + rest if rest else "/"
+        return norm_path, ws_from_path
+    ws_q = (qs.get("ws") or qs.get("workspace") or [""])[0].strip()
+    if ws_q:
+        return raw_path, ws_q
+    ws_hdr = str(headers.get("X-Parking-Workspace") or "").strip() if headers else ""
+    if ws_hdr:
+        return raw_path, ws_hdr
+    return raw_path, "default"
+
+
+def extract_request_token(qs: Dict[str, list[str]], headers: Any) -> str:
+    for k in ("token", "k", "key", "ws_token"):
+        if qs.get(k) and str(qs[k][0]).strip():
+            return str(qs[k][0]).strip()
+    if headers:
+        hdr = str(headers.get("X-Parking-Token") or headers.get("X-Workspace-Token") or "").strip()
+        if hdr:
+            return hdr
+        auth = str(headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+    return ""
+
+
 class PayloadTooLargeError(Exception):
     """Raised when an incoming HTTP payload exceeds MAX_HTTP_BODY_BYTES."""
 
 
 class ParkingAppContext:
-    def __init__(self, database: Optional[Database] = None) -> None:
+    def __init__(
+        self,
+        database: Optional[Database] = None,
+        workspace_id: str = "default",
+        workspace_registry: Optional[WorkspaceRegistry] = None,
+    ) -> None:
         self.db = database or default_db
+        self.workspace_id = str(workspace_id or "default")
+        self.workspace_registry: Optional[WorkspaceRegistry] = workspace_registry
+        self._reg_init_lock = threading.RLock()
         self.fsm = SpotStateMachine(self.db)
         self.vision = VisionPipeline(self.db, self.fsm)
         self.calibrator = ReferenceAutoCalibrator(self.db, self.vision)
         self.sitemap_gen = SiteMapGenerator(self.db, self.vision)
-        self.recommender = ParkingRecommender(self.db)
+        self.recommender = ParkingRecommender(self.db, profile_getter=self.get_workspace_profile)
         self.vision.set_recommender(self.recommender)
         self.recent_events: list[Dict[str, Any]] = []
         self._sched_stop = threading.Event()
@@ -241,6 +294,62 @@ class ParkingAppContext:
             vision_pipeline=self.vision,
             event_callback=self.push_event,
         )
+        self.voice_gateway = VoiceGatewayService(self)
+
+    def ensure_workspace_registry(self) -> WorkspaceRegistry:
+        with self._reg_init_lock:
+            if self.workspace_registry is None:
+                ws_dir = Path(self.db.db_path).resolve().parent / "workspaces"
+                self.workspace_registry = WorkspaceRegistry(
+                    root_ctx=self,
+                    context_factory=ParkingAppContext,
+                    workspaces_dir=ws_dir,
+                )
+            return self.workspace_registry
+
+    def resolve_workspace_context(self, ws_id: Optional[str] = None) -> "ParkingAppContext":
+        target = str(ws_id or "").strip()
+        if not target or target == self.workspace_id:
+            return self
+        reg = self.ensure_workspace_registry()
+        return reg.get_context(target)
+
+    def get_workspace_profile(self) -> Dict[str, Any]:
+        if self.workspace_registry is not None:
+            return self.workspace_registry.get_raw_profile(self.workspace_id)
+        cfg = config_manager.get()
+        vg = cfg.get("voice_gateway", {})
+        return {
+            "workspace_id": self.workspace_id,
+            "name": str(cfg.get("community_name") or "阳光花园 · 邻里公益寻位"),
+            "scene_type": "community",
+            "role_title": "业主",
+            "access_token": str(vg.get("access_token") or ""),
+            "arrival_place": str(vg.get("arrival_place") or ""),
+            "arrival_radius_m": int(vg.get("arrival_radius_m") or 200),
+            "default_unit_id": str(vg.get("default_unit_id") or "8-1"),
+        }
+
+    def get_public_workspace_profile(self, include_templates: bool = True) -> Dict[str, Any]:
+        reg = self.ensure_workspace_registry()
+        return reg.serialize_public_profile(self.workspace_id, include_templates=include_templates)
+
+    def community_name(self) -> str:
+        prof = self.get_workspace_profile()
+        return str(prof.get("name") or config_manager.get().get("community_name") or "邻里公益寻位")
+
+    def verify_viewer_token(self, provided_token: str) -> bool:
+        if self.workspace_registry is not None:
+            return self.workspace_registry.verify_viewer_token(self.workspace_id, provided_token)
+        expected = str(self.get_workspace_profile().get("access_token") or "").strip()
+        if not expected:
+            return True
+        return bool(provided_token) and provided_token == expected
+
+    def verify_admin_token(self, provided_admin_token: str) -> bool:
+        if self.workspace_registry is not None:
+            return self.workspace_registry.verify_admin_token(self.workspace_id, provided_admin_token)
+        return True
 
     @property
     def ingestor(self) -> CameraIngestionScheduler:
@@ -375,9 +484,10 @@ class ParkingAppContext:
 
 
 app_ctx = ParkingAppContext()
+app_ctx.ensure_workspace_registry()
 
 
-def make_http_handler(ctx: ParkingAppContext = app_ctx):
+def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
     class ParkingRequestHandler(BaseHTTPRequestHandler):
         server_version = "CommunityParking/1.0"
 
@@ -459,27 +569,74 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Parking-Client")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization, X-Parking-Client, X-Parking-Workspace, X-Workspace-Admin-Token",
+            )
             self.end_headers()
+
+        def _extract_admin_token(self, qs: Dict[str, list[str]]) -> str:
+            if qs.get("admin_token") and str(qs["admin_token"][0]).strip():
+                return str(qs["admin_token"][0]).strip()
+            return str(self.headers.get("X-Workspace-Admin-Token") or "").strip()
 
         def do_HEAD(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path == "/api/health":
+            qs = parse_qs(parsed.query)
+            path, _ = extract_workspace_from_request(parsed.path, qs, self.headers)
+            if path == "/api/health":
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 return
-            self._serve_static(parsed.path, head_only=True)
+            self._serve_static(path, head_only=True)
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            path = parsed.path
             qs = parse_qs(parsed.query)
+            path, req_ws_id = extract_workspace_from_request(parsed.path, qs, self.headers)
+            ctx = root_ctx.resolve_workspace_context(req_ws_id)
 
             try:
                 if path == "/api/health":
-                    self._send_json({"ok": True, "ts": time.time()})
+                    self._send_json({"ok": True, "workspace_id": ctx.workspace_id, "ts": time.time()})
+                    return
+
+                if path == "/api/workspaces":
+                    reg = root_ctx.ensure_workspace_registry()
+                    scoped_ws = (qs.get("scoped_ws") or [""])[0].strip() or None
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "current_workspace_id": ctx.workspace_id,
+                            "workspaces": reg.list_workspaces(scoped_admin_ws=scoped_ws),
+                            "scene_presets": {
+                                k: {
+                                    "label": v["label"],
+                                    "role_title": v["role_title"],
+                                    "dest_label": v["dest_label"],
+                                    "greeting_template": v["greeting_template"],
+                                    "full_template": v["full_template"],
+                                }
+                                for k, v in SCENE_PRESETS.items()
+                            },
+                            "broadcast_templates": BROADCAST_STYLE_TEMPLATES,
+                        }
+                    )
+                    return
+
+                if path.startswith("/api/") and not ctx.verify_admin_token(self._extract_admin_token(qs)):
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "admin_auth_required": True,
+                            "workspace_id": ctx.workspace_id,
+                            "workspace_name": ctx.community_name(),
+                            "error": "需要输入该工作空间的管理口令",
+                        },
+                        401,
+                    )
                     return
 
                 if path == "/api/overview":
@@ -521,7 +678,9 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                         extra_hdrs = {"Clear-Site-Data": '"cache"'}
                     self._send_json(
                         {
-                            "community_name": cfg["community_name"],
+                            "workspace_id": ctx.workspace_id,
+                            "workspace": ctx.get_public_workspace_profile(include_templates=True),
+                            "community_name": ctx.community_name(),
                             "frontend_version": fe_ver,
                             "total_capacity": total_cap,
                             "total_effective_free": total_free,
@@ -741,6 +900,21 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                     self._send_json(config_manager.get_public())
                     return
 
+                if path == "/api/voice-gateway/status":
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "gateway": ctx.voice_gateway.get_gateway_metrics(),
+                            "bindings": ctx.db.list_im_user_bindings(),
+                        }
+                    )
+                    return
+
+                if path == "/api/voice-gateway/weixin/qr-poll":
+                    qr_val = (qs.get("qrcode") or [""])[0]
+                    self._send_json(ctx.voice_gateway.weixin_bridge.poll_qr_login(qr_val))
+                    return
+
                 # Serve static frontend files
                 self._serve_static(path)
             except Exception as exc:
@@ -748,10 +922,71 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
-            path = parsed.path
             qs = parse_qs(parsed.query)
+            path, req_ws_id = extract_workspace_from_request(parsed.path, qs, self.headers)
+            ctx = root_ctx.resolve_workspace_context(req_ws_id)
 
             try:
+                if path == "/api/workspaces":
+                    body = self._read_json()
+                    reg = root_ctx.ensure_workspace_registry()
+                    created = reg.create_workspace(body)
+                    self._send_json({"ok": True, "workspace": created, "workspaces": reg.list_workspaces()})
+                    return
+
+                m_ws_upd = re.match(r"^/api/workspaces/([^/]+)/update$", path)
+                if m_ws_upd:
+                    target_ws = unquote(m_ws_upd.group(1))
+                    target_ctx = root_ctx.resolve_workspace_context(target_ws)
+                    if not target_ctx.verify_admin_token(self._extract_admin_token(qs)):
+                        self._send_json({"error": "管理口令验证未通过"}, 401)
+                        return
+                    body = self._read_json()
+                    reg = root_ctx.ensure_workspace_registry()
+                    updated_ws = reg.update_workspace(target_ws, body)
+                    self._send_json({"ok": True, "workspace": updated_ws, "workspaces": reg.list_workspaces()})
+                    return
+
+                m_ws_prev = re.match(r"^/api/workspaces/([^/]+)/preview-broadcast$", path)
+                if m_ws_prev:
+                    target_ws = unquote(m_ws_prev.group(1))
+                    target_ctx = root_ctx.resolve_workspace_context(target_ws)
+                    body = self._read_json()
+                    draft_prof = {**target_ctx.get_workspace_profile(), **body}
+                    zones_p = target_ctx.recommender.get_zone_summaries()
+                    units_p = target_ctx.db.list_units()
+                    u0 = units_p[0] if units_p else {"unit_id": "7-1", "name": "7号楼1单元"}
+                    tot_free_p = sum(int(z.get("effective_free") or 0) for z in zones_p) or 5
+                    tot_cap_p = sum(int(z.get("total_capacity") or 0) for z in zones_p) or 20
+                    z0_name = zones_p[0]["name"] if zones_p else "主干道地面停车带"
+                    z1_name = zones_p[1]["name"] if len(zones_p) > 1 else "东侧备选停车带"
+                    sample_ok = render_workspace_broadcast_text(
+                        draft_prof,
+                        has_recommendation=True,
+                        total_free=tot_free_p,
+                        total_raw_free=tot_free_p,
+                        total_spots=tot_cap_p,
+                        unit_name=str(u0.get("name") or u0["unit_id"]),
+                        unit_id=str(u0["unit_id"]),
+                        primary={"zone_name": z0_name, "effective_free": min(3, tot_free_p), "walk_meters": 68},
+                        backup={"zone_name": z1_name, "effective_free": 2, "walk_meters": 115},
+                    )
+                    sample_full = render_workspace_broadcast_text(
+                        draft_prof,
+                        has_recommendation=False,
+                        total_free=0,
+                        total_raw_free=0,
+                        total_spots=tot_cap_p,
+                        unit_name=str(u0.get("name") or u0["unit_id"]),
+                        unit_id=str(u0["unit_id"]),
+                    )
+                    self._send_json({"ok": True, "sample_voice_text": sample_ok, "sample_full_text": sample_full})
+                    return
+
+                if not ctx.verify_admin_token(self._extract_admin_token(qs)):
+                    self._send_json({"error": "需要输入该工作空间的管理口令"}, 401)
+                    return
+
                 if path == "/api/recommend":
                     body = self._read_json()
                     raw_eg = body.get("entry_gate_id")
@@ -893,17 +1128,27 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                 if path == "/api/cameras/test-connection":
                     body = self._read_json()
                     cam_id_hint = str(body.get("camera_id") or "").strip()
+                    slot_id_hint = max(0, int(body.get("slot_id") or 0))
+                    rec_hint = None
                     existing_ic = None
                     if cam_id_hint:
                         rec_hint = ctx.db.get_camera_ingest_record(cam_id_hint)
                         if rec_hint:
-                            existing_ic = rec_hint.get("ingest_config")
+                            base_existing = rec_hint.get("ingest_config")
+                            if slot_id_hint > 0 and isinstance(base_existing, dict):
+                                sb_list = base_existing.get("standby_cameras") or []
+                                if slot_id_hint - 1 < len(sb_list):
+                                    existing_ic = sb_list[slot_id_hint - 1]
+                            else:
+                                existing_ic = base_existing
                     raw_ic = body.get("ingest_config") if isinstance(body.get("ingest_config"), dict) else body
                     merged_ic = normalize_ingest_config(raw_ic, existing_ic)
                     test_res = test_camera_connection(merged_ic)
-                    if cam_id_hint and ctx.db.get_camera(cam_id_hint):
+                    if "elapsed_ms" not in test_res:
+                        test_res["elapsed_ms"] = test_res.get("latency_ms", 0.0)
+                    if cam_id_hint and slot_id_hint == 0 and ctx.db.get_camera(cam_id_hint):
                         now_ts = time.time()
-                        prev_st = (existing_rec or {}).get("ingest_status") or {}
+                        prev_st = (rec_hint or {}).get("ingest_status") or {}
                         if test_res.get("ok"):
                             ctx.db.update_camera_ingest_status(
                                 cam_id_hint,
@@ -988,6 +1233,42 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                     pull_res["camera"] = ctx.db.get_camera(cam_id)
                     pull_res["spots"] = ctx.db.list_spots(camera_id=cam_id)
                     self._send_json(pull_res, 200 if pull_res.get("ok") else 400)
+                    return
+
+                m_cam_fsw = re.match(r"^/api/cameras/([^/]+)/failover/switch$", path)
+                if m_cam_fsw:
+                    cam_id = unquote(m_cam_fsw.group(1))
+                    body = self._read_json()
+                    slot_idx = int(body.get("slot_index", 0))
+                    reason = str(body.get("reason") or f"管理端手动切换至槽位 #{slot_idx}").strip()
+                    switched_cam = ctx.db.switch_camera_active_slot(cam_id, slot_idx, reason=reason)
+                    ctx.vision.clear_frame_cache(cam_id)
+                    ctx.camera_ingestor.notify_config_changed(cam_id)
+                    ctx.push_event(
+                        {
+                            "ts": time.time(),
+                            "source": f"摄像头主备切换 → #{slot_idx} ({switched_cam.get('active_slot_label', '')})",
+                            "camera_id": cam_id,
+                            "elapsed_ms": 0.0,
+                            "processed_spots": int(switched_cam.get("spot_count") or 0),
+                        }
+                    )
+                    pull_res = None
+                    if body.get("pull_now"):
+                        pull_res = ctx.camera_ingestor.pull_camera_once(
+                            cam_id,
+                            process_vision=True,
+                            save_reference_frame=True,
+                        )
+                        switched_cam = ctx.db.get_camera(cam_id) or switched_cam
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "camera": switched_cam,
+                            "spots": ctx.db.list_spots(camera_id=cam_id),
+                            "pull_result": pull_res,
+                        }
+                    )
                     return
 
                 m_cam_bind = re.match(r"^/api/cameras/([^/]+)/bind$", path)
@@ -1748,9 +2029,20 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                 if path == "/api/config":
                     body = self._read_json()
                     updated = config_manager.update(body)
+                    if "community_name" in body and str(body["community_name"]).strip():
+                        root_ctx.ensure_workspace_registry().update_workspace(
+                            "default", {"name": str(body["community_name"]).strip()}
+                        )
                     if "vlm" in body:
                         ctx.vision.clear_vlm_cache()
+                    if "voice_gateway" in body:
+                        ctx.voice_gateway.weixin_bridge.sync_worker_state()
                     self._send_json(updated)
+                    return
+
+                if path == "/api/voice-gateway/weixin/qr-start":
+                    qr_res = ctx.voice_gateway.weixin_bridge.start_qr_login()
+                    self._send_json({"ok": True, **qr_res})
                     return
 
                 if path == "/api/vlm/test":
@@ -1780,8 +2072,27 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
 
         def do_PUT(self) -> None:
             parsed = urlparse(self.path)
-            path = parsed.path
+            qs = parse_qs(parsed.query)
+            path, req_ws_id = extract_workspace_from_request(parsed.path, qs, self.headers)
+            ctx = root_ctx.resolve_workspace_context(req_ws_id)
             try:
+                m_ws_put = re.match(r"^/api/workspaces/([^/]+)$", path)
+                if m_ws_put:
+                    target_ws = unquote(m_ws_put.group(1))
+                    target_ctx = root_ctx.resolve_workspace_context(target_ws)
+                    if not target_ctx.verify_admin_token(self._extract_admin_token(qs)):
+                        self._send_json({"error": "管理口令验证未通过"}, 401)
+                        return
+                    body = self._read_json()
+                    reg = root_ctx.ensure_workspace_registry()
+                    updated_ws = reg.update_workspace(target_ws, body)
+                    self._send_json({"ok": True, "workspace": updated_ws, "workspaces": reg.list_workspaces()})
+                    return
+
+                if not ctx.verify_admin_token(self._extract_admin_token(qs)):
+                    self._send_json({"error": "需要输入该工作空间的管理口令"}, 401)
+                    return
+
                 m_zone_put = re.match(r"^/api/zones/([^/]+)$", path)
                 if m_zone_put:
                     zid = unquote(m_zone_put.group(1))
@@ -1827,25 +2138,39 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
         def do_DELETE(self) -> None:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
+            path, req_ws_id = extract_workspace_from_request(parsed.path, qs, self.headers)
+            ctx = root_ctx.resolve_workspace_context(req_ws_id)
             try:
-                if parsed.path == "/api/locks":
+                m_ws_del = re.match(r"^/api/workspaces/([^/]+)$", path)
+                if m_ws_del:
+                    target_ws = unquote(m_ws_del.group(1))
+                    reg = root_ctx.ensure_workspace_registry()
+                    res = reg.delete_workspace(target_ws)
+                    self._send_json({**res, "workspaces": reg.list_workspaces()})
+                    return
+
+                if not ctx.verify_admin_token(self._extract_admin_token(qs)):
+                    self._send_json({"error": "需要输入该工作空间的管理口令"}, 401)
+                    return
+
+                if path == "/api/locks":
                     ctx.recommender.clear_locks()
                     self._send_json({"ok": True})
                     return
-                m_unit_del = re.match(r"^/api/units/([^/]+)$", parsed.path)
+                m_unit_del = re.match(r"^/api/units/([^/]+)$", path)
                 if m_unit_del:
                     uid_del = unquote(m_unit_del.group(1))
                     res = ctx.db.delete_unit(uid_del)
                     self._send_json({"ok": True, **res})
                     return
-                m_zone_del = re.match(r"^/api/zones/([^/]+)$", parsed.path)
+                m_zone_del = re.match(r"^/api/zones/([^/]+)$", path)
                 if m_zone_del:
                     zid_del = unquote(m_zone_del.group(1))
                     reassign_to = qs.get("reassign_to", [""])[0]
                     res = ctx.db.delete_zone(zid_del, reassign_zone_id=reassign_to or None)
                     self._send_json({"ok": True, **res})
                     return
-                m_grp_del = re.match(r"^/api/sitemap/groups/([^/]+)$", parsed.path)
+                m_grp_del = re.match(r"^/api/sitemap/groups/([^/]+)$", path)
                 if m_grp_del:
                     gc_del = unquote(m_grp_del.group(1))
                     cam_act = qs.get("camera_action", ["keep"])[0]
@@ -1854,7 +2179,7 @@ def make_http_handler(ctx: ParkingAppContext = app_ctx):
                         ctx.vision.clear_frame_cache(cid)
                     self._send_json({"ok": True, **res})
                     return
-                m_cam_del = re.match(r"^/api/cameras/([^/]+)$", parsed.path)
+                m_cam_del = re.match(r"^/api/cameras/([^/]+)$", path)
                 if m_cam_del:
                     cam_id = unquote(m_cam_del.group(1))
                     spot_action = qs.get("spot_action", ["detach"])[0]
@@ -1966,10 +2291,11 @@ MOBILE_ALLOWED_STATIC_FILES = frozenset(
 )
 
 
-def make_mobile_http_handler(ctx: ParkingAppContext = app_ctx):
+def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
     """
     Strictly read-only HTTP handler dedicated to the mobile owner viewer port (:18790).
-    Exposes ONLY the minimalist mobile floor-plan & voice broadcast UI and sanitized viewer APIs.
+    Exposes ONLY the minimalist mobile floor-plan & voice broadcast UI and sanitized viewer APIs,
+    with per-workspace identity isolation (`/w/<ws_id>` or `?ws=<ws_id>` + optional `token`).
     """
 
     class MobileViewerRequestHandler(BaseHTTPRequestHandler):
@@ -2003,7 +2329,10 @@ def make_mobile_http_handler(ctx: ParkingAppContext = app_ctx):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Parking-Mobile-Client")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization, X-Parking-Token, X-Parking-Workspace, X-Parking-Mobile-Client",
+            )
             self.end_headers()
 
         def do_POST(self) -> None:
@@ -2020,22 +2349,56 @@ def make_mobile_http_handler(ctx: ParkingAppContext = app_ctx):
 
         def do_HEAD(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path == "/api/health":
+            qs = parse_qs(parsed.query)
+            path, _ = extract_workspace_from_request(parsed.path, qs, self.headers)
+            if path == "/api/health":
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 return
-            self._serve_mobile_static(parsed.path, head_only=True)
+            self._serve_mobile_static(path, head_only=True)
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            path = parsed.path
             qs = parse_qs(parsed.query)
+            path, req_ws_id = extract_workspace_from_request(parsed.path, qs, self.headers)
+            ctx = root_ctx.resolve_workspace_context(req_ws_id)
+            tok = extract_request_token(qs, self.headers)
 
             try:
                 if path == "/api/health":
-                    self._send_json({"ok": True, "role": "mobile_viewer", "ts": time.time()})
+                    self._send_json(
+                        {"ok": True, "role": "mobile_viewer", "workspace_id": ctx.workspace_id, "ts": time.time()}
+                    )
+                    return
+
+                if path == "/api/mobile/workspace-auth":
+                    ws_pub = ctx.get_public_workspace_profile(include_templates=False)
+                    is_auth = ctx.verify_viewer_token(tok)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "workspace_id": ctx.workspace_id,
+                            "workspace": ws_pub,
+                            "auth_required": bool(ws_pub.get("has_access_token")),
+                            "authorized": bool(is_auth),
+                        }
+                    )
+                    return
+
+                if path.startswith("/api/mobile/") and not ctx.verify_viewer_token(tok):
+                    ws_pub = ctx.get_public_workspace_profile(include_templates=False)
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "auth_required": True,
+                            "workspace_id": ctx.workspace_id,
+                            "workspace_name": ws_pub.get("name") or ctx.community_name(),
+                            "error": "该场所已开启身份验证，请输入专属访问口令",
+                        },
+                        401,
+                    )
                     return
 
                 if path == "/api/mobile/overview":
@@ -2168,19 +2531,29 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, server_address, RequestHandlerClass, ctx_ref: Optional[ParkingAppContext] = None):
-        super().__init__(server_address, RequestHandlerClass)
         self._ctx_ref = ctx_ref
+        super().__init__(server_address, RequestHandlerClass)
 
     def shutdown(self) -> None:
         if self._ctx_ref is not None:
             self._ctx_ref.stop_camera_ingestor()
             self._ctx_ref.stop_calib_scheduler()
+            self._ctx_ref.voice_gateway.stop_background_workers()
+            try:
+                self._ctx_ref.db.checkpoint_wal()
+            except Exception:
+                pass
         super().shutdown()
 
     def server_close(self) -> None:
         if self._ctx_ref is not None:
             self._ctx_ref.stop_camera_ingestor()
             self._ctx_ref.stop_calib_scheduler()
+            self._ctx_ref.voice_gateway.stop_background_workers()
+            try:
+                self._ctx_ref.db.checkpoint_wal()
+            except Exception:
+                pass
         super().server_close()
 
 

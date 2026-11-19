@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.DS_Store
+# 保护宿主机敏感配置与实时数据库不被打入镜像层（运行时通过 ./data:/app/data 挂载）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.log
+data/*.pid
+data/runtime_config.json
+data/workspaces/
+data/shortcuts/

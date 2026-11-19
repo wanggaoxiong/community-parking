@@ -8,7 +8,12 @@ from typing import Optional
 
 from app.config import config_manager
 from app.ftp_receiver import BackgroundFTPServer
-from app.server import app_ctx, create_http_server, create_mobile_http_server
+from app.server import (
+    app_ctx,
+    create_http_server,
+    create_mobile_http_server,
+    create_voice_http_server,
+)
 
 
 def _detect_lan_ip() -> str:
@@ -44,6 +49,18 @@ def main() -> None:
         help="业主手机查看端只读 HTTP 端口（默认 18790，设为 0 可禁用）",
     )
     parser.add_argument("--no-mobile", action="store_true", help="禁用业主手机查看端端口")
+    parser.add_argument(
+        "--voice-host",
+        default=str(cfg.get("voice_http_host", "0.0.0.0")),
+        help="免手语音/Siri快捷指令/大模型问答网关监听地址（默认 0.0.0.0）",
+    )
+    parser.add_argument(
+        "--voice-port",
+        type=int,
+        default=int(cfg.get("voice_http_port", 18791)),
+        help="免手语音/Siri快捷指令/大模型问答网关端口（默认 18791，设为 0 可禁用）",
+    )
+    parser.add_argument("--no-voice", action="store_true", help="禁用 18791 免手语音与问答网关端口")
     parser.add_argument("--ftp-port", type=int, default=int(cfg["ftp_port"]), help="内存 FTP 抓图接收端口")
     parser.add_argument("--no-ftp", action="store_true", help="禁用内嵌内存 FTP 服务")
     args = parser.parse_args()
@@ -62,9 +79,20 @@ def main() -> None:
             daemon=True,
         ).start()
 
+    voice_httpd: Optional[object] = None
+    vg_enabled = bool(cfg.get("voice_gateway", {}).get("enabled", True))
+    if not args.no_voice and args.voice_port > 0 and vg_enabled:
+        app_ctx.voice_gateway.start_background_workers()
+        voice_httpd = create_voice_http_server(host=args.voice_host, port=args.voice_port, ctx=app_ctx)
+        threading.Thread(
+            target=voice_httpd.serve_forever,
+            name="VoiceGatewayHTTPServer",
+            daemon=True,
+        ).start()
+
+    lan_ip = _detect_lan_ip()
     print(f"🚗 主控管理端已启动: http://{args.host}:{args.port}", flush=True)
     if mobile_httpd is not None:
-        lan_ip = _detect_lan_ip()
         local_mob_host = "127.0.0.1" if args.mobile_host in ("0.0.0.0", "::") else args.mobile_host
         lan_hint = (
             f" | 局域网手机访问: http://{lan_ip}:{args.mobile_port}"
@@ -73,6 +101,17 @@ def main() -> None:
         )
         print(
             f"📱 业主手机端已启动: http://{local_mob_host}:{args.mobile_port}{lan_hint}",
+            flush=True,
+        )
+    if voice_httpd is not None:
+        local_voice_host = "127.0.0.1" if args.voice_host in ("0.0.0.0", "::") else args.voice_host
+        voice_lan_hint = (
+            f" | 局域网 Siri/语音网关: http://{lan_ip}:{args.voice_port}"
+            if args.voice_host in ("0.0.0.0", "::") and lan_ip != "127.0.0.1"
+            else ""
+        )
+        print(
+            f"🎙️ 免手语音/Siri/大模型网关已启动: http://{local_voice_host}:{args.voice_port}{voice_lan_hint}",
             flush=True,
         )
     if not args.no_ftp:
@@ -87,21 +126,38 @@ def main() -> None:
         if stopping.is_set():
             return
         stopping.set()
+        print(f"\n收到退出信号 ({signum})，正在安全刷写 SQLite WAL 并停止服务...", flush=True)
         threading.Thread(target=httpd.shutdown, name="GracefulShutdown", daemon=True).start()
 
     signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
 
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n正在关闭服务...", flush=True)
     finally:
+        if voice_httpd is not None:
+            try:
+                voice_httpd.shutdown()
+                voice_httpd.server_close()
+            except Exception:
+                pass
         if mobile_httpd is not None:
             try:
                 mobile_httpd.shutdown()
                 mobile_httpd.server_close()
             except Exception:
                 pass
+        app_ctx.voice_gateway.stop_background_workers()
+        try:
+            app_ctx.ensure_workspace_registry().stop_all_and_checkpoint()
+        except Exception:
+            pass
+        try:
+            app_ctx.db.checkpoint_wal()
+        except Exception:
+            pass
         httpd.server_close()
 
 

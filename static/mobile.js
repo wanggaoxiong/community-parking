@@ -1,22 +1,45 @@
 (function () {
   "use strict";
 
+  function detectWorkspaceId() {
+    const m = (window.location.pathname || "").match(/^\/w\/([a-zA-Z0-9_-]{1,40})(?:\/|$)/);
+    if (m && m[1]) return m[1];
+    try {
+      const p = new URLSearchParams(window.location.search);
+      const qWs = (p.get("ws") || p.get("workspace") || "").trim();
+      if (qWs) return qWs;
+    } catch (_e) {}
+    return "default";
+  }
+
+  const WORKSPACE_ID = detectWorkspaceId();
+  const WS_KEY_PREFIX = WORKSPACE_ID === "default" ? "" : `${WORKSPACE_ID}_`;
+
   const STORAGE_KEYS = {
-    unitId: "parking_mobile_unit_id",
-    repeatCount: "parking_mobile_repeat_count",
-    continuous: "parking_mobile_continuous",
-    showBackdrop: "parking_mobile_show_backdrop",
+    unitId: `parking_mobile_${WS_KEY_PREFIX}unit_id`,
+    repeatCount: `parking_mobile_${WS_KEY_PREFIX}repeat_count`,
+    continuous: `parking_mobile_${WS_KEY_PREFIX}continuous`,
+    showBackdrop: `parking_mobile_${WS_KEY_PREFIX}show_backdrop`,
+    voiceUri: `parking_mobile_${WS_KEY_PREFIX}voice_uri`,
+    token: `parking_mobile_${WS_KEY_PREFIX}token`,
   };
 
   const POLL_INTERVAL_MS = 4000;
   const CONTINUOUS_REPEAT_MS = 16000;
 
   const state = {
+    workspaceId: WORKSPACE_ID,
+    token: "",
+    preferredVoiceLang: "",
     overview: null,
     unitId: "",
     repeatCount: 2, // 1 | 2 | 0 (mute)
     continuousBroadcast: true,
-    showBackdrop: false,
+    sessionMutedByQuery: false,
+    embedMode: false,
+    voiceUri: "", // "" = browser built-in instant default voice
+    showBackdrop: true,
+    backdropPreferenceSaved: false,
     backdropDataUrl: null,
     backdropLoading: false,
     zoom: 1.0,
@@ -25,13 +48,16 @@
     worldW: 145,
     worldH: 100,
     latestVoiceText: "",
+    latestRepeatText: "",
     lastAnnouncedSig: "",
     isSpeaking: false,
     currentPass: 0,
     totalPasses: 0,
     speechSessionId: 0,
     passTimer: null,
+    onlineFallbackTimer: null,
     watchdogTimer: null,
+    speechPollTimer: null,
     continuousTimer: null,
     toastTimer: null,
     userInteracted: false,
@@ -39,6 +65,7 @@
     wakeLock: null,
     pollTimer: null,
     fetching: false,
+    fetchAbortCtrl: null,
   };
 
   const els = {
@@ -49,6 +76,7 @@
     unitSelect: document.getElementById("mobileUnitSelect"),
     btnSpeakAction: document.getElementById("btnSpeakAction"),
     repeatModeGroup: document.getElementById("repeatModeGroup"),
+    voiceSelect: document.getElementById("mobileVoiceSelect"),
     btnContinuousToggle: document.getElementById("btnContinuousToggle"),
     continuousLabel: document.getElementById("continuousLabel"),
     guidanceCard: document.getElementById("guidanceCard"),
@@ -65,7 +93,33 @@
     btnZoomReset: document.getElementById("btnZoomReset"),
     btnBackdropToggle: document.getElementById("btnBackdropToggle"),
     mapSpotToast: document.getElementById("mapSpotToast"),
+    authCard: document.getElementById("mobileAuthCard"),
+    authTitle: document.getElementById("mobileAuthTitle"),
+    tokenInput: document.getElementById("mobileTokenInput"),
+    btnSaveToken: document.getElementById("btnSaveMobileToken"),
   };
+
+  function mobileAuthHeaders() {
+    const h = {};
+    if (state.workspaceId && state.workspaceId !== "default") {
+      h["X-Parking-Workspace"] = state.workspaceId;
+    }
+    if (state.token) {
+      h["X-Parking-Token"] = state.token;
+    }
+    return h;
+  }
+
+  function appendWorkspaceQuery(baseUrl) {
+    const u = new URL(baseUrl, window.location.origin);
+    if (state.workspaceId && state.workspaceId !== "default") {
+      u.searchParams.set("ws", state.workspaceId);
+    }
+    if (state.token) {
+      u.searchParams.set("token", state.token);
+    }
+    return u.pathname + u.search;
+  }
 
   function escapeHtml(str) {
     return String(str ?? "")
@@ -79,6 +133,18 @@
   function loadPersistedSettings() {
     try {
       const urlParams = new URLSearchParams(window.location.search);
+      const qTok = (urlParams.get("token") || urlParams.get("k") || "").trim();
+      if (qTok) {
+        state.token = qTok;
+        localStorage.setItem(STORAGE_KEYS.token, qTok);
+      } else {
+        state.token = (localStorage.getItem(STORAGE_KEYS.token) || "").trim();
+      }
+      if (urlParams.get("embed") === "1") {
+        state.embedMode = true;
+        document.body.classList.add("is-embed");
+      }
+
       const queryUnit = (urlParams.get("unit") || "").trim();
       const savedUnit = (localStorage.getItem(STORAGE_KEYS.unitId) || "").trim();
       state.unitId = queryUnit || savedUnit || "";
@@ -97,7 +163,28 @@
         state.continuousBroadcast = true;
       }
 
-      state.showBackdrop = localStorage.getItem(STORAGE_KEYS.showBackdrop) === "1";
+      state.voiceUri = (localStorage.getItem(STORAGE_KEYS.voiceUri) || "").trim();
+      const rawBackdropPref = localStorage.getItem(STORAGE_KEYS.showBackdrop);
+      if (urlParams.get("backdrop") === "1") {
+        state.showBackdrop = true;
+        state.backdropPreferenceSaved = true;
+      } else if (rawBackdropPref === "0" || rawBackdropPref === "1") {
+        state.showBackdrop = rawBackdropPref === "1";
+        state.backdropPreferenceSaved = true;
+      } else {
+        state.showBackdrop = true;
+        state.backdropPreferenceSaved = false;
+      }
+
+      // If opened by Siri / Apple Shortcut (`?mute=1`) or embedded (`?embed=1`),
+      // mute auto-broadcast in this session without overwriting saved settings.
+      if (
+        state.embedMode ||
+        urlParams.get("mute") === "1" ||
+        urlParams.get("autoplay") === "0"
+      ) {
+        state.sessionMutedByQuery = true;
+      }
     } catch (_err) {
       // Ignore storage access errors in private WebViews
     }
@@ -113,6 +200,7 @@
         STORAGE_KEYS.continuous,
         state.continuousBroadcast ? "1" : "0"
       );
+      localStorage.setItem(STORAGE_KEYS.voiceUri, state.voiceUri || "");
       localStorage.setItem(
         STORAGE_KEYS.showBackdrop,
         state.showBackdrop ? "1" : "0"
@@ -173,8 +261,8 @@
       state.continuousBroadcast ? "true" : "false"
     );
     els.continuousLabel.textContent = state.continuousBroadcast
-      ? "持续播报 · 开"
-      : "持续播报 · 关";
+      ? "持续 · 开"
+      : "持续 · 关";
 
     els.btnSpeakAction.classList.toggle("is-speaking", state.isSpeaking);
     els.btnSpeakAction.classList.toggle(
@@ -207,44 +295,187 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Multi-Pass (1x / 2x) + Continuous Web Speech Engine
+  // Multi-Pass (1x / 2x) + Continuous Web Speech Engine (Instant Local Default + Optional Voices)
   // ---------------------------------------------------------------------------
 
-  function pickChineseVoice() {
+  function classifyChineseVoiceDialect(v) {
+    const lang = String(v.lang || "").toLowerCase();
+    const name = String(v.name || "");
+    if (
+      lang.includes("hk") ||
+      lang.includes("mo") ||
+      lang.includes("yue") ||
+      /sin[-_ ]?ji|善怡|hiumaan|hiugaai|wanlung|晓曼|曉曼|晓佳|曉佳|云龙|雲龍|粤|粵|cantonese/i.test(name)
+    ) {
+      return { group: "cantonese", tag: "粤语" };
+    }
+    if (/liaoning|晓北|东北/i.test(`${lang} ${name}`)) {
+      return { group: "dialect", tag: "东北话" };
+    }
+    if (/shaanxi|晓妮|陕西/i.test(`${lang} ${name}`)) {
+      return { group: "dialect", tag: "陕西话" };
+    }
+    if (lang.includes("tw") || /mei[-_ ]?jia|美佳|hsiaochen|hsiaoyu|yunjhe|曉臻|曉雨|雲哲/i.test(name)) {
+      return { group: "dialect", tag: "台湾腔" };
+    }
+    return { group: "mandarin", tag: "普通话" };
+  }
+
+  function isCloudOnlineVoice(v) {
+    if (!v) return false;
+    return /online|cloud|natural/i.test(`${v.name || ""} ${v.voiceURI || ""}`);
+  }
+
+  function normalizeVoiceBcp47Lang(v, fallbackLang) {
+    if (v) {
+      const info = classifyChineseVoiceDialect(v);
+      const raw = String(v.lang || "").trim().replace(/_/g, "-");
+      if (info.group === "cantonese") {
+        return /^(zh-HK|zh-MO|yue)/i.test(raw) ? raw : "zh-HK";
+      }
+      if (info.tag === "台湾腔") {
+        return /^zh-TW/i.test(raw) ? raw : "zh-TW";
+      }
+      if (raw) return raw;
+    }
+    return String(fallbackLang || "zh-CN").trim().replace(/_/g, "-") || "zh-CN";
+  }
+
+  function formatVoiceOptionLabel(v) {
+    const info = classifyChineseVoiceDialect(v);
+    const rawName = String(v.name || v.voiceURI || "中文语音")
+      .replace(/^Microsoft\s+/i, "")
+      .replace(/\s*Online\s*\(Natural\)\s*-\s*Chinese.*$/i, "")
+      .replace(/\s*-\s*Chinese.*$/i, "")
+      .trim();
+    const isOnline = isCloudOnlineVoice(v);
+    const speedTag = isOnline ? "联网自然" : "本地秒响";
+    return `${isOnline ? "✨" : "⚡"} ${rawName} · ${info.tag} (${speedTag})`;
+  }
+
+  function populateVoiceSelectOptions() {
+    if (!els.voiceSelect || !("speechSynthesis" in window)) return;
+    const allVoices = window.speechSynthesis.getVoices() || [];
+    const zhVoices = allVoices.filter((v) =>
+      /^zh|chinese|cmn|yue|cantonese|sin[-_ ]?ji|善怡|tingting|婷婷|mei[-_ ]?jia|美佳/i.test(
+        `${v.lang || ""} ${v.name || ""}`
+      )
+    );
+    zhVoices.sort((a, b) => {
+      const aCloud = isCloudOnlineVoice(a) ? 1 : 0;
+      const bCloud = isCloudOnlineVoice(b) ? 1 : 0;
+      if (aCloud !== bCloud) return aCloud - bCloud;
+      const aLocal = a.localService !== false ? 0 : 1;
+      const bLocal = b.localService !== false ? 0 : 1;
+      if (aLocal !== bLocal) return aLocal - bLocal;
+      return String(a.name || "").localeCompare(String(b.name || ""), "zh-CN");
+    });
+
+    const prevVal = state.voiceUri || "";
+    els.voiceSelect.innerHTML = "";
+    const defOpt = document.createElement("option");
+    defOpt.value = "";
+    defOpt.textContent = "🎙️ 默认自带 (秒响)";
+    els.voiceSelect.appendChild(defOpt);
+
+    const groups = {
+      mandarin: { label: "普通话 · 国语", items: [] },
+      cantonese: { label: "粤语 · 广东话 (善怡等)", items: [] },
+      dialect: { label: "台湾腔与特色方言", items: [] },
+    };
+    const seen = new Set();
+    const seenLabels = new Set();
+    zhVoices.forEach((v) => {
+      const uri = String(v.voiceURI || v.name || "").trim();
+      if (!uri || seen.has(uri)) return;
+      const lbl = formatVoiceOptionLabel(v);
+      if (seenLabels.has(lbl) && uri !== prevVal) return;
+      seen.add(uri);
+      seenLabels.add(lbl);
+      const info = classifyChineseVoiceDialect(v);
+      groups[info.group].items.push({ uri, label: lbl });
+    });
+
+    ["mandarin", "cantonese", "dialect"].forEach((gk) => {
+      const grp = groups[gk];
+      if (!grp.items.length) return;
+      const og = document.createElement("optgroup");
+      og.label = grp.label;
+      grp.items.forEach((it) => {
+        const opt = document.createElement("option");
+        opt.value = it.uri;
+        opt.textContent = it.label;
+        og.appendChild(opt);
+      });
+      els.voiceSelect.appendChild(og);
+    });
+
+    if (prevVal && seen.has(prevVal)) {
+      els.voiceSelect.value = prevVal;
+    } else {
+      els.voiceSelect.value = "";
+    }
+  }
+
+  function resolveSelectedVoice(preferLocalFallbackForLang) {
     if (!("speechSynthesis" in window)) return null;
     const voices = window.speechSynthesis.getVoices() || [];
-    if (!voices.length) return null;
-    const preferred = [
-      "Tingting",
-      "Xiaoxiao",
-      "Yunxi",
-      "Mei-Jia",
-      "Sin-ji",
-      "Google 普通话",
-    ];
-    for (const kw of preferred) {
-      const hit = voices.find(
-        (v) =>
-          (v.name || "").includes(kw) &&
-          /^zh/i.test(String(v.lang || "zh-CN"))
+    if (preferLocalFallbackForLang) {
+      const target = String(preferLocalFallbackForLang).toLowerCase();
+      return (
+        voices.find(
+          (v) =>
+            !isCloudOnlineVoice(v) &&
+            normalizeVoiceBcp47Lang(v, "").toLowerCase().startsWith(target.slice(0, 5))
+        ) || null
       );
-      if (hit) return hit;
     }
-    return (
-      voices.find((v) => /^zh[-_]?CN/i.test(String(v.lang || ""))) ||
-      voices.find((v) => /^zh/i.test(String(v.lang || ""))) ||
-      null
+    if (state.voiceUri) {
+      const matches = voices.filter(
+        (v) => v.voiceURI === state.voiceUri || v.name === state.voiceUri
+      );
+      if (matches.length) {
+        // Prefer localService === true when macOS registers duplicate entries (e.g. two Sinji / 善怡)
+        return matches.find((v) => v.localService !== false) || matches[0];
+      }
+      return null;
+    }
+    const prefLang = String(state.preferredVoiceLang || "")
+      .trim()
+      .replace(/_/g, "-")
+      .toLowerCase();
+    if (prefLang) {
+      const localPref = voices.find(
+        (v) =>
+          !isCloudOnlineVoice(v) &&
+          normalizeVoiceBcp47Lang(v, "").toLowerCase().startsWith(prefLang)
+      );
+      if (localPref) return localPref;
+    }
+    const localZh = voices.find(
+      (v) => !isCloudOnlineVoice(v) && /^zh[-_]?CN/i.test(String(v.lang || ""))
     );
+    return localZh || null;
   }
+
+  const activeMobileUtterances = new Set();
 
   function clearSpeechTimers() {
     if (state.passTimer) {
       clearTimeout(state.passTimer);
       state.passTimer = null;
     }
+    if (state.onlineFallbackTimer) {
+      clearTimeout(state.onlineFallbackTimer);
+      state.onlineFallbackTimer = null;
+    }
     if (state.watchdogTimer) {
       clearTimeout(state.watchdogTimer);
       state.watchdogTimer = null;
+    }
+    if (state.speechPollTimer) {
+      clearInterval(state.speechPollTimer);
+      state.speechPollTimer = null;
     }
   }
 
@@ -266,7 +497,9 @@
     state.totalPasses = 0;
     if ("speechSynthesis" in window) {
       try {
-        window.speechSynthesis.cancel();
+        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+          window.speechSynthesis.cancel();
+        }
       } catch (_err) {
         // Ignore
       }
@@ -299,16 +532,23 @@
       return;
     }
 
+    const hadActiveSpeech = Boolean(
+      window.speechSynthesis.speaking || window.speechSynthesis.pending
+    );
     stopBroadcast(true);
     const sessionId = state.speechSessionId;
     state.isSpeaking = true;
-    state.totalPasses = targetPasses;
+    const fullSpeechText =
+      targetPasses >= 2 && state.latestRepeatText
+        ? `${cleanText} 再为您重复播报一遍：${state.latestRepeatText}`
+        : cleanText;
+    state.totalPasses = 1;
     state.currentPass = 1;
     syncBroadcastControlUi();
 
-    const runSinglePass = (passNo) => {
+    const runSinglePass = (_passNo, forceBuiltInDefault = false) => {
       if (sessionId !== state.speechSessionId) return;
-      state.currentPass = passNo;
+      state.currentPass = 1;
       syncBroadcastControlUi();
 
       let finished = false;
@@ -329,47 +569,107 @@
         }
 
         state.speechBlockedByAutoplay = false;
-        if (passNo < targetPasses) {
-          state.passTimer = setTimeout(() => {
-            runSinglePass(passNo + 1);
-          }, 700);
-        } else {
-          state.isSpeaking = false;
-          state.currentPass = 0;
-          state.totalPasses = 0;
-          syncBroadcastControlUi();
-          scheduleNextContinuousCycle();
-        }
+        state.isSpeaking = false;
+        state.currentPass = 0;
+        state.totalPasses = 0;
+        syncBroadcastControlUi();
+        scheduleNextContinuousCycle();
       };
 
       try {
-        const utter = new SpeechSynthesisUtterance(cleanText);
-        utter.lang = "zh-CN";
-        utter.rate = 1.02;
+        const passText = fullSpeechText;
+        const utter = new SpeechSynthesisUtterance(passText);
+        activeMobileUtterances.add(utter);
+        const startIssuedAt = Date.now();
+        utter.rate = 1.04;
         utter.pitch = 1.0;
-        const voice = pickChineseVoice();
-        if (voice) utter.voice = voice;
+        const primaryPick = resolveSelectedVoice(null);
+        const targetLang = normalizeVoiceBcp47Lang(primaryPick, state.preferredVoiceLang || "zh-CN");
+        const chosenVoice = forceBuiltInDefault
+          ? resolveSelectedVoice(targetLang)
+          : primaryPick;
+        if (chosenVoice) {
+          utter.voice = chosenVoice;
+          utter.lang = normalizeVoiceBcp47Lang(chosenVoice, targetLang);
+        } else {
+          utter.lang = targetLang;
+        }
+        const isOnlineVoice = isCloudOnlineVoice(chosenVoice);
 
         utter.onstart = () => {
           startedSpeaking = true;
+          if (state.onlineFallbackTimer) {
+            clearTimeout(state.onlineFallbackTimer);
+            state.onlineFallbackTimer = null;
+          }
           state.speechBlockedByAutoplay = false;
           syncBroadcastControlUi();
         };
-        utter.onend = () => completePass(false);
+        utter.onend = () => {
+          activeMobileUtterances.delete(utter);
+          completePass(false);
+        };
         utter.onerror = (ev) => {
+          activeMobileUtterances.delete(utter);
           const errCode = String((ev && ev.error) || "").toLowerCase();
+          if (errCode.includes("interrupted") || errCode.includes("canceled")) {
+            return;
+          }
           if (
             errCode.includes("not-allowed") ||
             (!state.userInteracted && !startedSpeaking)
           ) {
             completePass(true);
+          } else if (isOnlineVoice && !startedSpeaking && !forceBuiltInDefault) {
+            finished = true;
+            clearSpeechTimers();
+            runSinglePass(passNo, true);
           } else {
             completePass(false);
           }
         };
 
-        window.speechSynthesis.resume();
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
         window.speechSynthesis.speak(utter);
+
+        // State poller guarantees button auto-resets even if WebKit drops `onend`
+        state.speechPollTimer = setInterval(() => {
+          if (finished || sessionId !== state.speechSessionId) {
+            clearInterval(state.speechPollTimer);
+            state.speechPollTimer = null;
+            return;
+          }
+          const busy = Boolean(window.speechSynthesis.speaking || window.speechSynthesis.pending);
+          if (window.speechSynthesis.speaking && !startedSpeaking) {
+            startedSpeaking = true;
+          }
+          if (startedSpeaking && !busy && Date.now() - startIssuedAt > 350) {
+            activeMobileUtterances.delete(utter);
+            completePass(false);
+          }
+        }, 240);
+
+        // Only true cloud neural voices (e.g. Microsoft Online) use network timeout fallback
+        if (isOnlineVoice && state.userInteracted && !forceBuiltInDefault) {
+          state.onlineFallbackTimer = setTimeout(() => {
+            if (
+              !finished &&
+              sessionId === state.speechSessionId &&
+              !startedSpeaking &&
+              !window.speechSynthesis.speaking
+            ) {
+              activeMobileUtterances.delete(utter);
+              finished = true;
+              clearSpeechTimers();
+              try {
+                window.speechSynthesis.cancel();
+              } catch (_e) {}
+              runSinglePass(passNo, true);
+            }
+          }, 3200);
+        }
 
         // Detect iOS Safari / mobile WebView silent pre-gesture block quickly
         if (!state.userInteracted) {
@@ -380,6 +680,7 @@
               !startedSpeaking &&
               !window.speechSynthesis.speaking
             ) {
+              activeMobileUtterances.delete(utter);
               try {
                 window.speechSynthesis.cancel();
               } catch (_e) {
@@ -387,12 +688,13 @@
               }
               completePass(true);
             }
-          }, 1100);
+          }, 900);
         }
 
         // Watchdog in case mobile WebView drops onend callback
-        const maxDurationMs = Math.max(6000, cleanText.length * 380);
+        const maxDurationMs = Math.max(6000, passText.length * 360);
         state.watchdogTimer = setTimeout(() => {
+          activeMobileUtterances.delete(utter);
           completePass(false);
         }, maxDurationMs);
       } catch (_err) {
@@ -400,10 +702,8 @@
       }
     };
 
-    // Slight defer after cancel() avoids WebKit speech queue swallow bug
-    state.passTimer = setTimeout(() => {
-      runSinglePass(1);
-    }, 60);
+    // Always invoke synchronously inside user-gesture stack so iOS Safari never blocks speech!
+    runSinglePass(1, false);
   }
 
   function buildRecommendationSignature(rec, unitId) {
@@ -1009,7 +1309,8 @@
             0.52 * invScale
           ).toFixed(2)}" stroke-dasharray="${(0.95 * invScale).toFixed(2)},${(
             0.65 * invScale
-          ).toFixed(2)}" stroke-linecap="round" stroke-linejoin="round"/>
+          ).toFixed(2)}" class="active-walk-route" stroke-linecap="round" stroke-linejoin="round"/>
+          ${renderChevronAlongSegments(wPts, "#0F766E", 0.85 * invScale, false)}
           <rect x="${(mxLbl - pillW / 2).toFixed(2)}" y="${(
             myLbl -
             pillH / 2
@@ -1290,7 +1591,10 @@
     }
     state.backdropLoading = true;
     try {
-      const resp = await fetch("/api/mobile/backdrop", { cache: "no-store" });
+      const resp = await fetch(appendWorkspaceQuery("/api/mobile/backdrop"), {
+        cache: "no-store",
+        headers: mobileAuthHeaders(),
+      });
       if (resp.ok) {
         const data = await resp.json();
         const rawB64 =
@@ -1363,17 +1667,47 @@
   }
 
   async function fetchOverview({ forceSpeak = false } = {}) {
-    if (state.fetching) return;
+    if (state.fetching) {
+      // Never drop an explicit unit-switch or manual speak request while a background poll is in flight!
+      if (!forceSpeak) return;
+      if (state.fetchAbortCtrl) {
+        try {
+          state.fetchAbortCtrl.abort();
+        } catch (_e) {}
+      }
+    }
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    state.fetchAbortCtrl = ctrl;
     state.fetching = true;
     try {
-      const qs = state.unitId
-        ? `?unit_id=${encodeURIComponent(state.unitId)}`
-        : "";
-      const resp = await fetch(`/api/mobile/overview${qs}`, {
+      const baseOv = state.unitId
+        ? `/api/mobile/overview?unit_id=${encodeURIComponent(state.unitId)}`
+        : "/api/mobile/overview";
+      const resp = await fetch(appendWorkspaceQuery(baseOv), {
         cache: "no-store",
+        headers: mobileAuthHeaders(),
+        signal: ctrl ? ctrl.signal : undefined,
       });
+      if (resp.status === 401) {
+        const authErr = await resp.json().catch(() => ({}));
+        if (authErr.workspace_name) {
+          els.communityName.textContent = authErr.workspace_name;
+        }
+        if (els.authCard) {
+          els.authCard.hidden = false;
+          if (els.authTitle) {
+            els.authTitle.textContent = `🔐 请输入「${authErr.workspace_name || "当前场所"}」访问口令`;
+          }
+        }
+        return;
+      }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      if (els.authCard) els.authCard.hidden = true;
       const data = await resp.json();
+
+      if (data.workspace && data.workspace.preferred_voice_lang != null) {
+        state.preferredVoiceLang = data.workspace.preferred_voice_lang || "";
+      }
 
       if (
         state.mobileVersion &&
@@ -1410,6 +1744,9 @@
       populateUnitSelect(data.units || [], state.unitId);
 
       const hasBackdrop = Boolean(data.site_map && data.site_map.has_backdrop);
+      if (hasBackdrop && !state.backdropPreferenceSaved) {
+        state.showBackdrop = true;
+      }
       els.btnBackdropToggle.hidden = !hasBackdrop;
       els.btnBackdropToggle.classList.toggle(
         "is-active",
@@ -1425,6 +1762,7 @@
       const rec = data.recommendation;
       const voiceText = (rec && rec.voice_text) || "";
       state.latestVoiceText = voiceText;
+      state.latestRepeatText = (rec && rec.repeat_voice_text) || "";
       const newSig = buildRecommendationSignature(rec, state.unitId);
       const wasInitialLoad = !state.lastAnnouncedSig;
       const sigChanged = Boolean(newSig && newSig !== state.lastAnnouncedSig);
@@ -1432,17 +1770,22 @@
 
       if (state.repeatCount > 0 && voiceText) {
         if (forceSpeak) {
+          state.sessionMutedByQuery = false;
           speakBroadcast(voiceText, state.repeatCount, "manual");
-        } else if (wasInitialLoad) {
+        } else if (wasInitialLoad && !state.sessionMutedByQuery) {
           speakBroadcast(voiceText, state.repeatCount, "initial");
-        } else if (sigChanged && (state.continuousBroadcast || !state.isSpeaking)) {
+        } else if (!state.sessionMutedByQuery && sigChanged && (state.continuousBroadcast || !state.isSpeaking)) {
           speakBroadcast(voiceText, state.repeatCount, "change");
         }
       }
-    } catch (_err) {
+    } catch (err) {
+      if (err && err.name === "AbortError") return;
       els.liveDot.classList.add("is-offline");
     } finally {
-      state.fetching = false;
+      if (state.fetchAbortCtrl === ctrl) {
+        state.fetching = false;
+        state.fetchAbortCtrl = null;
+      }
     }
   }
 
@@ -1597,12 +1940,19 @@
   // Control Events & Lifecycle
   // ---------------------------------------------------------------------------
 
-  function markUserGesture() {
+  function markUserGesture(ev) {
     const wasBlocked = state.speechBlockedByAutoplay;
     state.userInteracted = true;
     requestWakeLockIfNeeded();
+    // Do not auto-trigger on pointerdown if the user is clicking a broadcast/unit control
+    // whose own click/change handler will immediately speak (prevents start-then-cancel race!).
+    const targetEl = ev && ev.target && ev.target.closest
+      ? ev.target.closest("#btnSpeakAction, #mobileUnitSelect, #repeatModeGroup, #btnContinuousToggle, #mobileVoiceSelect")
+      : null;
     if (
+      !targetEl &&
       wasBlocked &&
+      !state.sessionMutedByQuery &&
       state.repeatCount > 0 &&
       state.latestVoiceText &&
       !state.isSpeaking
@@ -1621,6 +1971,18 @@
       state.userInteracted = true;
       changeDestination(els.unitSelect.value, true);
     });
+
+    if (els.voiceSelect) {
+      els.voiceSelect.addEventListener("change", () => {
+        state.userInteracted = true;
+        state.voiceUri = els.voiceSelect.value || "";
+        persistSettings();
+        if (state.latestVoiceText) {
+          const passes = state.repeatCount > 0 ? state.repeatCount : 1;
+          speakBroadcast(state.latestVoiceText, passes, "voice-change");
+        }
+      });
+    }
 
     els.btnSpeakAction.addEventListener("click", () => {
       state.userInteracted = true;
@@ -1688,11 +2050,19 @@
     els.btnZoomOut.addEventListener("click", () => {
       zoomAroundRatio(state.zoom / 1.35, 0.5, 0.5);
     });
-    els.btnZoomReset.addEventListener("click", () => {
-      zoomAroundRatio(1.0, 0.5, 0.5);
+    if (els.btnZoomReset) {
+      els.btnZoomReset.addEventListener("click", () => {
+        zoomAroundRatio(1.0, 0.5, 0.5);
+      });
+    }
+    els.mapSvg.addEventListener("dblclick", () => {
+      if (state.zoom > 1.02) {
+        zoomAroundRatio(1.0, 0.5, 0.5);
+      }
     });
     els.btnBackdropToggle.addEventListener("click", () => {
       state.showBackdrop = !state.showBackdrop;
+      state.backdropPreferenceSaved = true;
       els.btnBackdropToggle.classList.toggle("is-active", state.showBackdrop);
       persistSettings();
       if (state.showBackdrop) {
@@ -1700,6 +2070,25 @@
       }
       renderFloorPlanSvg();
     });
+
+    if (els.btnSaveToken) {
+      const submitMobToken = () => {
+        state.token = String((els.tokenInput && els.tokenInput.value) || "").trim();
+        try {
+          localStorage.setItem(STORAGE_KEYS.token, state.token);
+        } catch (_e) {}
+        fetchOverview({ forceSpeak: false });
+      };
+      els.btnSaveToken.addEventListener("click", submitMobToken);
+      if (els.tokenInput) {
+        els.tokenInput.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            submitMobToken();
+          }
+        });
+      }
+    }
 
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
@@ -1712,11 +2101,10 @@
     });
 
     if ("speechSynthesis" in window) {
-      // Pre-warm voices array on Safari / Chrome
-      window.speechSynthesis.getVoices();
+      populateVoiceSelectOptions();
       if ("onvoiceschanged" in window.speechSynthesis) {
         window.speechSynthesis.onvoiceschanged = () => {
-          window.speechSynthesis.getVoices();
+          populateVoiceSelectOptions();
         };
       }
     }

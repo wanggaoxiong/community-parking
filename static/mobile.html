@@ -30,6 +30,15 @@
       </div>
     </header>
 
+    <!-- 场所身份验证条（仅当前小区/办公区开启了专属身份口令且未验证时显示） -->
+    <section class="m-auth-card" id="mobileAuthCard" hidden aria-label="场所身份口令验证">
+      <div class="m-auth-title" id="mobileAuthTitle">🔐 请输入本场所访问口令</div>
+      <div class="m-auth-row">
+        <input id="mobileTokenInput" type="password" class="m-auth-input" placeholder="输入身份口令（本机自动记忆）" autocomplete="off" />
+        <button type="button" id="btnSaveMobileToken" class="m-speak-btn">进入</button>
+      </div>
+    </section>
+
     <!-- 目的地与语音播报控制卡（每台手机独立记忆） -->
     <section class="m-controls-card" aria-label="目的地与语音播报设置">
       <div class="m-dest-row">
@@ -49,6 +58,12 @@
           <button type="button" class="m-seg-btn" data-repeat="0" role="radio" aria-checked="false">静音</button>
         </div>
 
+        <div class="m-voice-select-wrap" title="可选播报音色（默认采用浏览器自带极速语音，0等待秒响）">
+          <select id="mobileVoiceSelect" class="m-voice-select" aria-label="选择语音播报音色">
+            <option value="">🎙️ 默认自带</option>
+          </select>
+        </div>
+
         <button
           type="button"
           id="btnContinuousToggle"
@@ -57,7 +72,7 @@
           title="开启后持续轮询车位变化并周期自动语音播报"
         >
           <span class="m-cont-dot" aria-hidden="true"></span>
-          <span id="continuousLabel">持续播报 · 开</span>
+          <span id="continuousLabel">持续 · 开</span>
         </button>
       </div>
     </section>
@@ -94,7 +109,6 @@
       <div class="m-map-tools">
         <button type="button" id="btnZoomIn" class="m-tool-btn" aria-label="放大平面图">＋</button>
         <button type="button" id="btnZoomOut" class="m-tool-btn" aria-label="缩小平面图">－</button>
-        <button type="button" id="btnZoomReset" class="m-tool-btn m-tool-text" aria-label="重置全局视角">全图</button>
         <button type="button" id="btnBackdropToggle" class="m-tool-btn m-tool-text" hidden aria-label="切换底图叠显">底图</button>
       </div>
 

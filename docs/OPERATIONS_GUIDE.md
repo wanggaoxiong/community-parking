@@ -20,6 +20,10 @@
 | **前台调试运行** | `./parking-ctl.sh foreground` | `./parking-ctl.sh foreground` | `.\parking-ctl.ps1 foreground` |
 | **开启开机自启守护** | `./parking-ctl.sh install-launchd` | `./parking-ctl.sh install-systemd` | `.\parking-ctl.ps1 install-task` |
 | **取消开机自启守护** | `./parking-ctl.sh uninstall-launchd` | `./parking-ctl.sh uninstall-systemd` | `.\parking-ctl.ps1 uninstall-task` |
+| **Docker 容器一键拉起** | `./parking-ctl.sh docker-up` | `./parking-ctl.sh docker-up` | `.\parking-ctl.ps1 docker-up` |
+| **Docker 容器平滑重启** | `./parking-ctl.sh docker-restart` | `./parking-ctl.sh docker-restart` | `.\parking-ctl.ps1 docker-restart` |
+| **Docker 容器日志跟随** | `./parking-ctl.sh docker-logs` | `./parking-ctl.sh docker-logs` | `.\parking-ctl.ps1 docker-logs` |
+| **Docker 容器优雅停机** | `./parking-ctl.sh docker-down` | `./parking-ctl.sh docker-down` | `.\parking-ctl.ps1 docker-down` |
 
 > **注意**：若已启用系统级守护（macOS `launchd` 或 Linux `systemd`），守护进程具备崩溃自动拉起能力（`KeepAlive` / `Restart=always`）。此时：
 > - **重启服务**：
@@ -37,9 +41,12 @@
 | :--- | :--- | :--- |
 | `PARKING_HOST` | `127.0.0.1` | 管理控制台绑定地址；设为 `0.0.0.0` 可对局域网管理电脑或 HTTP 推图摄像头开放 |
 | `PARKING_PORT` | `8790` | 管理控制台与摄像头 HTTP Webhook 抓图推送端口 |
-| `PARKING_MOBILE_HOST` | `0.0.0.0` | 业主手机端极简寻位专口绑定地址（默认面向局域网手机直接开放） |
-| `PARKING_MOBILE_PORT` | `18790` | 业主手机端极简寻位与语音播报只读端口（设为 `0` 可关闭该端口） |
+| `PARKING_MOBILE_HOST` | `0.0.0.0` | 业主微信浮窗看图专口绑定地址（默认面向局域网/隧道开放） |
+| `PARKING_MOBILE_PORT` | `18790` | 业主手机极简寻位与实时平面图只读端口（设为 `0` 可关闭） |
+| `PARKING_VOICE_HOST` | `0.0.0.0` | 开车免手语音 / Siri 快捷指令 / 大模型问答网关绑定地址 |
+| `PARKING_VOICE_PORT` | `18791` | 开车免手语音与普通微信 ClawBot 助手网关端口（设为 `0` 可关闭） |
 | `PARKING_FTP_PORT` | `2121` | 内嵌零落盘内存 FTP 接收端口（供不支持 HTTP 抓图的摄像头定时传图） |
+| `CLOUDFLARE_TUNNEL_TOKEN` | 空 | 容器模式下设置后，`docker-up` 自动拉起 `cloudflared` 免费公网 HTTPS 隧道 |
 
 示例（自定义端口 `8800` 重启）：
 - macOS / Linux：`PARKING_HOST=0.0.0.0 PARKING_PORT=8800 ./parking-ctl.sh restart`
@@ -119,3 +126,7 @@ git pull origin main
 | 海康/大华测试抓图报 `HTTP 401 Unauthorized` | 摄像头开启了 Digest 摘要认证，或抓图账号密码错误 | 在「摄像头管理 -> 编辑」确认认证方式为 **Digest（摘要认证，预设已默认）**，核对摄像机本地 Web 密码（非萤石云验证码，部分萤石/乐橙局域网密码为机身 6 位安全码） |
 | RTSP 拉流超时但能 ping 通摄像头 | 子码流端口/通道号不匹配，或 UDP 丢包 | 优先改用厂商推荐的 **HTTP CGI 抓图**（最省内存带宽）；若必须走 RTSP，确认端口 `554`、传输协议选 `TCP`、接 NVR 时正确填写通道号 |
 | 治理看板提示某机位「疑似大风偏移 / 起雾遮挡」 | 摄像头支架被外力碰歪或镜头脏污 | 系统内置 RootSIFT 已自动补偿轻中度位移；若偏移过大，擦拭镜头或在「空间标定」重新抓拍更新一次空场基准帧即可消除告警 |
+| 主摄像头离线后如何验证冷备摄像头接管与独立标定？ | 同一车位带配置了 1 主 + N 备冷切摄像头 | 在 `:8790`「摄像头管理」卡片上直接点击 `#1 备用1` 槽位胶囊即可手动切到备机并进入「空间标定」框选备机视角（系统按槽位独立记忆多边形框），标定完毕点 `#0 主机` 切回即可；日常主机连续失败满 3 次将自动冷切，主机恢复后每 180 秒探测自动切回 |
+| Spot 云机器频繁被抢占重启，如何确认重启后自动在线？ | 云厂商 Spot 容量波动触发实例重启或启停策略 | 确认云主机 Spot 策略设为 `Stop / Start (Hibernate/Restart)` 而非销毁磁盘，并在宿主机执行一次 `sudo systemctl enable docker`；容器收到 `SIGTERM` 会自动将 SQLite WAL 刷盘并在机器开机后由 `restart: always` 秒级自愈拉起 |
+| Siri 快捷指令提示口令校验未通过 (`401`) | `:8790` 设置了 `:18791` 访问口令，但快捷指令 URL 未带 `token=` | 打开 `:18791` 页面顶部填入相同口令并点击「保存口令」，再重新点击「一键安装 Siri 播报快捷指令」即可自动生成带口令 URL |
+

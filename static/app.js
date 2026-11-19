@@ -245,17 +245,59 @@ const state = {
     lastSourceLabel: "",
     busy: false,
   },
+  workspaceId: (function () {
+    const m = (window.location.pathname || "").match(/^\/w\/([a-zA-Z0-9_-]{1,40})(?:\/|$)/);
+    if (m && m[1]) return m[1];
+    try {
+      const p = new URLSearchParams(window.location.search);
+      const qw = (p.get("ws") || p.get("workspace") || "").trim();
+      if (qw) return qw;
+      return localStorage.getItem("parking_admin_ws_id") || "default";
+    } catch (_) {
+      return "default";
+    }
+  })(),
+  workspace: null,
+  workspacesList: [],
+  scenePresets: {},
+  broadcastTemplates: {},
+  wsModalMode: "edit",
+  adminVoiceUri: (function () {
+    try {
+      return localStorage.getItem("parking_admin_voice_uri") || "";
+    } catch (_) {
+      return "";
+    }
+  })(),
   vlmPresets: {},
 };
 
+function getSavedWsAdminToken(wsId) {
+  try {
+    return localStorage.getItem(`parking_ws_adm_tok_${wsId || "default"}`) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function saveWsAdminToken(wsId, tok) {
+  try {
+    localStorage.setItem(`parking_ws_adm_tok_${wsId || "default"}`, tok || "");
+  } catch (_) {}
+}
+
 async function api(path, options = {}) {
-  const { headers: optHeaders, ...restOpts } = options;
+  const { headers: optHeaders, _retriedAdminAuth, ...restOpts } = options;
+  const targetWs = state.workspaceId || "default";
+  const admTok = getSavedWsAdminToken(targetWs);
   const res = await fetch(path, {
     cache: "no-store",
     ...restOpts,
     headers: {
       "Content-Type": "application/json",
       "X-Parking-Client": "20260420e",
+      "X-Parking-Workspace": targetWs,
+      ...(admTok ? { "X-Workspace-Admin-Token": admTok } : {}),
       ...(optHeaders || {}),
     },
   });
@@ -266,6 +308,15 @@ async function api(path, options = {}) {
       data = JSON.parse(raw);
     } catch (_) {
       data = { error: raw.slice(0, 180) };
+    }
+  }
+  if (res.status === 401 && data && data.admin_auth_required && !_retriedAdminAuth) {
+    const entered = window.prompt(
+      `请输入工作空间「${data.workspace_name || targetWs}」的物业管理口令：`
+    );
+    if (entered != null && entered.trim()) {
+      saveWsAdminToken(targetWs, entered.trim());
+      return api(path, { ...options, _retriedAdminAuth: true });
     }
   }
   if (!res.ok) {
@@ -294,6 +345,8 @@ window.getEffectiveSpotStatusClient = getEffectiveSpotStatusClient;
 document.addEventListener("DOMContentLoaded", async () => {
   bindTabs();
   bindModelModal();
+  bindWorkspaceModal();
+  bindAdminVoiceSelector();
   bindDriverActions();
   bindSpatialGovernanceAndModals();
   bindSiteMapControls();
@@ -303,11 +356,18 @@ document.addEventListener("DOMContentLoaded", async () => {
   syncMapWorkspaceLayout();
   drawSyntheticDemoLotOnCalibCanvas();
   try {
+    await refreshWorkspacesCatalog();
     await refreshOverview();
   } catch (err) {
     console.error("Initial overview refresh failed:", err);
   }
-  await loadCameraSpotsForCalib(state.calib.cameraId || "5LV7_CAM_NORTH_4G");
+  const firstCamId =
+    state.calib.cameraId ||
+    (state.overview?.cameras && state.overview.cameras[0]?.camera_id) ||
+    "";
+  if (firstCamId) {
+    await loadCameraSpotsForCalib(firstCamId);
+  }
 });
 
 function bindTabs() {
@@ -380,6 +440,9 @@ async function refreshOverview() {
     } catch (_) {}
   }
   state.overview = data;
+  if (data.workspace) {
+    state.workspace = data.workspace;
+  }
   state.vlmPresets = data.config?.vlm_presets || {};
 
   document.getElementById("communityTitle").textContent = data.community_name;
@@ -726,18 +789,38 @@ function bindModelModal() {
       first_frame_vlm_anchor: firstFrameEl ? Boolean(firstFrameEl.checked) : false,
       dynamic_roi_enabled: dynRoiEl ? Boolean(dynRoiEl.checked) : true,
       vlm: collectVlmFormValues(),
+      voice_gateway: collectVoiceGatewayFormValues(),
     };
     const updated = await api("/api/config", {
       method: "POST",
       body: JSON.stringify(payload),
     });
     document.getElementById("vlmApiKey").value = "";
+    const vgTokEl = document.getElementById("vgCfgAccessToken");
+    if (vgTokEl) vgTokEl.value = "";
+    const vgClrEl = document.getElementById("vgCfgClearAccessToken");
+    if (vgClrEl) vgClrEl.checked = false;
     populateConfigUI(updated);
     document.getElementById("cfgSaveMsg").textContent = "设置已保存并立即生效";
     setTimeout(() => {
       closeModelModal();
     }, 650);
   });
+}
+
+function collectVoiceGatewayFormValues() {
+  return {
+    access_token: document.getElementById("vgCfgAccessToken")?.value?.trim() || "",
+    clear_access_token: Boolean(document.getElementById("vgCfgClearAccessToken")?.checked),
+    default_unit_id: document.getElementById("vgCfgDefaultUnit")?.value?.trim() || "8-1",
+    daily_llm_limit_per_user: Number(document.getElementById("vgCfgDailyLimit")?.value || 60),
+    public_mobile_url: document.getElementById("vgCfgPublicMobileUrl")?.value?.trim() || "",
+    public_voice_url: document.getElementById("vgCfgPublicVoiceUrl")?.value?.trim() || "",
+    arrival_place: document.getElementById("vgCfgArrivalPlace")?.value?.trim() || "",
+    icloud_shortcut_url: document.getElementById("vgCfgIcloudShortcutUrl")?.value?.trim() || "",
+    llm_qa_enabled: Boolean(document.getElementById("vgCfgLlmQaEnabled")?.checked),
+    weixin_enabled: false,
+  };
 }
 
 function collectVlmFormValues() {
@@ -775,6 +858,34 @@ function populateConfigUI(cfg) {
   document.getElementById("apiKeyStatus").textContent = v.has_api_key
     ? `已保存 (${v.api_key_masked})`
     : "未设置密钥";
+
+  // Populate 18791 Voice Gateway config fields
+  const vg = cfg.voice_gateway || {};
+  const vgTokStatus = document.getElementById("vgTokenSavedPill");
+  if (vgTokStatus) {
+    vgTokStatus.textContent = vg.has_access_token
+      ? `已设口令 (${vg.access_token_masked || "***"})`
+      : "免口令(内网)";
+  }
+  const vgDefUnit = document.getElementById("vgCfgDefaultUnit");
+  if (vgDefUnit) vgDefUnit.value = vg.default_unit_id || "8-1";
+  const vgLim = document.getElementById("vgCfgDailyLimit");
+  if (vgLim) vgLim.value = vg.daily_llm_limit_per_user ?? 60;
+  const vgMobUrl = document.getElementById("vgCfgPublicMobileUrl");
+  if (vgMobUrl) vgMobUrl.value = vg.public_mobile_url || "";
+  const vgVoiceUrl = document.getElementById("vgCfgPublicVoiceUrl");
+  if (vgVoiceUrl) vgVoiceUrl.value = vg.public_voice_url || "";
+  const vgArrivalPlace = document.getElementById("vgCfgArrivalPlace");
+  if (vgArrivalPlace) vgArrivalPlace.value = vg.arrival_place || "";
+  const vgIcloudUrl = document.getElementById("vgCfgIcloudShortcutUrl");
+  if (vgIcloudUrl) vgIcloudUrl.value = vg.icloud_shortcut_url || "";
+  const vgLlmChk = document.getElementById("vgCfgLlmQaEnabled");
+  if (vgLlmChk) vgLlmChk.checked = vg.llm_qa_enabled !== false;
+  const vgOpenLink = document.getElementById("vgOpenPortalLink");
+  if (vgOpenLink) {
+    const voicePort = cfg.voice_http_port || 18791;
+    vgOpenLink.href = vg.public_voice_url || `${location.protocol}//${location.hostname}:${voicePort}`;
+  }
 
   // Update header pill & Lab card summary
   const isConfigured =
@@ -848,11 +959,29 @@ function bindDriverActions() {
     const url = `${location.origin}/api/recommend/voice?unit_id=${
       document.getElementById("unitSelect").value
     }&vehicle_type=${document.getElementById("vehicleTypeSelect").value}${egParam}`;
-    try {
-      await navigator.clipboard.writeText(url);
+    let ok = false;
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(url);
+        ok = true;
+      } catch (_) {}
+    }
+    if (!ok) {
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        ok = document.execCommand("copy");
+      } catch (_) {}
+      document.body.removeChild(ta);
+    }
+    if (ok) {
       document.getElementById("btnCopySiri").textContent = "已复制";
       setTimeout(() => (document.getElementById("btnCopySiri").textContent = "复制链接"), 1800);
-    } catch (_) {}
+    }
   });
 }
 
@@ -864,6 +993,14 @@ function updateSiriHint() {
   document.getElementById(
     "siriEndpointCode"
   ).textContent = `GET ${location.origin}/api/recommend/voice?unit_id=${uid}&vehicle_type=${vt}${egParam}`;
+  const portalLink = document.getElementById("drvOpenVoicePortalLink");
+  if (portalLink) {
+    const wsSeg =
+      state.workspaceId && state.workspaceId !== "default"
+        ? `/w/${encodeURIComponent(state.workspaceId)}`
+        : "";
+    portalLink.href = `${location.protocol}//${location.hostname}:18791${wsSeg}/?unit=${encodeURIComponent(uid)}`;
+  }
 }
 
 async function triggerRecommendation(driverTag) {
@@ -3445,16 +3582,426 @@ function bindSpatialGovernanceAndModals() {
   });
 }
 
-function speakChinese(text) {
-  if (!document.getElementById("ttsEnabled").checked) return;
-  if (!("speechSynthesis" in window)) return;
+function classifyAdminVoiceDialect(v) {
+  const lang = String(v.lang || "").toLowerCase();
+  const name = String(v.name || "");
+  if (
+    lang.includes("hk") ||
+    lang.includes("mo") ||
+    lang.includes("yue") ||
+    /sin[-_ ]?ji|善怡|hiumaan|hiugaai|wanlung|晓曼|曉曼|晓佳|曉佳|云龙|雲龍|粤|粵|cantonese/i.test(name)
+  ) {
+    return { group: "cantonese", tag: "粤语" };
+  }
+  if (/liaoning|晓北|东北/i.test(`${lang} ${name}`)) return { group: "dialect", tag: "东北话" };
+  if (/shaanxi|晓妮|陕西/i.test(`${lang} ${name}`)) return { group: "dialect", tag: "陕西话" };
+  if (lang.includes("tw") || /mei[-_ ]?jia|美佳|hsiaochen|hsiaoyu|yunjhe|曉臻|曉雨|雲哲/i.test(name)) {
+    return { group: "dialect", tag: "台湾腔" };
+  }
+  return { group: "mandarin", tag: "普通话" };
+}
+
+function bindAdminVoiceSelector() {
+  const sel = document.getElementById("adminVoiceSelect");
+  if (!sel || !("speechSynthesis" in window)) return;
+  const populate = () => {
+    const all = window.speechSynthesis.getVoices() || [];
+    const zh = all.filter((v) =>
+      /^zh|chinese|cmn|yue|cantonese|sin-ji|tingting|mei-jia/i.test(`${v.lang || ""} ${v.name || ""}`)
+    );
+    zh.sort((a, b) => {
+      const aL = a.localService !== false && !/online/i.test(String(a.name || "")) ? 0 : 1;
+      const bL = b.localService !== false && !/online/i.test(String(b.name || "")) ? 0 : 1;
+      return aL !== bL ? aL - bL : String(a.name || "").localeCompare(String(b.name || ""), "zh-CN");
+    });
+    sel.innerHTML = "";
+    const defOpt = document.createElement("option");
+    defOpt.value = "";
+    defOpt.textContent = "🎙️ 默认音色";
+    sel.appendChild(defOpt);
+    const groups = {
+      mandarin: { label: "普通话 · 国语", items: [] },
+      cantonese: { label: "粤语 · 广东话 (善怡等)", items: [] },
+      dialect: { label: "台湾腔与特色方言", items: [] },
+    };
+    const seen = new Set();
+    const seenLabels = new Set();
+    zh.forEach((v) => {
+      const uri = String(v.voiceURI || v.name || "").trim();
+      if (!uri || seen.has(uri)) return;
+      const info = classifyAdminVoiceDialect(v);
+      const shortName = String(v.name || uri)
+        .replace(/^Microsoft\s+/i, "")
+        .replace(/\s*Online\s*\(Natural\)\s*-\s*Chinese.*$/i, "")
+        .replace(/\s*-\s*Chinese.*$/i, "")
+        .trim();
+      const online = /online|cloud|natural/i.test(`${v.name || ""} ${uri}`);
+      const lbl = `${online ? "✨" : "⚡"} ${shortName} · ${info.tag}`;
+      if (seenLabels.has(lbl) && uri !== state.adminVoiceUri) return;
+      seen.add(uri);
+      seenLabels.add(lbl);
+      groups[info.group].items.push({
+        uri,
+        label: lbl,
+      });
+    });
+    ["mandarin", "cantonese", "dialect"].forEach((gk) => {
+      if (!groups[gk].items.length) return;
+      const og = document.createElement("optgroup");
+      og.label = groups[gk].label;
+      groups[gk].items.forEach((it) => {
+        const opt = document.createElement("option");
+        opt.value = it.uri;
+        opt.textContent = it.label;
+        og.appendChild(opt);
+      });
+      sel.appendChild(og);
+    });
+    sel.value = state.adminVoiceUri && seen.has(state.adminVoiceUri) ? state.adminVoiceUri : "";
+  };
+  populate();
+  if ("onvoiceschanged" in window.speechSynthesis) {
+    window.speechSynthesis.onvoiceschanged = populate;
+  }
+  sel.addEventListener("change", () => {
+    state.adminVoiceUri = sel.value || "";
+    try {
+      localStorage.setItem("parking_admin_voice_uri", state.adminVoiceUri);
+    } catch (_) {}
+    const curText = document.getElementById("voiceText")?.textContent?.trim() || "";
+    if (curText) speakChinese(curText, true);
+  });
+}
+
+function speakChinese(text, forceSpeak = false) {
+  if (!forceSpeak && !document.getElementById("ttsEnabled")?.checked) return;
+  if (!("speechSynthesis" in window) || !text) return;
   try {
-    window.speechSynthesis.cancel();
+    if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+      window.speechSynthesis.cancel();
+    }
+    const voices = window.speechSynthesis.getVoices() || [];
+    const prefLang = String(state.workspace?.preferred_voice_lang || "").trim().replace(/_/g, "-");
+    let chosen = null;
+    if (state.adminVoiceUri) {
+      const matches = voices.filter((v) => v.voiceURI === state.adminVoiceUri || v.name === state.adminVoiceUri);
+      chosen = matches.find((v) => v.localService !== false) || matches[0] || null;
+    } else if (prefLang) {
+      chosen =
+        voices.find(
+          (v) =>
+            !/online|cloud|natural/i.test(String(v.name || "")) &&
+            String(v.lang || "").replace(/_/g, "-").toLowerCase().startsWith(prefLang.toLowerCase())
+        ) || null;
+    }
     const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = "zh-CN";
-    utter.rate = 1.05;
+    if (chosen) {
+      utter.voice = chosen;
+      const dInfo = classifyAdminVoiceDialect(chosen);
+      const rawLang = String(chosen.lang || "").trim().replace(/_/g, "-");
+      if (dInfo.group === "cantonese") {
+        utter.lang = /^(zh-HK|zh-MO|yue)/i.test(rawLang) ? rawLang : "zh-HK";
+      } else if (dInfo.tag === "台湾腔") {
+        utter.lang = /^zh-TW/i.test(rawLang) ? rawLang : "zh-TW";
+      } else {
+        utter.lang = rawLang || prefLang || "zh-CN";
+      }
+    } else {
+      utter.lang = prefLang || "zh-CN";
+    }
+    utter.rate = 1.04;
     window.speechSynthesis.speak(utter);
   } catch (_) {}
+}
+
+async function refreshWorkspacesCatalog() {
+  const data = await api("/api/workspaces");
+  state.workspacesList = data.workspaces || [];
+  state.scenePresets = data.scene_presets || {};
+  state.broadcastTemplates = data.broadcast_templates || {};
+  if (!state.workspacesList.some((w) => w.workspace_id === state.workspaceId)) {
+    state.workspaceId = "default";
+    try {
+      localStorage.setItem("parking_admin_ws_id", "default");
+    } catch (_) {}
+  }
+  const sel = document.getElementById("workspaceSwitcherSelect");
+  if (sel) {
+    sel.innerHTML = "";
+    state.workspacesList.forEach((ws) => {
+      const opt = document.createElement("option");
+      opt.value = ws.workspace_id;
+      const icon = (ws.scene_label || "🏘️").split(" ")[0];
+      opt.textContent = `${icon} ${ws.name} (${ws.total_effective_free}/${ws.total_capacity})`;
+      sel.appendChild(opt);
+    });
+    const newOpt = document.createElement("option");
+    newOpt.value = "__create_new__";
+    newOpt.textContent = "＋ 新建独立小区 / 办公区工作空间…";
+    sel.appendChild(newOpt);
+    sel.value = state.workspaceId;
+  }
+  return data;
+}
+
+async function switchActiveWorkspace(nextWsId) {
+  const cleanId = String(nextWsId || "default").trim() || "default";
+  state.workspaceId = cleanId;
+  try {
+    localStorage.setItem("parking_admin_ws_id", cleanId);
+    const u = new URL(window.location.href);
+    if (cleanId === "default") u.searchParams.delete("ws");
+    else u.searchParams.set("ws", cleanId);
+    window.history.replaceState(null, "", u.toString());
+  } catch (_) {}
+  state.siteMap.backdropDataUrl = null;
+  state.siteMap.backdropLoaded = false;
+  state.calib.cameraId = "";
+  await refreshWorkspacesCatalog();
+  await refreshOverview();
+  const cam0 = state.overview?.cameras?.[0]?.camera_id || "";
+  if (cam0) {
+    await loadCameraSpotsForCalib(cam0);
+  }
+  showAppleToast(`已切换至工作空间：${state.overview?.community_name || cleanId}`);
+}
+
+function buildWorkspaceExclusiveUrls(wsId) {
+  const cfg = state.overview?.config || {};
+  const vg = cfg.voice_gateway || {};
+  const mobPort = cfg.mobile_http_port || 18790;
+  const voicePort = cfg.voice_http_port || 18791;
+  const mobBase = (vg.public_mobile_url || `${location.protocol}//${location.hostname}:${mobPort}`).replace(/\/+$/, "");
+  const voiceBase = (vg.public_voice_url || `${location.protocol}//${location.hostname}:${voicePort}`).replace(/\/+$/, "");
+  const wsSeg = wsId && wsId !== "default" ? `/w/${encodeURIComponent(wsId)}` : "";
+  return {
+    url18790: `${mobBase}${wsSeg}/`,
+    url18791: `${voiceBase}${wsSeg}/`,
+  };
+}
+
+function populateWorkspaceModalFields(mode) {
+  state.wsModalMode = mode === "create" ? "create" : "edit";
+  document.querySelectorAll("#wsModalModeSeg .ws-mode-btn").forEach((b) => {
+    b.classList.toggle("is-active", b.getAttribute("data-wsmode") === state.wsModalMode);
+  });
+  const isCreate = state.wsModalMode === "create";
+  document.getElementById("wsSlugInput").disabled = !isCreate;
+  document.getElementById("wsCreateInitRow").classList.toggle("hidden", !isCreate);
+  const curWs =
+    state.workspacesList.find((w) => w.workspace_id === state.workspaceId) ||
+    state.workspace ||
+    {};
+  document.getElementById("btnDeleteWorkspace").classList.toggle(
+    "hidden",
+    isCreate || curWs.workspace_id === "default"
+  );
+  document.getElementById("wsExclusiveLinksBox").classList.toggle("hidden", isCreate);
+
+  if (isCreate) {
+    const defPreset = state.scenePresets.community || {};
+    document.getElementById("wsCurrentSlugPill").textContent = "新建独立站点";
+    document.getElementById("wsNameInput").value = "";
+    document.getElementById("wsShortNameInput").value = "";
+    document.getElementById("wsSlugInput").value = "";
+    document.getElementById("wsSceneTypeSelect").value = "community";
+    document.getElementById("wsRoleTitleInput").value = defPreset.role_title || "业主";
+    document.getElementById("wsPrefVoiceLangSelect").value = "";
+    document.getElementById("wsGreetingTplInput").value = defPreset.greeting_template || "";
+    document.getElementById("wsFullTplInput").value = defPreset.full_template || "";
+    document.getElementById("wsArrivalPlaceInput").value = "";
+    document.getElementById("wsViewerTokPill").textContent = "选填";
+    document.getElementById("wsAdminTokPill").textContent = "选填";
+  } else {
+    const wsId = curWs.workspace_id || "default";
+    document.getElementById("wsCurrentSlugPill").textContent = `workspace: ${wsId}`;
+    document.getElementById("wsNameInput").value = curWs.name || "";
+    document.getElementById("wsShortNameInput").value = curWs.short_name || "";
+    document.getElementById("wsSlugInput").value = wsId;
+    document.getElementById("wsSceneTypeSelect").value = curWs.scene_type || "community";
+    document.getElementById("wsRoleTitleInput").value = curWs.role_title || "业主";
+    document.getElementById("wsPrefVoiceLangSelect").value = curWs.preferred_voice_lang || "";
+    document.getElementById("wsGreetingTplInput").value = curWs.greeting_template || "";
+    document.getElementById("wsFullTplInput").value = curWs.full_template || "";
+    document.getElementById("wsArrivalPlaceInput").value = curWs.arrival_place || "";
+    document.getElementById("wsViewerTokPill").textContent = curWs.has_access_token
+      ? `已设 (${curWs.access_token_masked})`
+      : "免口令";
+    document.getElementById("wsAdminTokPill").textContent = curWs.has_admin_token
+      ? `已设 (${curWs.admin_token_masked})`
+      : "未设置";
+    const urls = buildWorkspaceExclusiveUrls(wsId);
+    document.getElementById("wsLink18790").textContent = urls.url18790;
+    document.getElementById("wsLink18791").textContent = urls.url18791;
+  }
+  document.getElementById("wsAccessTokenInput").value = "";
+  document.getElementById("wsAdminTokenInput").value = "";
+  document.getElementById("wsClearAccessTokenChk").checked = false;
+  document.getElementById("wsClearAdminTokenChk").checked = false;
+  document.getElementById("wsModalFeedback").textContent = "";
+  updateWorkspaceLiveBroadcastPreview();
+}
+
+async function updateWorkspaceLiveBroadcastPreview() {
+  const targetWs = state.wsModalMode === "create" ? "default" : state.workspaceId || "default";
+  const draft = {
+    name: document.getElementById("wsNameInput").value.trim() || "阳光花园",
+    short_name: document.getElementById("wsShortNameInput").value.trim(),
+    scene_type: document.getElementById("wsSceneTypeSelect").value,
+    role_title: document.getElementById("wsRoleTitleInput").value.trim() || "业主",
+    greeting_template: document.getElementById("wsGreetingTplInput").value.trim(),
+    full_template: document.getElementById("wsFullTplInput").value.trim(),
+  };
+  try {
+    const res = await api(`/api/workspaces/${encodeURIComponent(targetWs)}/preview-broadcast`, {
+      method: "POST",
+      body: JSON.stringify(draft),
+    });
+    document.getElementById("wsLivePreviewText").textContent = res.sample_voice_text || "";
+    return res.sample_voice_text || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function bindWorkspaceModal() {
+  const modal = document.getElementById("workspaceModal");
+  if (!modal) return;
+  const openModal = async (mode = "edit") => {
+    await refreshWorkspacesCatalog();
+    populateWorkspaceModalFields(mode);
+    modal.classList.remove("hidden");
+  };
+  const closeModal = () => modal.classList.add("hidden");
+
+  document.getElementById("btnOpenWorkspaceModal")?.addEventListener("click", () => openModal("edit"));
+  document.getElementById("btnCloseWorkspaceModal")?.addEventListener("click", closeModal);
+  document.getElementById("btnCancelWorkspaceModal")?.addEventListener("click", closeModal);
+  document.getElementById("workspaceModalBackdrop")?.addEventListener("click", closeModal);
+
+  document.getElementById("workspaceSwitcherSelect")?.addEventListener("change", async (e) => {
+    const val = e.target.value;
+    if (val === "__create_new__") {
+      e.target.value = state.workspaceId;
+      await openModal("create");
+      return;
+    }
+    await switchActiveWorkspace(val);
+  });
+
+  document.getElementById("wsModalModeSeg")?.addEventListener("click", (e) => {
+    const btn = e.target.closest(".ws-mode-btn");
+    if (!btn) return;
+    populateWorkspaceModalFields(btn.getAttribute("data-wsmode") || "edit");
+  });
+
+  document.getElementById("wsSceneTypeSelect")?.addEventListener("change", (e) => {
+    const preset = state.scenePresets[e.target.value];
+    if (preset) {
+      document.getElementById("wsRoleTitleInput").value = preset.role_title || "";
+      document.getElementById("wsGreetingTplInput").value = preset.greeting_template || "";
+      document.getElementById("wsFullTplInput").value = preset.full_template || "";
+      updateWorkspaceLiveBroadcastPreview();
+    }
+  });
+
+  document.getElementById("wsTplPresetChips")?.addEventListener("click", (e) => {
+    const chip = e.target.closest(".ws-chip-btn");
+    if (!chip) return;
+    const tplObj = state.broadcastTemplates[chip.getAttribute("data-tplkey") || ""];
+    if (tplObj) {
+      document.getElementById("wsGreetingTplInput").value = tplObj.greeting_template || "";
+      document.getElementById("wsFullTplInput").value = tplObj.full_template || "";
+      updateWorkspaceLiveBroadcastPreview();
+    }
+  });
+
+  ["wsNameInput", "wsShortNameInput", "wsRoleTitleInput", "wsGreetingTplInput", "wsFullTplInput"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("input", () => {
+      clearTimeout(bindWorkspaceModal._prevTimer);
+      bindWorkspaceModal._prevTimer = setTimeout(updateWorkspaceLiveBroadcastPreview, 220);
+    });
+  });
+
+  document.getElementById("btnWsPreviewSpeak")?.addEventListener("click", async () => {
+    const sample = await updateWorkspaceLiveBroadcastPreview();
+    if (sample) speakChinese(sample, true);
+  });
+
+  document.getElementById("btnCopyWs18790")?.addEventListener("click", async () => {
+    const txt = document.getElementById("wsLink18790").textContent || "";
+    await navigator.clipboard?.writeText(txt).catch(() => {});
+    showAppleToast("已复制本场所专属 :18790 平面图链接");
+  });
+  document.getElementById("btnCopyWs18791")?.addEventListener("click", async () => {
+    const txt = document.getElementById("wsLink18791").textContent || "";
+    await navigator.clipboard?.writeText(txt).catch(() => {});
+    showAppleToast("已复制本场所专属 :18791 快捷指令链接");
+  });
+
+  document.getElementById("btnSaveWorkspaceModal")?.addEventListener("click", async () => {
+    const fb = document.getElementById("wsModalFeedback");
+    fb.textContent = "";
+    const payload = {
+      name: document.getElementById("wsNameInput").value.trim(),
+      short_name: document.getElementById("wsShortNameInput").value.trim(),
+      scene_type: document.getElementById("wsSceneTypeSelect").value,
+      role_title: document.getElementById("wsRoleTitleInput").value.trim(),
+      preferred_voice_lang: document.getElementById("wsPrefVoiceLangSelect").value,
+      greeting_template: document.getElementById("wsGreetingTplInput").value.trim(),
+      full_template: document.getElementById("wsFullTplInput").value.trim(),
+      arrival_place: document.getElementById("wsArrivalPlaceInput").value.trim(),
+      access_token: document.getElementById("wsAccessTokenInput").value.trim(),
+      admin_token: document.getElementById("wsAdminTokenInput").value.trim(),
+      clear_access_token: document.getElementById("wsClearAccessTokenChk").checked,
+      clear_admin_token: document.getElementById("wsClearAdminTokenChk").checked,
+    };
+    try {
+      if (state.wsModalMode === "create") {
+        payload.workspace_id = document.getElementById("wsSlugInput").value.trim();
+        payload.template_mode = document.getElementById("wsTemplateInitSelect").value;
+        const res = await api("/api/workspaces", { method: "POST", body: JSON.stringify(payload) });
+        const newId = res.workspace?.workspace_id;
+        if (payload.admin_token && newId) {
+          saveWsAdminToken(newId, payload.admin_token);
+        }
+        closeModal();
+        if (newId) await switchActiveWorkspace(newId);
+      } else {
+        const curId = state.workspaceId || "default";
+        if (payload.admin_token) {
+          saveWsAdminToken(curId, payload.admin_token);
+        } else if (payload.clear_admin_token) {
+          saveWsAdminToken(curId, "");
+        }
+        await api(`/api/workspaces/${encodeURIComponent(curId)}/update`, {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        closeModal();
+        await refreshWorkspacesCatalog();
+        await refreshOverview();
+        showAppleToast("工作空间设置与自定义播报语已生效");
+      }
+    } catch (err) {
+      fb.textContent = err.message || "保存失败";
+    }
+  });
+
+  document.getElementById("btnDeleteWorkspace")?.addEventListener("click", async () => {
+    const curId = state.workspaceId || "";
+    if (!curId || curId === "default") return;
+    if (!window.confirm(`确定要彻底删除工作空间「${curId}」及其独立平面图数据吗？默认主空间不受影响。`)) {
+      return;
+    }
+    try {
+      await api(`/api/workspaces/${encodeURIComponent(curId)}`, { method: "DELETE" });
+      closeModal();
+      await switchActiveWorkspace("default");
+    } catch (err) {
+      document.getElementById("wsModalFeedback").textContent = err.message || "删除失败";
+    }
+  });
 }
 
 function renderSoftLocks(locks) {
@@ -9459,7 +10006,7 @@ function renderAbstractSvgMap(data) {
         0.52 * invScale
       ).toFixed(2)}" stroke-dasharray="${(0.95 * invScale).toFixed(2)},${(
         0.65 * invScale
-      ).toFixed(2)}" stroke-linecap="round" stroke-linejoin="round"/>
+      ).toFixed(2)}" class="active-walk-route" stroke-linecap="round" stroke-linejoin="round"/>
           <rect x="${(mxLbl - pillW / 2).toFixed(2)}" y="${(myLbl - pillH / 2).toFixed(
         2
       )}" width="${pillW.toFixed(2)}" height="${pillH.toFixed(2)}" rx="${(
@@ -15872,6 +16419,42 @@ function renderCameraManagementHub(data) {
           </div>`
         : "";
 
+      const standbyList = Array.isArray(cfg.standby_cameras) ? cfg.standby_cameras : [];
+      const activeSlot = Number(st.active_slot ?? cfg.active_slot ?? 0);
+      const failoverStripHtml = standbyList.length
+        ? `<div class="cam-card-failover-strip ${activeSlot > 0 ? "is-failover-active" : ""}">
+            <div>
+              <strong>${
+                activeSlot > 0
+                  ? `🟠 冷备接管中 · 当前采集 #${activeSlot} (${escapeHtml(
+                      standbyList[activeSlot - 1]?.label || `备用#${activeSlot}`
+                    )})`
+                  : `🛡️ 主备冷切就绪 (1主+${standbyList.length}备 · 备机零负载)`
+              }</strong>
+              ${
+                st.failover_switches
+                  ? `<span style="margin-left:6px;opacity:0.8;">累计切换 ${st.failover_switches} 次</span>`
+                  : ""
+              }
+            </div>
+            <div class="cam-slot-pills" title="点击可手动切换活跃采集槽位（每路槽位独立记忆标定框）">
+              <button type="button" class="cam-slot-switch-pill js-cam-switch-slot ${
+                activeSlot === 0 ? "is-active-slot" : ""
+              }" data-cam-id="${escapeHtml(cam.camera_id)}" data-slot="0">#0 主机</button>
+              ${standbyList
+                .map(
+                  (sb, idx) =>
+                    `<button type="button" class="cam-slot-switch-pill js-cam-switch-slot ${
+                      activeSlot === idx + 1 ? "is-active-slot" : ""
+                    }" data-cam-id="${escapeHtml(cam.camera_id)}" data-slot="${idx + 1}">#${
+                      idx + 1
+                    } ${escapeHtml(sb.label || `备用${idx + 1}`)}</button>`
+                )
+                .join("")}
+            </div>
+          </div>`
+        : "";
+
       return `
         <article class="cam-mgmt-card ${isBound ? "" : "is-unbound-card"}" data-cam-hub-id="${escapeHtml(
         cam.camera_id
@@ -15908,6 +16491,7 @@ function renderCameraManagementHub(data) {
           </div>
 
           ${errBanner}
+          ${failoverStripHtml}
           ${boundHtml}
           ${snapHtml}
 
@@ -16080,7 +16664,145 @@ function collectWizardIngestConfig() {
     custom_url: document.getElementById("camCfgCustomUrlInput")?.value?.trim() || "",
     usb_index: Number(document.getElementById("camCfgUsbIndexInput")?.value || 0),
     push_token: document.getElementById("camCfgPushTokenInput")?.value?.trim() || "",
+    failover_enabled: Boolean(document.getElementById("camCfgFailoverEnabled")?.checked),
+    failover_threshold: Math.max(
+      1,
+      Math.min(20, Number(document.getElementById("camCfgFailoverThreshold")?.value || 3))
+    ),
+    auto_recover_primary: Boolean(document.getElementById("camCfgAutoRestorePrimary")?.checked),
+    primary_probe_interval_sec: Math.max(
+      15,
+      Math.min(3600, Number(document.getElementById("camCfgPrimaryProbeSec")?.value || 180))
+    ),
+    active_slot: Number(camHubState.editingActiveSlot || 0),
+    standby_cameras: collectWizardStandbySlots(),
   };
+}
+
+function collectWizardStandbySlots() {
+  const container = document.getElementById("camCfgStandbySlotsList");
+  if (!container) return [];
+  const cards = [...container.querySelectorAll(".cam-standby-slot-card")];
+  return cards.slice(0, 3).map((card, idx) => {
+    const protocol = card.querySelector(".js-sb-protocol")?.value || "rtsp";
+    const portVal = Number(card.querySelector(".js-sb-port")?.value || (protocol === "rtsp" ? 554 : 80));
+    return {
+      slot_id: idx + 1,
+      label: card.querySelector(".js-sb-label")?.value?.trim() || `备用#${idx + 1}`,
+      vendor: card.querySelector(".js-sb-vendor")?.value || "hikvision",
+      protocol,
+      host: card.querySelector(".js-sb-host")?.value?.trim() || "",
+      port: protocol === "rtsp" ? 80 : portVal,
+      rtsp_port: protocol === "rtsp" ? portVal : 554,
+      username: card.querySelector(".js-sb-username")?.value?.trim() || "admin",
+      password: card.querySelector(".js-sb-password")?.value || "",
+      auth_mode: "digest",
+      channel: 1,
+      stream: "main",
+      rtsp_transport: "tcp",
+      custom_url: card.querySelector(".js-sb-custom-url")?.value?.trim() || "",
+    };
+  });
+}
+
+function renderWizardStandbySlots(slots) {
+  const container = document.getElementById("camCfgStandbySlotsList");
+  const addBtn = document.getElementById("btnCamAddStandbySlot");
+  if (!container) return;
+  const list = Array.isArray(slots) ? slots.slice(0, 3) : [];
+  camHubState.wizardStandbySlots = list;
+  if (addBtn) {
+    addBtn.disabled = list.length >= 3;
+    addBtn.textContent = list.length >= 3 ? "已达上限 (最多 3 备)" : "➕ 添加备用摄像头";
+  }
+  if (!list.length) {
+    container.innerHTML = `<div class="cam-standby-empty">当前为单摄像头直连模式。若同一车位带安装了第 2/第 3 个冗余摄像头（如物业监控 + 业主阳台窗机），可点击右上角「➕ 添加备用摄像头」配置冷备兜底。</div>`;
+    return;
+  }
+  const vendorOpts = (camHubState.vendors || [])
+    .map((v) => ({ value: v.vendor, label: v.label }));
+  const protoOpts = [
+    { value: "rtsp", label: "RTSP 视频流抓帧 (554)" },
+    { value: "http_snapshot", label: "HTTP/ISAPI 快照 (80)" },
+    { value: "onvif", label: "ONVIF 标准快照 (80)" },
+    { value: "mjpeg", label: "MJPEG 实时流" },
+  ];
+  container.innerHTML = list
+    .map((sb, idx) => {
+      const proto = sb.protocol || "rtsp";
+      const port = proto === "rtsp" ? sb.rtsp_port || 554 : sb.port || 80;
+      const hasPwd = Boolean(sb.has_password);
+      return `
+      <div class="cam-standby-slot-card" data-sb-index="${idx}">
+        <div class="cam-standby-slot-head">
+          <div>
+            <span class="cam-standby-slot-badge">🛡️ 冷备槽位 #${idx + 1}</span>
+            <span style="font-size:11.5px;color:#64748B;margin-left:6px;">平时休眠零带宽 · 仅前序机位断流时唤醒接管</span>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button type="button" class="btn-apple btn-apple-ghost btn-apple-xs js-cam-test-standby" data-sb-index="${idx}">⚡ 测通此备机</button>
+            <button type="button" class="btn-apple btn-apple-ghost btn-apple-xs js-cam-remove-standby" data-sb-index="${idx}" style="color:#B91C1C;">移除</button>
+          </div>
+        </div>
+        <div class="field-grid-3">
+          <div class="field">
+            <label>备机备注名称</label>
+            <input type="text" class="js-sb-label" value="${escapeHtml(sb.label || `备用摄像头#${idx + 1}`)}" placeholder="如 西侧灯杆备机" />
+          </div>
+          <div class="field">
+            <label>品牌预设</label>
+            <select class="js-sb-vendor">
+              ${vendorOpts
+                .map(
+                  (vo) =>
+                    `<option value="${escapeHtml(vo.value)}" ${
+                      vo.value === (sb.vendor || "hikvision") ? "selected" : ""
+                    }>${escapeHtml(vo.label)}</option>`
+                )
+                .join("")}
+            </select>
+          </div>
+          <div class="field">
+            <label>接入协议</label>
+            <select class="js-sb-protocol">
+              ${protoOpts
+                .map(
+                  (po) =>
+                    `<option value="${escapeHtml(po.value)}" ${
+                      po.value === proto ? "selected" : ""
+                    }>${escapeHtml(po.label)}</option>`
+                )
+                .join("")}
+            </select>
+          </div>
+        </div>
+        <div class="field-grid-4">
+          <div class="field">
+            <label>备机 IP / 主机</label>
+            <input type="text" class="js-sb-host" value="${escapeHtml(sb.host || "")}" placeholder="192.168.1.65" />
+          </div>
+          <div class="field">
+            <label>端口</label>
+            <input type="number" class="js-sb-port" value="${Number(port)}" />
+          </div>
+          <div class="field">
+            <label>账号</label>
+            <input type="text" class="js-sb-username" value="${escapeHtml(sb.username ?? "admin")}" />
+          </div>
+          <div class="field">
+            <label>密码 ${hasPwd ? `<span class="saved-key-pill">已存</span>` : ""}</label>
+            <input type="password" class="js-sb-password" value="" placeholder="${
+              hasPwd ? "留空保持原密码" : "输入备机密码"
+            }" />
+          </div>
+        </div>
+        <div class="field">
+          <label>完整自定义流/抓拍 URL（可选，填写后优先使用）</label>
+          <input type="text" class="js-sb-custom-url" value="${escapeHtml(sb.custom_url || "")}" placeholder="如 rtsp://admin:12345@192.168.1.65:554/Streaming/Channels/101" />
+        </div>
+      </div>`;
+    })
+    .join("");
 }
 
 function renderWizardVendorGrid() {
@@ -16463,6 +17185,18 @@ async function openCameraConfigModal(mode = "create", cameraId = "", opts = {}) 
     }
     tokPill?.classList.toggle("hidden", !cfg.has_push_token);
 
+    // Populate Active-Standby cold failover settings
+    camHubState.editingActiveSlot = Number(cfg.active_slot || 0);
+    const foEn = document.getElementById("camCfgFailoverEnabled");
+    if (foEn) foEn.checked = cfg.failover_enabled !== false;
+    const foThr = document.getElementById("camCfgFailoverThreshold");
+    if (foThr) foThr.value = cfg.failover_threshold ?? 3;
+    const foAuto = document.getElementById("camCfgAutoRestorePrimary");
+    if (foAuto) foAuto.checked = cfg.auto_recover_primary !== false;
+    const foProbe = document.getElementById("camCfgPrimaryProbeSec");
+    if (foProbe) foProbe.value = cfg.primary_probe_interval_sec ?? 180;
+    renderWizardStandbySlots(cfg.standby_cameras || []);
+
     if (zoneSel && cam.zone_id) zoneSel.value = cam.zone_id;
     if (bindSel) bindSel.value = opts.presetBindGroupCode || currentPrimaryBoundCode || "";
     if (unitSel) unitSel.value = currentBoundGroups[0]?.near_unit_id || "";
@@ -16493,6 +17227,16 @@ async function openCameraConfigModal(mode = "create", cameraId = "", opts = {}) 
       tokInp.placeholder = "留空则免令牌接收";
     }
     tokPill?.classList.add("hidden");
+    camHubState.editingActiveSlot = 0;
+    const foEn = document.getElementById("camCfgFailoverEnabled");
+    if (foEn) foEn.checked = true;
+    const foThr = document.getElementById("camCfgFailoverThreshold");
+    if (foThr) foThr.value = 3;
+    const foAuto = document.getElementById("camCfgAutoRestorePrimary");
+    if (foAuto) foAuto.checked = true;
+    const foProbe = document.getElementById("camCfgPrimaryProbeSec");
+    if (foProbe) foProbe.value = 180;
+    renderWizardStandbySlots([]);
     document.getElementById("camCfgCustomUrlInput").value = "";
     addrInp.value = "";
     nameInp.value = "";
@@ -16880,6 +17624,30 @@ function bindCameraManagementHub() {
 
   // Camera Hub Cards Delegation
   document.getElementById("camHubCardsGrid")?.addEventListener("click", async (e) => {
+    const slotPill = e.target.closest(".js-cam-switch-slot");
+    if (slotPill) {
+      const cid = slotPill.dataset.camId;
+      const targetSlot = Number(slotPill.dataset.slot || 0);
+      slotPill.disabled = true;
+      try {
+        const res = await api(`/api/cameras/${encodeURIComponent(cid)}/failover/switch`, {
+          method: "POST",
+          body: JSON.stringify({ target_slot: targetSlot, reason: "manual_admin_ui" }),
+        });
+        await refreshOverview();
+        const restored = res.calibration_switch?.restored_saved_profile;
+        showAppleToast(
+          `🛡️ 已将摄像头 ${cid} 切换至槽位 #${targetSlot}（${
+            restored ? "已自动载入该槽位独立标定框" : "已继承基准车位框，可点空间标定微调该视角"
+          }）`
+        );
+      } catch (err) {
+        showAppleToast(`槽位切换失败：${err.message}`, "error");
+      } finally {
+        slotPill.disabled = false;
+      }
+      return;
+    }
     if (e.target.closest(".js-cam-empty-create")) {
       openCameraConfigModal("create");
       return;
@@ -16932,6 +17700,79 @@ function bindCameraManagementHub() {
   });
 
   // Wizard Modal Events
+  document.getElementById("btnCamAddStandbySlot")?.addEventListener("click", () => {
+    const current = collectWizardStandbySlots();
+    if (current.length >= 3) return;
+    current.push({
+      slot_id: current.length + 1,
+      label: `备用摄像头#${current.length + 1}`,
+      vendor: camHubState.selectedVendor || "hikvision",
+      protocol: "rtsp",
+      host: "",
+      port: 80,
+      rtsp_port: 554,
+      username: "admin",
+      password: "",
+      custom_url: "",
+    });
+    renderWizardStandbySlots(current);
+  });
+
+  document.getElementById("camCfgStandbySlotsList")?.addEventListener("click", async (e) => {
+    const rmBtn = e.target.closest(".js-cam-remove-standby");
+    if (rmBtn) {
+      const idx = Number(rmBtn.dataset.sbIndex);
+      const current = collectWizardStandbySlots();
+      // Preserve has_password flags from existing state when re-rendering
+      const prevMeta = camHubState.wizardStandbySlots || [];
+      const merged = current.map((s, i) => ({
+        ...s,
+        has_password: Boolean(s.password) || Boolean(prevMeta[i]?.has_password),
+      }));
+      merged.splice(idx, 1);
+      renderWizardStandbySlots(merged);
+      return;
+    }
+    const testBtn = e.target.closest(".js-cam-test-standby");
+    if (testBtn) {
+      const idx = Number(testBtn.dataset.sbIndex);
+      const slots = collectWizardStandbySlots();
+      const sb = slots[idx];
+      if (!sb) return;
+      const origId = document.getElementById("camCfgOriginalId")?.value || "";
+      testBtn.disabled = true;
+      const origTxt = testBtn.textContent;
+      testBtn.textContent = "测通中…";
+      try {
+        const res = await api("/api/cameras/test-connection", {
+          method: "POST",
+          body: JSON.stringify({
+            camera_id: origId,
+            slot_id: idx + 1,
+            ingest_config: sb,
+          }),
+        });
+        if (res.preview_jpeg_b64) {
+          const dataUrl = `data:image/jpeg;base64,${res.preview_jpeg_b64}`;
+          camHubState.lastTestDataUrl = dataUrl;
+          const imgEl = document.getElementById("camCfgPreviewImg");
+          if (imgEl) imgEl.src = dataUrl;
+          const metaEl = document.getElementById("camCfgPreviewMetaText");
+          if (metaEl) {
+            metaEl.textContent = `✅ 冷备槽位 #${idx + 1} (${sb.label}) 抓拍成功 · ${res.width}×${res.height} · ${res.elapsed_ms}ms`;
+          }
+          document.getElementById("camCfgPreviewStage")?.classList.remove("hidden");
+        }
+        showAppleToast(`✅ 冷备槽位 #${idx + 1} (${sb.label}) 测通成功 (${res.elapsed_ms}ms)`);
+      } catch (err) {
+        showAppleToast(`冷备槽位 #${idx + 1} 测通失败：${err.message}`, "error");
+      } finally {
+        testBtn.disabled = false;
+        testBtn.textContent = origTxt;
+      }
+    }
+  });
+
   document.getElementById("btnCloseCameraConfigModal")?.addEventListener("click", closeCameraConfigModal);
   document.getElementById("btnCancelCameraConfigModal")?.addEventListener("click", closeCameraConfigModal);
   document.getElementById("cameraConfigModalBackdrop")?.addEventListener("click", closeCameraConfigModal);

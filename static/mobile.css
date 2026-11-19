@@ -113,6 +113,73 @@ body {
   color: #c81e1e;
 }
 
+/* Workspace Identity Auth Card & Embed Mode */
+.m-auth-card {
+  background: var(--card);
+  border: 1px solid rgba(245, 138, 0, 0.35);
+  border-radius: 16px;
+  padding: 10px 12px;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.m-auth-card[hidden] {
+  display: none !important;
+}
+
+.m-auth-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.m-auth-row {
+  display: flex;
+  gap: 8px;
+}
+
+.m-auth-input {
+  flex: 1;
+  height: 38px;
+  padding: 0 11px;
+  border-radius: 10px;
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  background: #ffffff;
+  font-size: 14px;
+  outline: none;
+}
+
+.m-auth-input:focus {
+  border-color: var(--accent);
+}
+
+body.is-embed .mobile-shell {
+  max-width: none;
+  width: 100%;
+  height: 100%;
+  height: 100dvh;
+  min-height: 0;
+  padding: 0;
+  gap: 0;
+}
+
+body.is-embed .m-topbar,
+body.is-embed .m-controls-card,
+body.is-embed .m-guidance-strip {
+  display: none !important;
+}
+
+body.is-embed .m-map-stage {
+  border-radius: 0;
+  border: none;
+  flex: 1 1 0%;
+  height: 100%;
+  min-height: 0;
+}
+
 /* 2. Destination & Broadcast Control Card */
 .m-controls-card {
   background: var(--card);
@@ -223,7 +290,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
 }
 
 .m-seg-group {
@@ -233,6 +300,46 @@ body {
   border-radius: 10px;
   gap: 2px;
   flex: 1;
+  min-width: 118px;
+}
+
+.m-voice-select-wrap {
+  position: relative;
+  flex-shrink: 1;
+  min-width: 102px;
+  max-width: 152px;
+}
+
+.m-voice-select-wrap::after {
+  content: "▾";
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.m-voice-select {
+  width: 100%;
+  height: 35px;
+  padding: 0 21px 0 9px;
+  border-radius: 10px;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  background: #f8fafc;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  appearance: none;
+  -webkit-appearance: none;
+  outline: none;
+  text-overflow: ellipsis;
+}
+
+.m-voice-select:focus {
+  border-color: var(--accent);
+  background: #ffffff;
 }
 
 .m-seg-btn {
@@ -418,7 +525,10 @@ body {
 .m-map-svg {
   width: 100%;
   height: 100%;
-  flex: 1;
+  max-height: 100%;
+  min-height: 0;
+  min-width: 0;
+  flex: 1 1 0%;
   display: block;
   touch-action: none;
 }
@@ -427,7 +537,8 @@ body {
   cursor: pointer;
 }
 
-.m-map-svg .active-guidance-route {
+.m-map-svg .active-guidance-route,
+.m-map-svg .active-walk-route {
   animation: routeFlow 1.2s linear infinite;
 }
 

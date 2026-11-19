@@ -45,19 +45,28 @@ cd community-parking
 
 > **Windows 物业主机容器化**：安装 [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/)（开启开机自启 `Start Docker Desktop when you sign in`），在 PowerShell 进入仓库执行 `.\parking-ctl.ps1 docker-up` 即可。
 
-### 3. 零成本接入 Cloudflare Tunnel（0 元免备案服务 1,000+ 业主）
-已有 Cloudflare 域名时，无需购买公网 IP、无需开放云安全组入站端口、无需 ICP 备案（Cloudflare Free 计划免费支持 1,000 条隧道，公开 Web/API 访问不受 50 席位限制）：
+### 3. 零成本接入 Cloudflare Tunnel（为什么已经有公网 IP 仍强烈推荐？）
+即使你的 Ubuntu 云主机拥有公网 IP（例如 `40.82.129.122`），接入 **Cloudflare Tunnel（`cloudflared`）** 依然有四大核心价值（0 元免备案，支持 1,000+ 业主）：
+1. **免装 Nginx/Certbot 自动开启全站 HTTPS（443 端口）**：Cloudflare 普通 DNS 橙云代理仅支持 `80/443/8080/8443` 等标准端口，**无法直接代理自定义的 `18790` / `18791` 端口**。通过 Tunnel 可直接把 `https://parking.listingworker.com` 转发到容器内部 `:18790`、`https://voice.listingworker.com` 转发到 `:18791`，自动签发并续期 SSL 证书，从而解锁手机浏览器 **GPS 进场自动播报、麦克风语音提问、剪贴板一键复制**（这些浏览器权限在纯 `http://IP:端口` 下会被现代手机拦截）。
+2. **Spot 竞价实例换 IP 永不失联**：如果云主机因 Spot 回收重建换了公网 IP，或后续迁回物业内网无公网 IP 主机，出站隧道重连后域名保持不变，全小区业主手机里已添加的 Siri 快捷指令**无需重新下载**。
+3. **云主机零入站端口暴露（防扫段与 DDoS）**：Azure NSG / Ubuntu `ufw` 无需对公网开放 `18790`、`18791`、`8790` 任何业务端口（仅留管理员 SSH `22`），流量经 Cloudflare 边缘清洗后通过加密出站隧道直达容器。
+4. **完全可选（支持双模平滑切换）**：若初期想先用 `http://40.82.129.122:18791` 直连测试，留空 `CLOUDFLARE_TUNNEL_TOKEN` 并放行防火墙 `18790/18791` 即可，仓库已同时内置 `voice.listingworker.com` 与 `40.82.129.122:18791` 两套全模式 Apple 官方签名包！
+
+**Cloudflare Tunnel 2 分钟配置步骤**：
 1. 登录 [Cloudflare Zero Trust 控制台](https://one.dash.cloudflare.com/) -> **Networks -> Tunnels -> Create a tunnel（Cloudflared）**，复制生成的 `Tunnel Token`。
 2. 在该 Tunnel 的 **Public Hostname** 添加两条子域名映射（**切勿映射 `8790`**）：
-   - `parking.你的域名.com` -> `Service: HTTP`，`URL: community-parking:18790`（若宿主机直跑填 `127.0.0.1:18790`）
-   - `voice.你的域名.com` -> `Service: HTTP`，`URL: community-parking:18791`（若宿主机直跑填 `127.0.0.1:18791`）
-3. 一键拉起含隧道侧车的容器栈：
+   - `parking.listingworker.com` -> `Service: HTTP`，`URL: community-parking:18790`（若宿主机直跑填 `127.0.0.1:18790`）
+   - `voice.listingworker.com` -> `Service: HTTP`，`URL: community-parking:18791`（若宿主机直跑填 `127.0.0.1:18791`）
+3. 在项目目录复制 `.env.example` 为 `.env`，填入 `CLOUDFLARE_TUNNEL_TOKEN` 后一键启动：
 
 ```bash
-CLOUDFLARE_TUNNEL_TOKEN="粘贴你的Token" ./parking-ctl.sh docker-up
+cp -n .env.example .env
+# 编辑 .env 填入 CLOUDFLARE_TUNNEL_TOKEN 后执行（脚本会自动识别并拉起 --profile tunnel）：
+./parking-ctl.sh docker-up
 ```
 
-4. 打开本机管理台 `http://127.0.0.1:8790` -> 右上角「配置 Azure 模型」，在下方 **`:18791` 免手语音网关** 区域设置访问口令（如 `xiaoqu888`）并填入上述两个 `https://` 公网域名保存即可！
+> **从开发机一键同步已标定数据与模型配置到 Ubuntu**：
+> 在本地 Mac 执行 `./parking-ctl.sh sync-ubuntu ericwang@40.82.129.122`，即可通过 `rsync` 将代码、Apple 预签名包以及本地已标定的 `data/`（含 `parking.db` 与 `runtime_config.json`）安全同步至 Ubuntu 主机。
 
 ---
 
@@ -231,7 +240,7 @@ sudo loginctl enable-linger "$USER"
    - 选择海康、大华、TP-Link、萤石、ONVIF 等预设模板，点击「测试抓图预览」出图后绑定到平面图对应车位带，最后前往「空间标定」框选地面车位框并保存空场基准模板。
 5. **配置 `:18791` Siri 车载免手播报与苹果签名说明**：
    - **macOS 本机运行**：`:18791` 点击「📲 一键下载『小区车位』Siri 快捷指令」时，后端会自动调用系统内置 `/usr/bin/shortcuts sign --mode anyone` 生成 **Apple 官方签名包（`AEA1`）** 并缓存于 `data/shortcuts/`，双击或发送至 iPhone 即可直接添加为「小区车位」（不再报错“不支持导入未签名快捷指令”），导入后直接喊 **“嘿 Siri，小区车位”** 即可双遍播报。
-   - **Ubuntu / Docker / Spot VM / Windows 云端部署（二选一免签分发）**：
-     - **方式 A（推荐，全平台永久有效）**：在 Mac 或 iPhone 导入「小区车位」快捷指令后，点「分享 → 拷贝 iCloud 链接（`https://www.icloud.com/shortcuts/...`）」，粘贴到 `:8790` 右上角「🎙️ 18791 Siri / 语音网关」弹窗的 **iCloud 快捷指令分享链接** 中保存；
-     - **方式 B（随 `data/` 目录携带通用签名包）**：在任意 Mac 执行一次 `./parking-ctl.sh sign-shortcut https://voice.你的域名.com 8-1`，会在 `data/shortcuts/universal-signed.shortcut` 生成带单元提问向导的 Apple 签名包，随 `./data:/app/data` 挂载到 Linux Docker 容器即可直接下载导入。
+   - **Ubuntu 24.04 / Docker / Spot VM / Windows 云端部署（开箱即用多模式预签名包）**：
+     - **内置全模式 Apple 官方签名包（`app/presigned_shortcuts/`）**：仓库已针对 `https://voice.listingworker.com` 与 `http://40.82.129.122:18791` 预置全套 `AEA1` 官方签名快捷指令包，在 Ubuntu 上无需 `/usr/bin/shortcuts` 即可原生分发 **仅文字（`text`）**、**仅动态平面图（`map`）**、**文字+平面图同屏（`both`）**、**纯语音（`silent`）** 与 **大模型问答（`ask`）**，且同时支持单元直连、首次运行选一次（`setup_once`）与每次动态菜单（实时拉取 `/api/voice/units.txt`）。
+     - **更换新域名时重新生成签名包**：在任意 Mac 执行一次 `./parking-ctl.sh sign-pack "https://voice.新域名.com"` 即可一键重签全套模式包；也可随时在 `:8790` 粘贴 iCloud 快捷指令分享链接（`https://www.icloud.com/shortcuts/...`）分发。
 

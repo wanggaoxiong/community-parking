@@ -14,7 +14,7 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -x "${APP_DIR}/.venv/bin/python" ]]; then
   VENV_PY="${APP_DIR}/.venv/bin/python"
 else
-  VENV_PY="$(command -v python3 || command -v python)"
+  VENV_PY="$(command -v python3 || command -v python || true)"
 fi
 HOST="${PARKING_HOST:-127.0.0.1}"
 PORT="${PARKING_PORT:-8790}"
@@ -228,7 +228,8 @@ cmd_health() {
     voice_status="未响应(:${VOICE_PORT})"
   fi
   if resp=$(curl --noproxy '*' -fsS -m 3 "http://${target_host}:${PORT}/api/overview" 2>/dev/null); then
-    "${VENV_PY}" -c "
+    if [[ -n "${VENV_PY}" ]]; then
+      "${VENV_PY}" -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 ps = d.get('privacy_stats', {})
@@ -239,6 +240,9 @@ vlm_hits = ps.get('vlm_cache_hits', 0)
 tpl_hits = ps.get('template_cache_hits', 0)
 print(f\"   📊 概览: 总车位 {d.get('total_capacity')} | 净余空位 {d.get('total_effective_free')} | 手机看图 ${mob_status} | Siri语音 ${voice_status} | 落盘 {ps.get('raw_images_written_to_disk', 0)} | 瞬时销毁 {ps.get('frames_processed_in_ram', 0)} 帧 | 热快取 {human_cache}/{budget_mb:.0f}MB (命中: 模板{tpl_hits}/VLM{vlm_hits})\")
 " <<< "${resp}"
+    else
+      echo "   📊 三端口健康状态: 管理台 在线(:${PORT}) | 手机看图 ${mob_status} | Siri语音 ${voice_status}"
+    fi
   else
     echo "⚠️  健康检查未响应: http://${target_host}:${PORT}/api/health"
     return 1
@@ -377,8 +381,12 @@ case "${1:-status}" in
   uninstall-systemd) cmd_uninstall_systemd ;;
   docker-up)
     cd "${APP_DIR}"
-    if [[ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
-      docker compose --profile tunnel up -d --build
+    CF_TOK="${CLOUDFLARE_TUNNEL_TOKEN:-}"
+    if [[ -z "${CF_TOK}" && -f "${APP_DIR}/.env" ]]; then
+      CF_TOK="$(grep -E '^CLOUDFLARE_TUNNEL_TOKEN=' "${APP_DIR}/.env" | tail -n 1 | cut -d'=' -f2- | tr -d '[:space:]\"'\''')"
+    fi
+    if [[ -n "${CF_TOK}" ]]; then
+      CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" docker compose --profile tunnel up -d --build
     else
       docker compose up -d --build
     fi
@@ -392,6 +400,40 @@ case "${1:-status}" in
     ;;
   docker-logs)
     cd "${APP_DIR}" && docker compose logs -f --tail=80
+    ;;
+  sign-pack)
+    # Pre-sign full multi-mode Ubuntu-Ready Apple Shortcut pack (`text`, `map`, `both`, `silent`, `ask` + `menu` + fixed units)
+    BASE_ARG="${2:-https://voice.listingworker.com}"
+    INC_UNITS="${3:-1}"
+    "${VENV_PY}" -c "
+import sys
+from app.database import Database
+from app.server import ParkingAppContext
+ctx = ParkingAppContext(database=Database('data/parking.db'))
+res = ctx.voice_gateway.pre_sign_domain_pack(base_url=sys.argv[1], include_fixed_units=(sys.argv[2] != '0'))
+if not res.get('ok'):
+    print('❌ 预签名包生成失败:', res.get('error'))
+    sys.exit(1)
+print(f\"✅ 已生成 Ubuntu Ready 多模式 Apple 官方签名包 ({res['count']} 个 .shortcut 文件):\")
+print(f\"   目标地址 : {res['base_url']}\")
+print(f\"   输出目录 : {res['dir']}\")
+print(f\"   覆盖模式 : 仅文字(text) · 仅平面图(map) · 文字+平面图同屏(both) · 纯语音(silent) · 大模型问答(ask) + 单元直连/首运行选一次/动态菜单\")
+" "${BASE_ARG}" "${INC_UNITS}"
+    ;;
+  sync-ubuntu)
+    REMOTE_HOST="${2:-ericwang@40.82.129.122}"
+    REMOTE_DIR="${3:-~/community-parking}"
+    echo "🚀 正在同步代码、预签名包与本地已标定数据(data/) 至 ${REMOTE_HOST}:${REMOTE_DIR} ..."
+    rsync -avz --progress \
+      --exclude '.venv' \
+      --exclude '__pycache__' \
+      --exclude '.pytest_cache' \
+      --exclude '.DS_Store' \
+      --exclude 'data/*.pid' \
+      --exclude 'data/*.log*' \
+      --exclude 'data/shortcuts/apple_map_helper*' \
+      "${APP_DIR}/" "${REMOTE_HOST}:${REMOTE_DIR}/"
+    echo "✅ 同步完成！登录 Ubuntu 执行: cd ${REMOTE_DIR} && cp -n .env.example .env && ./parking-ctl.sh docker-up"
     ;;
   sign-shortcut)
     # Pre-sign universal Apple Shortcut (AEA1) on macOS into data/shortcuts/universal-signed.shortcut
@@ -414,7 +456,7 @@ print('   提示: 将 data/ 目录随 Docker 挂载至 Linux/Windows 云端后�
 " "${BASE_ARG}" "${UNIT_ARG}"
     ;;
   *)
-    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|sign-shortcut|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd|docker-up|docker-tunnel|docker-down|docker-restart|docker-logs}"
+    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|sign-pack|sync-ubuntu|sign-shortcut|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd|docker-up|docker-down|docker-restart|docker-logs}"
     exit 1
     ;;
 esac

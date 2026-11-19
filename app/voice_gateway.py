@@ -36,7 +36,42 @@ logger = logging.getLogger("parking.voice_gateway")
 
 STATIC_DIR = BASE_DIR / "static"
 SHORTCUTS_CACHE_DIR = DATA_DIR / "shortcuts"
+PRESIGNED_BUNDLES_DIR = BASE_DIR / "app" / "presigned_shortcuts"
+DATA_PRESIGNED_DIR = DATA_DIR / "shortcuts" / "presigned_packs"
 MACOS_SHORTCUTS_BIN = "/usr/bin/shortcuts"
+
+
+def _pack_slug_for_base_url(base_url: str) -> str:
+    clean = str(base_url or "").strip().rstrip("/")
+    if not clean:
+        return ""
+    parsed = urlparse(clean)
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return ""
+    port = parsed.port
+    default_port = 443 if scheme == "https" else 80
+    port_part = f"_{port}" if (port and port != default_port) else ""
+    safe_host = re.sub(r"[^a-z0-9]+", "_", host).strip("_")
+    return f"{scheme}_{safe_host}{port_part}"
+
+
+def _infer_paired_mobile_url(voice_base_url: str, configured_mobile_url: str = "") -> str:
+    cfg_mob = str(configured_mobile_url or "").strip().rstrip("/")
+    if cfg_mob:
+        return cfg_mob
+    parsed = urlparse(str(voice_base_url or "").strip())
+    host = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "http").lower()
+    if host.startswith("voice.") and len(host) > 6:
+        root_dom = host[6:]
+        port_sfx = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+        return f"{scheme}://parking.{root_dom}{port_sfx}"
+    mob_port = int(config_manager.get().get("mobile_http_port", 18790))
+    if host:
+        return f"{scheme}://{host}:{mob_port}"
+    return f"http://127.0.0.1:{mob_port}"
 _MAP_HELPER_LOCK = threading.Lock()
 _PLACE_SEARCH_CACHE: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
@@ -728,6 +763,18 @@ class VoiceGatewayService:
                 has_presigned = universal_path.read_bytes()[:4] == b"AEA1"
             except Exception:
                 has_presigned = False
+        pack_domains: List[str] = []
+        for root_d in (DATA_PRESIGNED_DIR, PRESIGNED_BUNDLES_DIR):
+            if root_d.is_dir():
+                for mf in sorted(root_d.glob("*/manifest.json")):
+                    try:
+                        mdata = json.loads(mf.read_text(encoding="utf-8"))
+                        b_url = str(mdata.get("base_url") or "").strip()
+                        if b_url and b_url not in pack_domains:
+                            pack_domains.append(b_url)
+                            has_presigned = True
+                    except Exception:
+                        continue
         if icloud_url:
             delivery_mode = "icloud_link"
         elif macos_signer or has_presigned:
@@ -738,6 +785,7 @@ class VoiceGatewayService:
             "icloud_shortcut_url": icloud_url,
             "macos_signer_available": macos_signer,
             "presigned_universal_available": has_presigned,
+            "presigned_pack_domains": pack_domains,
             "shortcut_signed_ready": bool(icloud_url or macos_signer or has_presigned),
             "shortcut_delivery_mode": delivery_mode,
         }
@@ -754,6 +802,8 @@ class VoiceGatewayService:
             tot_ask = self._total_ask_calls
         sc_info = self._shortcut_delivery_info(vg)
         eff_tok = self._effective_access_token()
+        pub_voice = str(vg.get("public_voice_url") or "")
+        pub_mob = _infer_paired_mobile_url(pub_voice, str(vg.get("public_mobile_url") or ""))
         return {
             "workspace_id": self._ws_id(),
             "workspace_name": str(prof.get("name") or cfg.get("community_name") or "邻里公益寻位"),
@@ -765,8 +815,8 @@ class VoiceGatewayService:
             "token_required": bool(eff_tok),
             "default_unit_id": str(prof.get("default_unit_id") or vg.get("default_unit_id") or "8-1"),
             "default_repeat": int(vg.get("default_repeat") or 2),
-            "public_mobile_url": str(vg.get("public_mobile_url") or ""),
-            "public_voice_url": str(vg.get("public_voice_url") or ""),
+            "public_mobile_url": pub_mob,
+            "public_voice_url": pub_voice,
             "arrival_place": str(prof.get("arrival_place") or vg.get("arrival_place") or ""),
             "arrival_radius_m": int(prof.get("arrival_radius_m") or vg.get("arrival_radius_m") or 200),
             **sc_info,
@@ -2163,6 +2213,656 @@ class VoiceGatewayService:
                         pass
         return None
 
+    def build_ubuntu_pack_variant_plist(
+        self,
+        base_url: str,
+        variant_kind: str = "dynamic",
+        show_map: str = "text",
+        mode: str = "brief",
+        shortcut_name: str = "小区车位",
+    ) -> bytes:
+        """
+        Build a universal domain-bound Apple Shortcut plist designed for Ubuntu / Linux deployment:
+        - `variant_kind == "dynamic"`: Zero `WFWorkflowImportQuestions` (1-tap install in Chrome & Safari!).
+          Uses `/api/voice/check-bind` (`count < 1`): if already pre-bound via `:18791` webpage or prior run,
+          speaks & pops up `text` / `map` / `both` immediately; otherwise fetches live `/api/voice/units.txt`
+          (`choosefromlist`) ONCE on Run #1 and saves permanently!
+        - `variant_kind == "menu"`: Dynamically fetches live `/api/voice/units.txt` (`choosefromlist`) on every run
+          so newly added buildings/units on Ubuntu work immediately without re-signing!
+        """
+        clean_base = str(base_url or "").strip().rstrip("/")
+        safe_name = self.sanitize_shortcut_name(shortcut_name, "小区车位")
+        act_mode = "ask" if str(mode or "").strip().lower() == "ask" else "brief"
+        map_mode = self._normalize_show_map_mode(show_map)
+        popup_desc = {
+            "text": "播报同时弹出「精炼寻位文字」",
+            "map": "播报同时弹出「纯净动态平面图」",
+            "both": "播报同时弹出「精炼文字 + 动态平面图」",
+            "silent": "纯语音播报（不弹画面）",
+        }.get(map_mode, "播报同时弹出「精炼寻位文字」")
+
+        actions: List[Dict[str, Any]] = [
+            {
+                "WFWorkflowActionIdentifier": "is.workflow.actions.comment",
+                "WFWorkflowActionParameters": {
+                    "WFCommentActionText": (
+                        f"【{safe_name}】免手语音寻位（Apple 官方签名 · Ubuntu 云端直连版）\n"
+                        f"网关：{clean_base} ｜ 显示：{popup_desc}"
+                    )
+                },
+            }
+        ]
+
+        if act_mode == "ask":
+            ask_q_uuid = str(uuid.uuid4()).upper()
+            enc_q_uuid = str(uuid.uuid4()).upper()
+            ans_uuid = str(uuid.uuid4()).upper()
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.ask",
+                    "WFWorkflowActionParameters": {
+                        "UUID": ask_q_uuid,
+                        "WFAskActionPrompt": "请说出或输入您想问的车位问题",
+                        "WFAskActionDefaultAnswer": "现在停哪个区域走回家最近？",
+                        "WFInputType": "Text",
+                    },
+                }
+            )
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.urlencode",
+                    "WFWorkflowActionParameters": {
+                        "UUID": enc_q_uuid,
+                        "WFEncodeMode": "Encode",
+                        "WFInput": {
+                            "Value": {
+                                "attachmentsByRange": {
+                                    "{0, 1}": {
+                                        "OutputName": "提供的输入",
+                                        "OutputUUID": ask_q_uuid,
+                                        "Type": "ActionOutput",
+                                    }
+                                },
+                                "string": "\ufffc",
+                            },
+                            "WFSerializationType": "WFTextTokenString",
+                        },
+                    },
+                }
+            )
+            ask_prefix = f"{clean_base}/api/voice/ask?format=text&q="
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                    "WFWorkflowActionParameters": {
+                        "UUID": ans_uuid,
+                        "WFHTTPMethod": "GET",
+                        "WFURL": {
+                            "Value": {
+                                "attachmentsByRange": {
+                                    "{" + str(len(ask_prefix)) + ", 1}": {
+                                        "OutputName": "URL编码后的文本",
+                                        "OutputUUID": enc_q_uuid,
+                                        "Type": "ActionOutput",
+                                    }
+                                },
+                                "string": f"{ask_prefix}\ufffc",
+                            },
+                            "WFSerializationType": "WFTextTokenString",
+                        },
+                    },
+                }
+            )
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+                    "WFWorkflowActionParameters": {
+                        "WFSpeakTextWait": False,
+                        "WFSpeakTextLanguage": "zh-CN",
+                        "WFText": {
+                            "Value": {
+                                "attachmentsByRange": {
+                                    "{0, 1}": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": ans_uuid,
+                                        "Type": "ActionOutput",
+                                    }
+                                },
+                                "string": "\ufffc",
+                            },
+                            "WFSerializationType": "WFTextTokenString",
+                        },
+                    },
+                }
+            )
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.showresult",
+                    "WFWorkflowActionParameters": {
+                        "Text": {
+                            "Value": {
+                                "attachmentsByRange": {
+                                    "{0, 1}": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": ans_uuid,
+                                        "Type": "ActionOutput",
+                                    }
+                                },
+                                "string": "\ufffc",
+                            },
+                            "WFSerializationType": "WFTextTokenString",
+                        }
+                    },
+                }
+            )
+        else:
+            enc_menu_unit_uuid: Optional[str] = None
+            if variant_kind == "menu":
+                u_dl = str(uuid.uuid4()).upper()
+                u_sp = str(uuid.uuid4()).upper()
+                u_ch = str(uuid.uuid4()).upper()
+                enc_menu_unit_uuid = str(uuid.uuid4()).upper()
+                actions.extend(
+                    [
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                            "WFWorkflowActionParameters": {
+                                "UUID": u_dl,
+                                "WFHTTPMethod": "GET",
+                                "WFURL": f"{clean_base}/api/voice/units.txt",
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.splittext",
+                            "WFWorkflowActionParameters": {
+                                "UUID": u_sp,
+                                "WFTextSeparator": "New Lines",
+                                "text": {
+                                    "Value": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": u_dl,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.choosefromlist",
+                            "WFWorkflowActionParameters": {
+                                "UUID": u_ch,
+                                "WFChooseFromListActionPrompt": "请选择回家目的单元门",
+                                "WFInput": {
+                                    "Value": {
+                                        "OutputName": "拆分后的文本",
+                                        "OutputUUID": u_sp,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.urlencode",
+                            "WFWorkflowActionParameters": {
+                                "UUID": enc_menu_unit_uuid,
+                                "WFEncodeMode": "Encode",
+                                "WFInput": {
+                                    "Value": {
+                                        "attachmentsByRange": {
+                                            "{0, 1}": {
+                                                "OutputName": "选取的项目",
+                                                "OutputUUID": u_ch,
+                                                "Type": "ActionOutput",
+                                            }
+                                        },
+                                        "string": "\ufffc",
+                                    },
+                                    "WFSerializationType": "WFTextTokenString",
+                                },
+                            },
+                        },
+                    ]
+                )
+            else:
+                chk_uuid = str(uuid.uuid4()).upper()
+                cnt_uuid = str(uuid.uuid4()).upper()
+                if_grp = str(uuid.uuid4()).upper()
+                u_dl = str(uuid.uuid4()).upper()
+                u_sp = str(uuid.uuid4()).upper()
+                u_ch = str(uuid.uuid4()).upper()
+                u_en = str(uuid.uuid4()).upper()
+                qb_prefix = f"{clean_base}/api/voice/quick-bind?unit="
+                actions.extend(
+                    [
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                            "WFWorkflowActionParameters": {
+                                "UUID": chk_uuid,
+                                "WFHTTPMethod": "GET",
+                                "WFURL": f"{clean_base}/api/voice/check-bind",
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.count",
+                            "WFWorkflowActionParameters": {
+                                "UUID": cnt_uuid,
+                                "WFCountType": "Characters",
+                                "Input": {
+                                    "Value": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": chk_uuid,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
+                            "WFWorkflowActionParameters": {
+                                "GroupingIdentifier": if_grp,
+                                "WFControlFlowMode": 0,
+                                "WFCondition": 0,
+                                "WFNumberValue": "1",
+                                "WFInput": {
+                                    "Type": "Variable",
+                                    "Variable": {
+                                        "Value": {
+                                            "OutputName": "数量",
+                                            "OutputUUID": cnt_uuid,
+                                            "Type": "ActionOutput",
+                                        },
+                                        "WFSerializationType": "WFTextTokenAttachment",
+                                    },
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                            "WFWorkflowActionParameters": {
+                                "UUID": u_dl,
+                                "WFHTTPMethod": "GET",
+                                "WFURL": f"{clean_base}/api/voice/units.txt",
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.splittext",
+                            "WFWorkflowActionParameters": {
+                                "UUID": u_sp,
+                                "WFTextSeparator": "New Lines",
+                                "text": {
+                                    "Value": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": u_dl,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.choosefromlist",
+                            "WFWorkflowActionParameters": {
+                                "UUID": u_ch,
+                                "WFChooseFromListActionPrompt": "首次使用请点选默认单元门（仅需选一次，后续永久直连）",
+                                "WFInput": {
+                                    "Value": {
+                                        "OutputName": "拆分后的文本",
+                                        "OutputUUID": u_sp,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.urlencode",
+                            "WFWorkflowActionParameters": {
+                                "UUID": u_en,
+                                "WFEncodeMode": "Encode",
+                                "WFInput": {
+                                    "Value": {
+                                        "attachmentsByRange": {
+                                            "{0, 1}": {
+                                                "OutputName": "选取的项目",
+                                                "OutputUUID": u_ch,
+                                                "Type": "ActionOutput",
+                                            }
+                                        },
+                                        "string": "\ufffc",
+                                    },
+                                    "WFSerializationType": "WFTextTokenString",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                            "WFWorkflowActionParameters": {
+                                "WFHTTPMethod": "GET",
+                                "WFURL": {
+                                    "Value": {
+                                        "attachmentsByRange": {
+                                            "{" + str(len(qb_prefix)) + ", 1}": {
+                                                "OutputName": "URL编码后的文本",
+                                                "OutputUUID": u_en,
+                                                "Type": "ActionOutput",
+                                            }
+                                        },
+                                        "string": f"{qb_prefix}\ufffc",
+                                    },
+                                    "WFSerializationType": "WFTextTokenString",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
+                            "WFWorkflowActionParameters": {
+                                "GroupingIdentifier": if_grp,
+                                "WFControlFlowMode": 2,
+                            },
+                        },
+                    ]
+                )
+
+            def _pack_url(path_prefix: str, suffix: str = "") -> Any:
+                if enc_menu_unit_uuid:
+                    full_p = f"{clean_base}{path_prefix}"
+                    return {
+                        "Value": {
+                            "attachmentsByRange": {
+                                "{" + str(len(full_p)) + ", 1}": {
+                                    "OutputName": "URL编码后的文本",
+                                    "OutputUUID": enc_menu_unit_uuid,
+                                    "Type": "ActionOutput",
+                                }
+                            },
+                            "string": f"{full_p}\ufffc{suffix}",
+                        },
+                        "WFSerializationType": "WFTextTokenString",
+                    }
+                return f"{clean_base}{path_prefix}{suffix}"
+
+            speech_uuid = str(uuid.uuid4()).upper()
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                    "WFWorkflowActionParameters": {
+                        "UUID": speech_uuid,
+                        "WFHTTPMethod": "GET",
+                        "WFURL": _pack_url("/api/voice/brief?unit=", "&repeat=2&format=speech"),
+                    },
+                }
+            )
+
+            card_uuid: Optional[str] = None
+            hud_uuid: Optional[str] = None
+            if map_mode == "text":
+                card_uuid = str(uuid.uuid4()).upper()
+                actions.append(
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                        "WFWorkflowActionParameters": {
+                            "UUID": card_uuid,
+                            "WFHTTPMethod": "GET",
+                            "WFURL": _pack_url("/api/voice/brief?unit=", "&format=card"),
+                        },
+                    }
+                )
+            elif map_mode in ("map", "both"):
+                hud_uuid = str(uuid.uuid4()).upper()
+                v_q = "map" if map_mode == "map" else "both"
+                actions.append(
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                        "WFWorkflowActionParameters": {
+                            "UUID": hud_uuid,
+                            "WFHTTPMethod": "GET",
+                            "WFURL": _pack_url(
+                                "/api/voice/hud/%E5%AE%9E%E6%97%B6%E6%80%81%E5%8A%BF.html?unit=",
+                                f"&view={v_q}",
+                            ),
+                        },
+                    }
+                )
+
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+                    "WFWorkflowActionParameters": {
+                        "WFSpeakTextWait": False,
+                        "WFSpeakTextLanguage": "zh-CN",
+                        "WFText": {
+                            "Value": {
+                                "attachmentsByRange": {
+                                    "{0, 1}": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": speech_uuid,
+                                        "Type": "ActionOutput",
+                                    }
+                                },
+                                "string": "\ufffc",
+                            },
+                            "WFSerializationType": "WFTextTokenString",
+                        },
+                    },
+                }
+            )
+
+            if map_mode == "text" and card_uuid:
+                actions.append(
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.showresult",
+                        "WFWorkflowActionParameters": {
+                            "Text": {
+                                "Value": {
+                                    "attachmentsByRange": {
+                                        "{0, 1}": {
+                                            "OutputName": "URL的内容",
+                                            "OutputUUID": card_uuid,
+                                            "Type": "ActionOutput",
+                                        }
+                                    },
+                                    "string": "\ufffc",
+                                },
+                                "WFSerializationType": "WFTextTokenString",
+                            }
+                        },
+                    }
+                )
+            elif map_mode in ("map", "both") and hud_uuid:
+                actions.append(
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.previewdocument",
+                        "WFWorkflowActionParameters": {
+                            "WFInput": {
+                                "Value": {
+                                    "OutputName": "URL的内容",
+                                    "OutputUUID": hud_uuid,
+                                    "Type": "ActionOutput",
+                                },
+                                "WFSerializationType": "WFTextTokenAttachment",
+                            }
+                        },
+                    }
+                )
+
+        workflow = {
+            "WFWorkflowClientVersion": "2605.0.5",
+            "WFWorkflowMinimumClientVersion": 900,
+            "WFWorkflowMinimumClientVersionString": "900",
+            "WFWorkflowIcon": {
+                "WFWorkflowIconStartColor": 463140863,
+                "WFWorkflowIconGlyphNumber": 59676,
+            },
+            "WFWorkflowTypes": ["NCWidget"],
+            "WFWorkflowInputContentItemClasses": [],
+            "WFWorkflowActions": actions,
+        }
+        return plistlib.dumps(workflow, fmt=plistlib.FMT_BINARY)
+
+    def pre_sign_domain_pack(
+        self,
+        base_url: str,
+        include_fixed_units: bool = True,
+        target_root: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """
+        Pre-sign a complete multi-mode Ubuntu-Ready `.shortcut` pack (`text`, `map`, `both`,
+        `silent`, `ask` + `menu` + optional per-unit `fixed` presets) on macOS so Ubuntu 24.04
+        serves Apple-signed `AEA1` shortcuts for EVERY popup option without `/usr/bin/shortcuts`.
+        """
+        clean_base = str(base_url or "").strip().rstrip("/")
+        if not clean_base:
+            return {"ok": False, "error": "请指定公网域名或服务器地址，例如 https://voice.listingworker.com"}
+        if not _can_macos_sign_shortcuts():
+            return {"ok": False, "error": "请在 macOS 上执行一次 sign-pack 生成预签名包"}
+
+        slug = _pack_slug_for_base_url(clean_base)
+        out_dir = (target_root or PRESIGNED_BUNDLES_DIR) / slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        jobs: List[Tuple[str, bytes]] = []
+        # 1) Dynamic Smart-Once variants (`text`, `map`, `both`, `silent`, `ask`)
+        for mm in ("text", "map", "both", "silent"):
+            jobs.append(
+                (
+                    f"dynamic_{mm}.shortcut",
+                    self.build_ubuntu_pack_variant_plist(clean_base, variant_kind="dynamic", show_map=mm, mode="brief"),
+                )
+            )
+        jobs.append(
+            (
+                "dynamic_ask.shortcut",
+                self.build_ubuntu_pack_variant_plist(clean_base, variant_kind="dynamic", show_map="text", mode="ask"),
+            )
+        )
+        # 2) Live-Server Menu variants (`text`, `map`, `both`, `silent`)
+        for mm in ("text", "map", "both", "silent"):
+            jobs.append(
+                (
+                    f"menu_{mm}.shortcut",
+                    self.build_ubuntu_pack_variant_plist(clean_base, variant_kind="menu", show_map=mm, mode="brief"),
+                )
+            )
+        # 3) Dedicated CGNAT-immune per-unit fixed presets for existing units (`text`, `map`, `both`)
+        unit_ids_signed: List[str] = []
+        if include_fixed_units and hasattr(self.ctx, "db") and self.ctx.db is not None:
+            for u in (self.ctx.db.list_units() or [])[:16]:
+                uid = str(u.get("unit_id") or "").strip()
+                if not uid:
+                    continue
+                unit_ids_signed.append(uid)
+                safe_u = re.sub(r"[^a-zA-Z0-9_-]+", "_", uid)
+                for mm in ("text", "map", "both"):
+                    jobs.append(
+                        (
+                            f"fixed_{mm}_{safe_u}.shortcut",
+                            self.build_siri_shortcut_plist(
+                                base_url=clean_base,
+                                unit_id=uid,
+                                repeat=2,
+                                unit_mode="fixed",
+                                show_map=mm,
+                                mode="brief",
+                            ),
+                        )
+                    )
+
+        signed_files: Dict[str, int] = {}
+        with self._sign_lock:
+            for fname, raw_plist in jobs:
+                dest = out_dir / fname
+                if dest.is_file() and dest.read_bytes()[:4] == b"AEA1":
+                    signed_files[fname] = dest.stat().st_size
+                    continue
+                signed_b = self._sign_plist_via_macos_cli(raw_plist)
+                if not signed_b:
+                    return {"ok": False, "error": f"签名 {fname} 失败，请重试"}
+                dest.write_bytes(signed_b)
+                signed_files[fname] = len(signed_b)
+
+        manifest = {
+            "base_url": clean_base,
+            "slug": slug,
+            "modes": ["text", "map", "both", "silent", "ask"],
+            "unit_modes": ["fixed", "setup_once", "menu"],
+            "fixed_units": unit_ids_signed,
+            "files": signed_files,
+            "generated_at": datetime.datetime.now().isoformat(),
+        }
+        (out_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return {
+            "ok": True,
+            "slug": slug,
+            "dir": str(out_dir),
+            "base_url": clean_base,
+            "count": len(signed_files),
+            "fixed_units": unit_ids_signed,
+        }
+
+    @staticmethod
+    def match_presigned_pack_shortcut(
+        effective_base: str,
+        act_mode: str,
+        map_mode: str,
+        u_mode: str,
+        resolved_uid: str,
+    ) -> Optional[Tuple[bytes, str]]:
+        """
+        Locate the exact Apple-signed (`AEA1`) `.shortcut` file for `(effective_base, act_mode, map_mode, u_mode, resolved_uid)`
+        when running on Ubuntu / Linux without `/usr/bin/shortcuts`.
+        """
+        slug = _pack_slug_for_base_url(effective_base)
+        cand_dirs: List[Path] = []
+        if slug:
+            for root_d in (DATA_PRESIGNED_DIR, PRESIGNED_BUNDLES_DIR):
+                d = root_d / slug
+                if d.is_dir():
+                    cand_dirs.append(d)
+
+        # If accessed via SSH tunnel (127.0.0.1) on Ubuntu before PUBLIC_VOICE_URL is set, fallback to available pack
+        if not cand_dirs:
+            for root_d in (DATA_PRESIGNED_DIR, PRESIGNED_BUNDLES_DIR):
+                if root_d.is_dir():
+                    for sub in sorted(root_d.iterdir()):
+                        if sub.is_dir() and (sub / "manifest.json").is_file():
+                            cand_dirs.append(sub)
+
+        if not cand_dirs:
+            return None
+
+        norm_map = map_mode if map_mode in ("text", "map", "both", "silent") else "both"
+        safe_u = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(resolved_uid or "").strip())
+
+        candidates_rel: List[str] = []
+        if act_mode == "ask":
+            candidates_rel.append("dynamic_ask.shortcut")
+        else:
+            if u_mode == "menu":
+                candidates_rel.append(f"menu_{norm_map}.shortcut")
+            elif u_mode == "fixed" and safe_u:
+                candidates_rel.append(f"fixed_{norm_map}_{safe_u}.shortcut")
+                candidates_rel.append(f"dynamic_{norm_map}.shortcut")
+            else:
+                candidates_rel.append(f"dynamic_{norm_map}.shortcut")
+            candidates_rel.append(f"menu_{norm_map}.shortcut")
+            candidates_rel.append("dynamic_text.shortcut")
+
+        for pack_dir in cand_dirs:
+            for rel_name in candidates_rel:
+                fp = pack_dir / rel_name
+                if fp.is_file():
+                    try:
+                        b = fp.read_bytes()
+                        if b[:4] == b"AEA1":
+                            return b, f"presigned_pack:{pack_dir.name}/{rel_name}"
+                    except Exception:
+                        continue
+        return None
+
     def pre_sign_universal_shortcut(
         self,
         default_base_url: str = "",
@@ -2305,6 +3005,16 @@ class VoiceGatewayService:
                         while len(self._signed_shortcut_cache) > 32:
                             self._signed_shortcut_cache.popitem(last=False)
                     return signed_bytes, True, "macos_shortcuts_sign"
+
+        pack_match = self.match_presigned_pack_shortcut(
+            effective_base=effective_base,
+            act_mode=act_mode,
+            map_mode=map_mode,
+            u_mode=u_mode,
+            resolved_uid=resolved_uid,
+        )
+        if pack_match is not None:
+            return pack_match[0], True, pack_match[1]
 
         for univ_file in (
             SHORTCUTS_CACHE_DIR / "universal-signed.shortcut",
@@ -3328,7 +4038,7 @@ def make_voice_http_handler(root_ctx: Any):
                     rep_raw = (qs.get("repeat") or [""])[0]
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else None
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
-                    uid = (qs.get("user") or qs.get("uid") or [""])[0]
+                    uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     fmt = (qs.get("format") or ["json"])[0].lower()
 
                     res = vg.build_voice_brief(
@@ -3352,7 +4062,7 @@ def make_voice_http_handler(root_ctx: Any):
                     rep_raw = (qs.get("repeat") or [""])[0]
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else None
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
-                    uid = (qs.get("user") or qs.get("uid") or [""])[0]
+                    uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     fmt = (qs.get("format") or ["json"])[0].lower()
 
                     res = vg.ask_voice_assistant(
@@ -3412,16 +4122,27 @@ def make_voice_http_handler(root_ctx: Any):
                     self._send_json(vg.build_siri_guide(self._request_base_url(), unit_id=unit_id, repeat=rep))
                     return
 
+                if path == "/api/voice/units.txt":
+                    units_all = ctx.db.list_units() or []
+                    lines = []
+                    for u in units_all[:40]:
+                        u_id = str(u.get("unit_id") or "").strip()
+                        u_nm = str(u.get("name") or u_id).strip()
+                        if u_id:
+                            lines.append(f"{u_nm} ({u_id})" if u_id not in u_nm else u_nm)
+                    if not lines:
+                        lines.append("8号楼1单元 (8-1)")
+                    self._send_text("\n".join(lines))
+                    return
+
                 if path == "/api/voice/check-bind":
-                    uid_chk = (qs.get("uid") or qs.get("user") or [""])[0].strip()
+                    uid_chk = (qs.get("uid") or qs.get("user") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     bound = ctx.db.get_im_user_binding("siri", uid_chk) if uid_chk else None
-                    # Returns "" (0 chars -> Count < 1 is TRUE on Run #1) when unbound,
-                    # and bound unit_id (e.g. "9-2", >= 3 chars -> Count < 1 is FALSE on Run #2+) once bound!
                     self._send_text(str(bound["unit_id"]) if (bound and bound.get("unit_id")) else "")
                     return
 
                 if path == "/api/voice/quick-bind":
-                    uid_qb = (qs.get("uid") or qs.get("user") or [""])[0].strip()
+                    uid_qb = (qs.get("uid") or qs.get("user") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     raw_u_qb = (qs.get("unit") or qs.get("unit_id") or [""])[0].strip()
                     if uid_qb and raw_u_qb:
                         resolved_uid, _uname, _ = vg.resolve_unit_id(raw_u_qb, "siri", "")
@@ -3442,7 +4163,7 @@ def make_voice_http_handler(root_ctx: Any):
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else 2
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or ["sedan"])[0]
                     vmode = (qs.get("view") or ["both"])[0]
-                    ext_uid = (qs.get("uid") or qs.get("user") or [""])[0]
+                    ext_uid = (qs.get("uid") or qs.get("user") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     html_doc = vg.render_voice_hud_html(
                         request_base_url=self._request_base_url(),
                         unit_id=unit_id,
@@ -3462,7 +4183,7 @@ def make_voice_http_handler(root_ctx: Any):
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or ["sedan"])[0]
                     sc_mode = (qs.get("mode") or ["brief"])[0]
                     u_mode = (qs.get("unit_mode") or ["fixed"])[0]
-                    show_map = (qs.get("show_map") or ["text"])[0]
+                    show_map = (qs.get("show_map") or qs.get("popup_mode") or ["text"])[0]
                     dev_uid = (qs.get("device_uid") or qs.get("uid") or [""])[0].strip()
                     vg_cfg = config_manager.get().get("voice_gateway", {})
                     raw_name = (qs.get("name") or [""])[0].strip()
@@ -3474,8 +4195,24 @@ def make_voice_http_handler(root_ctx: Any):
                     want_prepare = ((qs.get("prepare") or qs.get("prewarm") or ["0"])[0]).lower() in ("1", "true", "yes")
 
                     pub_base = str(vg_cfg.get("public_voice_url") or "").strip() or self._request_base_url()
-                    pub_mob = str(vg_cfg.get("public_mobile_url") or "").strip()
+                    pub_mob = _infer_paired_mobile_url(pub_base, str(vg_cfg.get("public_mobile_url") or ""))
                     cfg_tok = vg._effective_access_token()
+
+                    # On Ubuntu/Linux (`not _can_macos_sign_shortcuts()`), sync `ip:<client_ip>` binding during `prepare=1`
+                    # so `dynamic_<mode>.shortcut` knows the exact unit selected on the webpage (or resets for `setup_once`)!
+                    if want_prepare:
+                        ip_bind_key = f"ip:{self._client_ip()}"
+                        if vg._normalize_unit_mode(u_mode) == "fixed" and unit_id:
+                            r_uid, _r_uname, _ = vg.resolve_unit_id(unit_id, "siri", "")
+                            ctx.db.upsert_im_user_binding(
+                                channel="siri",
+                                external_uid=ip_bind_key,
+                                unit_id=r_uid,
+                                repeat_count=rep,
+                                vehicle_type=vtype,
+                            )
+                        elif vg._normalize_unit_mode(u_mode) == "setup_once":
+                            ctx.db.delete_im_user_binding("siri", ip_bind_key)
 
                     if want_raw:
                         plist_bytes = vg.build_siri_shortcut_plist(

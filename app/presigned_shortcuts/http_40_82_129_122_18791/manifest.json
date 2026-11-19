@@ -1,0 +1,29 @@
+{
+  "base_url": "http://40.82.129.122:18791",
+  "slug": "http_40_82_129_122_18791",
+  "modes": [
+    "text",
+    "map",
+    "both",
+    "silent",
+    "ask"
+  ],
+  "unit_modes": [
+    "fixed",
+    "setup_once",
+    "menu"
+  ],
+  "fixed_units": [],
+  "files": {
+    "dynamic_text.shortcut": 23256,
+    "dynamic_map.shortcut": 23306,
+    "dynamic_both.shortcut": 23315,
+    "dynamic_silent.shortcut": 23134,
+    "dynamic_ask.shortcut": 22554,
+    "menu_text.shortcut": 22857,
+    "menu_map.shortcut": 22919,
+    "menu_both.shortcut": 22930,
+    "menu_silent.shortcut": 22706
+  },
+  "generated_at": "2026-11-19T16:35:53.841514"
+}

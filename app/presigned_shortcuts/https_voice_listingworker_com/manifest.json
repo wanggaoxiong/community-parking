@@ -1,0 +1,62 @@
+{
+  "base_url": "https://voice.listingworker.com",
+  "slug": "https_voice_listingworker_com",
+  "modes": [
+    "text",
+    "map",
+    "both",
+    "silent",
+    "ask"
+  ],
+  "unit_modes": [
+    "fixed",
+    "setup_once",
+    "menu"
+  ],
+  "fixed_units": [
+    "3-1",
+    "5-1",
+    "6-1",
+    "7-1",
+    "8-1",
+    "9-1",
+    "9-2",
+    "10-1"
+  ],
+  "files": {
+    "dynamic_text.shortcut": 23261,
+    "dynamic_map.shortcut": 23308,
+    "dynamic_both.shortcut": 23307,
+    "dynamic_silent.shortcut": 23135,
+    "dynamic_ask.shortcut": 22559,
+    "menu_text.shortcut": 22863,
+    "menu_map.shortcut": 22918,
+    "menu_both.shortcut": 22931,
+    "menu_silent.shortcut": 22710,
+    "fixed_text_3-1.shortcut": 22701,
+    "fixed_map_3-1.shortcut": 22816,
+    "fixed_both_3-1.shortcut": 22825,
+    "fixed_text_5-1.shortcut": 22704,
+    "fixed_map_5-1.shortcut": 22816,
+    "fixed_both_5-1.shortcut": 22832,
+    "fixed_text_6-1.shortcut": 22705,
+    "fixed_map_6-1.shortcut": 22819,
+    "fixed_both_6-1.shortcut": 22828,
+    "fixed_text_7-1.shortcut": 22705,
+    "fixed_map_7-1.shortcut": 22816,
+    "fixed_both_7-1.shortcut": 22828,
+    "fixed_text_8-1.shortcut": 22705,
+    "fixed_map_8-1.shortcut": 22818,
+    "fixed_both_8-1.shortcut": 22828,
+    "fixed_text_9-1.shortcut": 22703,
+    "fixed_map_9-1.shortcut": 22819,
+    "fixed_both_9-1.shortcut": 22828,
+    "fixed_text_9-2.shortcut": 22707,
+    "fixed_map_9-2.shortcut": 22815,
+    "fixed_both_9-2.shortcut": 22829,
+    "fixed_text_10-1.shortcut": 22711,
+    "fixed_map_10-1.shortcut": 22817,
+    "fixed_both_10-1.shortcut": 22828
+  },
+  "generated_at": "2026-11-19T16:38:40.438133"
+}

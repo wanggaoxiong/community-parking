@@ -1009,6 +1009,15 @@ class Database:
                 "updated_at": now,
             }
 
+    def delete_im_user_binding(self, channel: str, external_uid: str) -> None:
+        ch = str(channel or "siri").strip().lower()[:24] or "siri"
+        uid = str(external_uid or "").strip()[:128]
+        if not uid:
+            return
+        bkey = f"{ch}:{uid}"
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM im_user_bindings WHERE binding_key = ?", (bkey,))
+
     def list_im_user_bindings(self, channel: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
             if channel:

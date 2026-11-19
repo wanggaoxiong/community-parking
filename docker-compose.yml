@@ -24,6 +24,10 @@ services:
     stop_grace_period: 25s
     environment:
       - TZ=Asia/Shanghai
+      - PUBLIC_MOBILE_URL=${PUBLIC_MOBILE_URL:-}
+      - PUBLIC_VOICE_URL=${PUBLIC_VOICE_URL:-}
+      - VOICE_GATEWAY_TOKEN=${VOICE_GATEWAY_TOKEN:-}
+      - VOICE_ICLOUD_SHORTCUT_URL=${VOICE_ICLOUD_SHORTCUT_URL:-}
     ports:
       # 管理控制台默认仅暴露给宿主机回环口 (127.0.0.1:8790)，防止公网误扫管理端；
       # 如需局域网其他电脑管理，可设环境变量 PARKING_ADMIN_BIND=0.0.0.0

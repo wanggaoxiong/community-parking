@@ -6623,6 +6623,86 @@ class CommunityParkingSystemTests(unittest.TestCase):
             adm_srv.shutdown()
             adm_srv.server_close()
 
+    def test_ubuntu_presigned_multimode_shortcut_pack_and_ip_bind(self) -> None:
+        """Simulates Ubuntu 24.04 (`_can_macos_sign_shortcuts() == False`) and verifies `text`, `map`, `both`, `menu`, `ask`, and IP-bind fallback all serve real Apple-signed `AEA1` shortcuts."""
+        from unittest.mock import patch
+
+        config_manager.update(
+            {
+                "voice_gateway": {
+                    "public_voice_url": "https://voice.listingworker.com",
+                    "public_mobile_url": "",
+                }
+            }
+        )
+        # Simulate adding a brand-new unit `12-1` on Ubuntu AFTER the pre-signed pack was built
+        self.db.upsert_unit("12-1", "12号楼1单元", default_gate="south", map_x=52.0, map_y=48.0)
+
+        ctx = ParkingAppContext(database=self.db)
+        voice_srv = create_voice_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        v_port = voice_srv.server_address[1]
+        threading.Thread(target=voice_srv.serve_forever, daemon=True).start()
+        try:
+            with patch("app.voice_gateway._can_macos_sign_shortcuts", return_value=False):
+                # 1) Status auto-pairs `voice.listingworker.com` -> `parking.listingworker.com` & reports Ubuntu pack ready
+                with urllib.request.urlopen(f"http://127.0.0.1:{v_port}/api/voice/status", timeout=5) as r_ov:
+                    ov = json.loads(r_ov.read().decode("utf-8"))
+                self.assertEqual(ov["public_mobile_url"], "https://parking.listingworker.com")
+                self.assertEqual(ov["shortcut_delivery_mode"], "apple_signed_file")
+                self.assertTrue(ov["shortcut_signed_ready"])
+                self.assertIn("https://voice.listingworker.com", ov["gateway"]["presigned_pack_domains"])
+                self.assertIn("http://40.82.129.122:18791", ov["gateway"]["presigned_pack_domains"])
+
+                # 2) `/api/voice/units.txt` returns live newline-separated units including newly added `12-1`
+                with urllib.request.urlopen(f"http://127.0.0.1:{v_port}/api/voice/units.txt", timeout=5) as r_ut:
+                    units_txt = r_ut.read().decode("utf-8")
+                self.assertIn("(3-1)", units_txt)
+                self.assertIn("12号楼1单元 (12-1)", units_txt)
+
+                # 3) Every popup mode (`text`, `map`, `both`, `silent`) + `setup_once` + `menu` + `ask` returns `AEA1` signed bytes on Linux!
+                for query in (
+                    "unit=3-1&show_map=text",
+                    "unit=3-1&show_map=map",
+                    "unit=3-1&show_map=both",
+                    "unit=3-1&show_map=silent",
+                    "unit=3-1&unit_mode=setup_once&show_map=both",
+                    "unit=3-1&unit_mode=menu&show_map=map",
+                    "unit=12-1&unit_mode=fixed&show_map=both&prepare=1",
+                    "unit=12-1&unit_mode=fixed&show_map=both",
+                    "mode=ask&unit=3-1",
+                ):
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{v_port}/api/voice/siri.shortcut?{query}",
+                        headers={"CF-Connecting-IP": "198.51.100.88"},
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        raw_sc = resp.read()
+                        if "prepare=1" in query:
+                            prep_json = json.loads(raw_sc.decode("utf-8"))
+                            self.assertTrue(prep_json["ok"])
+                            self.assertTrue(prep_json["signed"])
+                        else:
+                            self.assertEqual(raw_sc[:4], b"AEA1", f"Expected AEA1 signed shortcut for {query}")
+
+                # 4) Verify `prepare=1` with `12-1` pre-bound `ip:198.51.100.88` so `check-bind` resolves `12-1` without `uid`
+                req_cb = urllib.request.Request(
+                    f"http://127.0.0.1:{v_port}/api/voice/check-bind",
+                    headers={"CF-Connecting-IP": "198.51.100.88"},
+                )
+                with urllib.request.urlopen(req_cb, timeout=5) as r_cb:
+                    self.assertEqual(r_cb.read().decode("utf-8"), "12-1")
+
+                # 5) Also verify direct VM IP pack (`http://40.82.129.122:18791`) serves `AEA1` on Linux
+                config_manager.update({"voice_gateway": {"public_voice_url": "http://40.82.129.122:18791"}})
+                for pm in ("text", "map", "both"):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{v_port}/api/voice/siri.shortcut?unit=8-1&show_map={pm}", timeout=5
+                    ) as r_ip:
+                        self.assertEqual(r_ip.read()[:4], b"AEA1")
+        finally:
+            voice_srv.shutdown()
+            voice_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

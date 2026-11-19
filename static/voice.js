@@ -179,7 +179,11 @@
     if (configuredUrl && configuredUrl.trim()) {
       return configuredUrl.trim();
     }
-    return `${window.location.protocol}//${window.location.hostname}:18790`;
+    const host = window.location.hostname || "127.0.0.1";
+    if (/^voice\./i.test(host) && host.length > 6) {
+      return `${window.location.protocol}//parking.${host.slice(6)}`;
+    }
+    return `${window.location.protocol}//${host}:18790`;
   }
 
   function sanitizeShortcutName(raw) {

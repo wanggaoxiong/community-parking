@@ -6703,6 +6703,217 @@ class CommunityParkingSystemTests(unittest.TestCase):
             voice_srv.shutdown()
             voice_srv.server_close()
 
+    def test_multilang_dialects_setup_once_wizard_and_geo_region_switching(self) -> None:
+        """Verifies Mandarin + Cantonese + English + Sichuanese + Northeastern broadcast, 2-step `setup_once` Shortcut wizard, `my-lang` slot dispatch, and Cloudflare geo-region switching."""
+        import plistlib
+        import re
+        from urllib.parse import quote
+
+        ctx = ParkingAppContext(database=self.db)
+        voice_srv = create_voice_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        v_port = voice_srv.server_address[1]
+        threading.Thread(target=voice_srv.serve_forever, daemon=True).start()
+        try:
+            # 1) `/api/voice/languages.txt` returns only non-blocking pre-installed voices (`zh-CN`, `zh-HK`, `en-US`) for visual Shortcuts,
+            #    includes `zh-NE` when `audio=cloud` (`silent` mode), and all 5+ languages when `include_dialects=1`!
+            with urllib.request.urlopen(f"http://127.0.0.1:{v_port}/api/voice/languages.txt", timeout=5) as rl_def:
+                default_lines = rl_def.read().decode("utf-8").splitlines()
+            self.assertEqual(len(default_lines), 3)
+            for tag in ("[zh-CN]", "[zh-HK]", "[en-US]"):
+                self.assertTrue(any(tag in ln for ln in default_lines), f"Missing {tag}")
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/languages.txt?audio=cloud", timeout=5
+            ) as rl_cloud:
+                cloud_lines = rl_cloud.read().decode("utf-8").splitlines()
+            self.assertEqual(len(cloud_lines), 4)
+            self.assertTrue(any("[zh-NE]" in ln for ln in cloud_lines))
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/languages.txt?include_dialects=1", timeout=5
+            ) as rl_all:
+                all_lines = rl_all.read().decode("utf-8").splitlines()
+            self.assertEqual(len(all_lines), 5)
+            for tag in ("[zh-CN]", "[zh-HK]", "[en-US]", "[zh-SC]", "[zh-NE]"):
+                self.assertTrue(any(tag in ln for ln in all_lines), f"Missing {tag}")
+
+            # 2) Geo-region switching via `CF-Region-Code` promotes Sichuanese (`SC`) to #2, and activates Shaanxi (`SN`, Cloud `晓妮`)!
+            req_sc = urllib.request.Request(
+                f"http://127.0.0.1:{v_port}/api/voice/languages.txt?include_dialects=1",
+                headers={"CF-Region-Code": "SC"},
+            )
+            with urllib.request.urlopen(req_sc, timeout=5) as rl_sc:
+                sc_lines = rl_sc.read().decode("utf-8").splitlines()
+            self.assertIn("[zh-CN]", sc_lines[0])
+            self.assertIn("[zh-SC]", sc_lines[1])
+
+            req_sn = urllib.request.Request(
+                f"http://127.0.0.1:{v_port}/api/voice/languages.txt?audio=cloud",
+                headers={"CF-Region-Code": "SN"},
+            )
+            with urllib.request.urlopen(req_sn, timeout=5) as rl_sn:
+                sn_lines = rl_sn.read().decode("utf-8").splitlines()
+            self.assertIn("[zh-SN]", sn_lines[1])
+            self.assertEqual(len(sn_lines), 5)
+
+            # 3) Verify localized speech phrasing across all 5 core languages (`format=json` Web & `dialect_ready=1` Shortcuts)
+            expected_checks = [
+                ("zh-CN", 1, "欢迎回家", "再为您重复播报一遍"),
+                ("zh-HK", 2, "歡迎返屋企", "再為您重複播報一次"),
+                ("en-US", 3, "Welcome home!", "Repeating once more:"),
+                ("zh-SC", 4, "巴适得很", "再给您摆一遍哈"),
+                ("zh-NE", 5, "妥妥滴", "再给您念叨一遍哈"),
+            ]
+            for lcode, slot_len, kw_single, kw_rep in expected_checks:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{v_port}/api/voice/brief?unit=3-1&repeat=2&lang={lcode}", timeout=5
+                ) as rb:
+                    b_json = json.loads(rb.read().decode("utf-8"))
+                self.assertEqual(b_json["voice_lang"], lcode)
+                self.assertIn(kw_single, b_json["single_text"])
+                self.assertIn(kw_rep, b_json["speech_text"])
+                if lcode == "en-US":
+                    # English speech must contain ZERO CJK characters so Apple `Samantha` speaks fluently!
+                    self.assertIsNone(re.search(r"[\u4e00-\u9fff]", b_json["speech_text"]))
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{v_port}/api/voice/my-lang?lang={lcode}&dialect_ready=1", timeout=5
+                ) as rml:
+                    slot_tok = rml.read().decode("utf-8")
+                self.assertEqual(len(slot_tok), slot_len)
+
+            # 4) Verify `zh-NE` falls back cleanly to `zh-CN` in visual Shortcut endpoints (unless `dialect_ready=1` or `audio=cloud`),
+            #    while `/api/voice/tts.mp3` serves `audio/mpeg` for Web & `silent` Shortcuts!
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/my-lang?lang=zh-NE", timeout=5
+            ) as rml_ne_vis:
+                self.assertEqual(len(rml_ne_vis.read().decode("utf-8")), 1)
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/my-lang?lang=zh-NE&audio=cloud", timeout=5
+            ) as rml_ne_cloud:
+                self.assertEqual(len(rml_ne_cloud.read().decode("utf-8")), 5)
+
+            from unittest.mock import patch as _mock_patch
+            with _mock_patch.object(ctx.voice_gateway, "synthesize_tts_mp3", return_value=b"ID3" + b"\x00" * 512):
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{v_port}/api/voice/tts.mp3?unit=3-1&lang=zh-NE", timeout=5
+                ) as r_mp3:
+                    self.assertEqual(r_mp3.headers.get("Content-Type"), "audio/mpeg")
+                    self.assertGreater(len(r_mp3.read()), 500)
+
+            menu_pick_sc = quote("🌶️ 四川话 · 川渝方言 [zh-SC]")
+            unit_pick = quote("3号楼1单元（中心区） (3-1)")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/quick-bind?uid=sc_test_u1&unit={unit_pick}&lang={menu_pick_sc}",
+                timeout=5,
+            ) as rqb:
+                self.assertEqual(rqb.read().decode("utf-8"), "3-1")
+
+            # Without `dialect_ready=1`, `zh-SC` MUST automatically fall back to `zh-CN` (slot len 1, Mandarin text)!
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/my-lang?uid=sc_test_u1", timeout=5
+            ) as rml_safe:
+                self.assertEqual(len(rml_safe.read().decode("utf-8")), 1)
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/brief?uid=sc_test_u1&format=speech", timeout=5
+            ) as rbr_safe:
+                safe_speech = rbr_safe.read().decode("utf-8")
+            self.assertIn("欢迎回家", safe_speech)
+            self.assertNotIn("巴适得很", safe_speech)
+
+            # With `dialect_ready=1` (device has Apple `盼盼` installed), dialect text & slot 4 are preserved!
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/brief?uid=sc_test_u1&format=speech&dialect_ready=1", timeout=5
+            ) as rbr_ready:
+                self.assertIn("巴适得很", rbr_ready.read().decode("utf-8"))
+
+            # And Cantonese (`zh-HK`, pre-installed `Sinji`) works out-of-the-box without `dialect_ready`!
+            menu_pick_hk = quote("🇭🇰 粤语 · 广东话 [zh-HK]")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/quick-bind?uid=sc_test_hk&unit=3-1&lang={menu_pick_hk}",
+                timeout=5,
+            ) as rqb_hk:
+                self.assertEqual(rqb_hk.read().decode("utf-8"), "3-1")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/my-lang?uid=sc_test_hk", timeout=5
+            ) as rml_hk:
+                self.assertEqual(len(rml_hk.read().decode("utf-8")), 2)
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/brief?uid=sc_test_hk&format=speech", timeout=5
+            ) as rbr_hk:
+                self.assertIn("歡迎返屋企", rbr_hk.read().decode("utf-8"))
+
+            # 5) CRITICAL REGRESSION: `show_map=both` MUST NEVER emit `notification` or blocking `playsound`,
+            #    so Text + Dynamic Map ALWAYS pop up simultaneously in ONE Quick Look view!
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/siri.shortcut?unit=3-1&unit_mode=setup_once&lang=ask_once&show_map=both&device_uid=sc_wiz99&raw=1",
+                timeout=5,
+            ) as r_plist:
+                sc_plist = plistlib.loads(r_plist.read())
+            plist_dump_str = json.dumps(sc_plist, ensure_ascii=False, default=str)
+            self.assertNotIn("is.workflow.actions.splittext", plist_dump_str)
+            self.assertNotIn("is.workflow.actions.notification", plist_dump_str)
+            self.assertNotIn("is.workflow.actions.playsound", plist_dump_str)
+            self.assertIn("is.workflow.actions.text.split", plist_dump_str)
+            self.assertIn("is.workflow.actions.previewdocument", plist_dump_str)
+            self.assertIn("/api/voice/languages.txt", plist_dump_str)
+            self.assertIn("/api/voice/my-lang", plist_dump_str)
+            self.assertIn("&lang=", plist_dump_str)
+            speak_params = [
+                a["WFWorkflowActionParameters"]
+                for a in sc_plist["WFWorkflowActions"]
+                if a["WFWorkflowActionIdentifier"] == "is.workflow.actions.speaktext"
+            ]
+            speak_langs = {p.get("WFSpeakTextLanguage") for p in speak_params}
+            speak_voices = {p.get("WFSpeakTextVoice") for p in speak_params if p.get("WFSpeakTextVoice")}
+            for expected_apple_tts in ("zh-CN", "yue-HK", "en-US", "zh-TW"):
+                self.assertIn(expected_apple_tts, speak_langs)
+            self.assertNotIn("zh-HK", speak_langs)  # `zh-HK` is rejected by ActionKit; must be `yue-HK`!
+            self.assertIn("com.apple.voice.compact.zh-HK.Sinji", speak_voices)
+            self.assertIn("com.apple.voice.compact.en-US.Samantha", speak_voices)
+            self.assertIn("com.apple.voice.compact.zh-CN-u-sd-cnsc.Fangfang", speak_voices)
+            self.assertIn("com.apple.voice.enhanced.zh-CN-u-sd-cnln.Dongmei", speak_voices)
+
+            # Meanwhile `show_map=silent` (pure audio, zero popup to block) DOES allow `playsound` + `tts.mp3` for `zh-NE`!
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/siri.shortcut?unit=3-1&unit_mode=fixed&lang=zh-NE&show_map=silent&raw=1",
+                timeout=5,
+            ) as r_plist_silent_ne:
+                silent_ne_dump = json.dumps(plistlib.loads(r_plist_silent_ne.read()), ensure_ascii=False, default=str)
+            self.assertNotIn("is.workflow.actions.notification", silent_ne_dump)
+            self.assertIn("is.workflow.actions.playsound", silent_ne_dump)
+            self.assertIn("/api/voice/tts.mp3", silent_ne_dump)
+
+            # And `setup_once` with explicit language (`lang=zh-HK`, `show_map=both`) skips `languages.txt` step and has ZERO notification/playsound!
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/siri.shortcut?unit=3-1&unit_mode=setup_once&lang=zh-HK&show_map=both&device_uid=sc_wiz_hk&raw=1",
+                timeout=5,
+            ) as r_plist_ne:
+                ne_plist = plistlib.loads(r_plist_ne.read())
+            ne_dump = json.dumps(ne_plist, ensure_ascii=False, default=str)
+            self.assertNotIn("is.workflow.actions.splittext", ne_dump)
+            self.assertNotIn("is.workflow.actions.notification", ne_dump)
+            self.assertNotIn("is.workflow.actions.playsound", ne_dump)
+            self.assertNotIn("/api/voice/languages.txt", ne_dump)
+            self.assertIn("lang=zh-HK", ne_dump)
+
+            # 6) Verify natural voice command switching via `/api/voice/ask` ("切换东北话播报")
+            req_ask_ne = urllib.request.Request(
+                f"http://127.0.0.1:{v_port}/api/voice/ask",
+                data=json.dumps({"question": "切换东北话播报", "uid": "sc_test_u1"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_ask_ne, timeout=5) as r_ne:
+                ne_res = json.loads(r_ne.read().decode("utf-8"))
+            self.assertEqual(ne_res["engine"], "fast_bind")
+            self.assertEqual(ne_res["voice_lang"], "zh-NE")
+            self.assertIn("妥妥滴", ne_res["answer"])
+        finally:
+            voice_srv.shutdown()
+            voice_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

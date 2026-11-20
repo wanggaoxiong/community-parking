@@ -918,6 +918,7 @@ class Database:
                     unit_id TEXT NOT NULL DEFAULT '8-1',
                     repeat_count INTEGER NOT NULL DEFAULT 2,
                     vehicle_type TEXT NOT NULL DEFAULT 'standard',
+                    voice_lang TEXT NOT NULL DEFAULT 'zh-CN',
                     updated_at REAL NOT NULL
                 );
                 """
@@ -963,6 +964,7 @@ class Database:
         repeat_count: int = 2,
         vehicle_type: str = "standard",
         display_name: str = "",
+        voice_lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         ch = str(channel or "siri").strip().lower()[:24] or "siri"
         uid = str(external_uid or "").strip()[:128]
@@ -972,28 +974,36 @@ class Database:
         rep = 1 if int(repeat_count or 2) <= 1 else 2
         vtype = "compact" if str(vehicle_type or "").strip().lower() == "compact" else "standard"
         dname = str(display_name or "").strip()[:64]
+        vlang_in = str(voice_lang or "").strip()[:24]
         bkey = f"{ch}:{uid}"
         now = time.time()
         with self._lock, self._connect() as conn:
             prev = conn.execute(
-                "SELECT display_name FROM im_user_bindings WHERE binding_key = ?", (bkey,)
+                "SELECT display_name, voice_lang FROM im_user_bindings WHERE binding_key = ?", (bkey,)
             ).fetchone()
             if not dname and prev and prev["display_name"]:
                 dname = str(prev["display_name"])
+            if vlang_in:
+                eff_vlang = vlang_in
+            elif prev and prev["voice_lang"]:
+                eff_vlang = str(prev["voice_lang"])
+            else:
+                eff_vlang = "zh-CN"
             conn.execute(
                 """
                 INSERT INTO im_user_bindings (
                     binding_key, channel, external_uid, display_name,
-                    unit_id, repeat_count, vehicle_type, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    unit_id, repeat_count, vehicle_type, voice_lang, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(binding_key) DO UPDATE SET
                     display_name = excluded.display_name,
                     unit_id = excluded.unit_id,
                     repeat_count = excluded.repeat_count,
                     vehicle_type = excluded.vehicle_type,
+                    voice_lang = excluded.voice_lang,
                     updated_at = excluded.updated_at
                 """,
-                (bkey, ch, uid, dname, uid_clean, rep, vtype, now),
+                (bkey, ch, uid, dname, uid_clean, rep, vtype, eff_vlang, now),
             )
             row = conn.execute(
                 "SELECT * FROM im_user_bindings WHERE binding_key = ?", (bkey,)
@@ -1006,6 +1016,7 @@ class Database:
                 "unit_id": uid_clean,
                 "repeat_count": rep,
                 "vehicle_type": vtype,
+                "voice_lang": eff_vlang,
                 "updated_at": now,
             }
 
@@ -1094,6 +1105,10 @@ class Database:
         ):
             if col_name not in unit_cols:
                 conn.execute(f"ALTER TABLE units ADD COLUMN {col_name} {col_def}")
+
+        bind_cols = {r["name"] for r in conn.execute("PRAGMA table_info(im_user_bindings)").fetchall()}
+        if "voice_lang" not in bind_cols:
+            conn.execute("ALTER TABLE im_user_bindings ADD COLUMN voice_lang TEXT NOT NULL DEFAULT 'zh-CN'")
 
     def _seed_if_empty(self) -> None:
         with self._lock, self._connect() as conn:

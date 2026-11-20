@@ -87,9 +87,19 @@
               </select>
             </div>
 
+            <div class="vg-select-wrap vg-compact-select" title="播报语言与方言">
+              <select id="vgLangSelect" class="vg-sub-select" aria-label="选择播报语言与方言">
+                <option value="zh-CN">🎙️ 普通话</option>
+                <option value="zh-HK">🇭🇰 粤语</option>
+                <option value="en-US">🌐 English</option>
+                <option value="zh-SC">🌶️ 四川话</option>
+                <option value="zh-NE">❄️ 东北话</option>
+              </select>
+            </div>
+
             <div class="vg-select-wrap vg-compact-select" title="语音音色">
               <select id="vgVoiceSelect" class="vg-sub-select" aria-label="选择语音音色">
-                <option value="">🎙️ 默认音色</option>
+                <option value="">🔊 自动音色</option>
               </select>
             </div>
           </div>
@@ -241,6 +251,20 @@
                 <option value="fixed" selected>绑定上方单元（一键秒加）</option>
                 <option value="setup_once">首次运行选一次，之后免选</option>
                 <option value="menu">每次运行时弹窗选单元</option>
+              </select>
+            </div>
+
+            <div class="ios-row">
+              <label class="ios-row-label" for="vgShortcutLangSelect">
+                <strong>播报语言</strong>
+                <span id="vgLangTargetHint">支持普通话、粤语、英文、川渝与东北话</span>
+              </label>
+              <select id="vgShortcutLangSelect" class="ios-row-select">
+                <option value="zh-CN" selected>🎙️ 普通话（标准播报）</option>
+                <option value="zh-HK">🇭🇰 粤语 · 广东话</option>
+                <option value="en-US">🌐 English（英文播报）</option>
+                <option value="zh-SC">🌶️ 四川话 · 川渝方言</option>
+                <option value="zh-NE">❄️ 东北话 · 东北方言</option>
               </select>
             </div>
 

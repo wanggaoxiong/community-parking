@@ -1,6 +1,7 @@
 {
   "base_url": "http://40.82.129.122:18791",
   "slug": "http_40_82_129_122_18791",
+  "pack_version": "2.0-multilang",
   "modes": [
     "text",
     "map",
@@ -13,17 +14,50 @@
     "setup_once",
     "menu"
   ],
+  "voice_languages": [
+    "zh-CN",
+    "zh-HK",
+    "en-US",
+    "zh-SC",
+    "zh-NE",
+    "zh-SN",
+    "zh-TW"
+  ],
   "fixed_units": [],
   "files": {
-    "dynamic_text.shortcut": 23256,
-    "dynamic_map.shortcut": 23306,
-    "dynamic_both.shortcut": 23315,
-    "dynamic_silent.shortcut": 23134,
-    "dynamic_ask.shortcut": 22554,
-    "menu_text.shortcut": 22857,
-    "menu_map.shortcut": 22919,
-    "menu_both.shortcut": 22930,
-    "menu_silent.shortcut": 22706
+    "dynamic_text.shortcut": 24336,
+    "dynamic_map.shortcut": 24368,
+    "dynamic_both.shortcut": 24383,
+    "dynamic_silent.shortcut": 24298,
+    "dynamic_ask.shortcut": 23609,
+    "menu_text.shortcut": 23862,
+    "dynamic_text_zh-HK.shortcut": 23357,
+    "menu_text_zh-HK.shortcut": 22947,
+    "dynamic_text_en-US.shortcut": 23356,
+    "menu_text_en-US.shortcut": 22936,
+    "dynamic_text_zh-NE.shortcut": 23360,
+    "menu_text_zh-NE.shortcut": 22954,
+    "menu_map.shortcut": 23801,
+    "dynamic_map_zh-HK.shortcut": 23398,
+    "menu_map_zh-HK.shortcut": 23001,
+    "dynamic_map_en-US.shortcut": 23402,
+    "menu_map_en-US.shortcut": 22999,
+    "dynamic_map_zh-NE.shortcut": 23402,
+    "menu_map_zh-NE.shortcut": 23010,
+    "menu_both.shortcut": 23800,
+    "dynamic_both_zh-HK.shortcut": 23395,
+    "menu_both_zh-HK.shortcut": 23012,
+    "dynamic_both_en-US.shortcut": 23403,
+    "menu_both_en-US.shortcut": 23009,
+    "dynamic_both_zh-NE.shortcut": 23417,
+    "menu_both_zh-NE.shortcut": 23024,
+    "menu_silent.shortcut": 23845,
+    "dynamic_silent_zh-HK.shortcut": 23238,
+    "menu_silent_zh-HK.shortcut": 22797,
+    "dynamic_silent_en-US.shortcut": 23238,
+    "menu_silent_en-US.shortcut": 22802,
+    "dynamic_silent_zh-NE.shortcut": 23196,
+    "menu_silent_zh-NE.shortcut": 22795
   },
-  "generated_at": "2026-11-19T16:35:53.841514"
+  "generated_at": "2026-11-20T20:22:18.633833"
 }

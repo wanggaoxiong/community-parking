@@ -19,7 +19,10 @@
   const LS_VEHICLE = `cp_voice_${WS_KEY_PREFIX}vehicle`;
   const LS_REPEAT = `cp_voice_${WS_KEY_PREFIX}repeat`;
   const LS_TOKEN = `cp_voice_${WS_KEY_PREFIX}token`;
+  const LS_VOICE_LANG = `cp_voice_${WS_KEY_PREFIX}voice_lang`;
+  const LS_SC_LANG = `cp_voice_${WS_KEY_PREFIX}sc_voice_lang`;
   const LS_VOICE_URI = `cp_voice_${WS_KEY_PREFIX}tts_uri`;
+  const LS_VOICE_URI_MAP = `cp_voice_${WS_KEY_PREFIX}tts_uri_map`;
   const LS_SC_NAME = `cp_voice_${WS_KEY_PREFIX}sc_name`;
   const LS_SC_UNIT_MODE = `cp_voice_${WS_KEY_PREFIX}sc_unit_mode_v2`;
   const LS_SC_ACTION = `cp_voice_${WS_KEY_PREFIX}sc_action`;
@@ -71,12 +74,24 @@
     return null;
   }
 
+  function loadSavedVoiceUriMap() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(LS_VOICE_URI_MAP) || "{}");
+      if (raw && typeof raw === "object") return raw;
+    } catch (_e) {}
+    return {};
+  }
+
   const savedUnitMode = localStorage.getItem(LS_SC_UNIT_MODE) || "";
   const savedMapApp = localStorage.getItem(LS_MAP_APP) || "";
   const state = {
     workspaceId: WORKSPACE_ID,
     deviceUid: ensureDeviceUid(),
     preferredVoiceLang: "",
+    voiceLanguages: [],
+    voiceLang: localStorage.getItem(LS_VOICE_LANG) || "",
+    shortcutLang: localStorage.getItem(LS_SC_LANG) || "",
+    voiceUriByLang: loadSavedVoiceUriMap(),
     activePage: "live", // "live" | "ai" | "shortcut"
     generatingShortcut: false,
     token: "",
@@ -101,6 +116,7 @@
     latestSpeech: "",
     latestAnswer: "",
     speaking: false,
+    activeAudio: null,
     speechSessionId: 0,
     speechPollTimer: null,
     speechWatchdogTimer: null,
@@ -141,6 +157,10 @@
   if (urlParams.get("unit")) {
     state.unitId = urlParams.get("unit").trim();
     localStorage.setItem(LS_UNIT, state.unitId);
+  }
+  if (urlParams.get("lang") || urlParams.get("voice_lang")) {
+    state.voiceLang = (urlParams.get("lang") || urlParams.get("voice_lang") || "").trim();
+    if (state.voiceLang) localStorage.setItem(LS_VOICE_LANG, state.voiceLang);
   }
   if (urlParams.get("autostart") === "1") {
     state.autostartRequested = true;
@@ -201,6 +221,9 @@
   function classifyVoiceDialect(v) {
     const lang = String(v.lang || "").toLowerCase();
     const name = String(v.name || "");
+    if (lang.startsWith("en") || /samantha|ava|allison|alex|daniel|karen/i.test(name)) {
+      return { group: "english", tag: "English" };
+    }
     if (
       lang.includes("hk") ||
       lang.includes("mo") ||
@@ -209,16 +232,29 @@
     ) {
       return { group: "cantonese", tag: "粤语" };
     }
-    if (/liaoning|晓北|东北/i.test(`${lang} ${name}`)) {
+    if (/cnsc|sichuan|fangfang|盼盼|四川|川渝/i.test(`${lang} ${name}`)) {
+      return { group: "dialect", tag: "四川话" };
+    }
+    if (/cnln|liaoning|dongmei|冬梅|晓北|东北/i.test(`${lang} ${name}`)) {
       return { group: "dialect", tag: "东北话" };
     }
-    if (/shaanxi|晓妮|陕西/i.test(`${lang} ${name}`)) {
+    if (/cnsn|shaanxi|haohao|浩浩|晓妮|陕西/i.test(`${lang} ${name}`)) {
       return { group: "dialect", tag: "陕西话" };
     }
-    if (lang.includes("tw") || /mei[-_ ]?jia|美佳|hsiaochen|hsiaoyu|yunjhe|曉臻|曉雨|雲哲/i.test(name)) {
+    if (lang.includes("tw") || /mei[-_ ]?jia|美佳|美嘉|hsiaochen|hsiaoyu|yunjhe|曉臻|曉雨|雲哲/i.test(name)) {
       return { group: "dialect", tag: "台湾腔" };
     }
     return { group: "mandarin", tag: "普通话" };
+  }
+
+  function voiceLangToBcp47Fallback(code) {
+    const c = String(code || "zh-CN").trim();
+    if (c === "zh-HK") return "zh-HK";
+    if (c === "en-US") return "en-US";
+    if (c === "zh-NE") return "zh-CN";
+    if (c === "zh-SC") return "zh-CN";
+    if (c === "zh-TW") return "zh-TW";
+    return "zh-CN";
   }
 
   function isCloudOnlineVoice(v) {
@@ -230,6 +266,9 @@
     if (v) {
       const info = classifyVoiceDialect(v);
       const raw = String(v.lang || "").trim().replace(/_/g, "-");
+      if (info.group === "english") {
+        return /^en/i.test(raw) ? raw : "en-US";
+      }
       if (info.group === "cantonese") {
         return /^(zh-HK|zh-MO|yue)/i.test(raw) ? raw : "zh-HK";
       }
@@ -241,27 +280,117 @@
     return String(fallbackLang || "zh-CN").trim().replace(/_/g, "-") || "zh-CN";
   }
 
+  function doesVoiceMatchLangCode(v, langCode) {
+    if (!v) return false;
+    const info = classifyVoiceDialect(v);
+    const code = String(langCode || "zh-CN").trim();
+    if (code === "zh-HK") return info.group === "cantonese";
+    if (code === "en-US") return info.group === "english";
+    if (code === "zh-SC") return info.tag === "四川话";
+    if (code === "zh-NE") return info.tag === "东北话";
+    if (code === "zh-SN") return info.tag === "陕西话";
+    if (code === "zh-TW") return info.tag === "台湾腔";
+    return info.group === "mandarin";
+  }
+
+  function isCloudTtsReadyForLang(langCode) {
+    const code = String(langCode || "").trim();
+    const found = (state.voiceLanguages || []).find((x) => x.code === code);
+    if (found && typeof found.cloud_tts_ready === "boolean") {
+      return found.cloud_tts_ready;
+    }
+    return code === "zh-NE" || code === "zh-SN";
+  }
+
+  function hasLocalAppleDialectPack(langCode) {
+    const code = String(langCode || "zh-CN").trim();
+    if (!("speechSynthesis" in window)) return false;
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return false;
+    return voices.some(
+      (v) =>
+        !isCloudOnlineVoice(v) &&
+        !/microsoft/i.test(`${v.name || ""} ${v.voiceURI || ""}`) &&
+        doesVoiceMatchLangCode(v, code)
+    );
+  }
+
+  function hasBrowserVoiceForLang(langCode) {
+    const code = String(langCode || "zh-CN").trim();
+    if (!code || code === "zh-CN") return true;
+    if (isCloudTtsReadyForLang(code)) return true;
+    if (!("speechSynthesis" in window)) return false;
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return null; // still loading asynchronously
+    return voices.some((v) => doesVoiceMatchLangCode(v, code));
+  }
+
+  function hasAppleOfflineShortcutVoiceForLang(langCode, popupModeOverride) {
+    const code = String(langCode || "zh-CN").trim();
+    const pmode = String(popupModeOverride || state.popupMode || "text").trim();
+    if (code === "ask_once") return true;
+    // Mandarin, Cantonese (Sinji), English (Samantha), and Taiwan Mandarin (Meijia) are pre-installed
+    // and launch simultaneously (`0ms`) with `文字 + 平面图同屏`!
+    if (!code || code === "zh-CN" || code === "zh-HK" || code === "en-US" || code === "zh-TW") {
+      return true;
+    }
+    // In `silent` (pure voice, no popup) mode, `zh-NE` / `zh-SN` can play Cloud Neural `晓北`/`晓妮` without blocking any UI!
+    if (pmode === "silent" && isCloudTtsReadyForLang(code)) {
+      return true;
+    }
+    return hasLocalAppleDialectPack(code);
+  }
+
+  function getLangDisplayShortName(code) {
+    const map = {
+      "zh-CN": "普通话",
+      "zh-HK": "粤语",
+      "en-US": "English",
+      "zh-SC": "四川话",
+      "zh-NE": "东北话",
+      "zh-SN": "陕西话",
+      "zh-TW": "闽台国语",
+    };
+    return map[code] || code;
+  }
+
   function formatVoiceLabel(v) {
     const info = classifyVoiceDialect(v);
-    const rawName = String(v.name || v.voiceURI || "中文语音")
+    const rawName = String(v.name || v.voiceURI || "语音")
       .replace(/^Microsoft\s+/i, "")
-      .replace(/\s*Online\s*\(Natural\)\s*-\s*Chinese.*$/i, "")
-      .replace(/\s*-\s*Chinese.*$/i, "")
+      .replace(/\s*Online\s*\(Natural\)\s*-\s*(Chinese|English).*$/i, "")
+      .replace(/\s*-\s*(Chinese|English).*$/i, "")
       .trim();
     const isOnline = isCloudOnlineVoice(v);
-    return `${isOnline ? "✨" : "⚡"} ${rawName} · ${info.tag} (${isOnline ? "联网" : "本地"})`;
+    return `${isOnline ? "✨" : "⚡"} ${rawName} (${isOnline ? "联网" : "本地"})`;
+  }
+
+  function getPinnedVoiceUriForLang(langCode) {
+    const code = String(langCode || state.voiceLang || "zh-CN").trim();
+    return String((state.voiceUriByLang && state.voiceUriByLang[code]) || "").trim();
+  }
+
+  function setPinnedVoiceUriForLang(langCode, uri) {
+    const code = String(langCode || state.voiceLang || "zh-CN").trim();
+    if (!state.voiceUriByLang) state.voiceUriByLang = {};
+    if (uri) {
+      state.voiceUriByLang[code] = uri;
+    } else {
+      delete state.voiceUriByLang[code];
+    }
+    try {
+      localStorage.setItem(LS_VOICE_URI_MAP, JSON.stringify(state.voiceUriByLang));
+    } catch (_e) {}
   }
 
   function populateVoiceOptions() {
     const sel = el("vgVoiceSelect");
     if (!sel || !("speechSynthesis" in window)) return;
+    const activeLang = String(state.voiceLang || state.preferredVoiceLang || "zh-CN").trim();
     const allVoices = window.speechSynthesis.getVoices() || [];
-    const zhVoices = allVoices.filter((v) =>
-      /^zh|chinese|cmn|yue|cantonese|sin[-_ ]?ji|善怡|tingting|婷婷|mei[-_ ]?jia|美佳/i.test(
-        `${v.lang || ""} ${v.name || ""}`
-      )
-    );
-    zhVoices.sort((a, b) => {
+    // Strictly filter timbres to ONLY the currently selected language (`activeLang`) — ZERO cross-language conflict!
+    const matchingVoices = allVoices.filter((v) => doesVoiceMatchLangCode(v, activeLang));
+    matchingVoices.sort((a, b) => {
       const aCloud = isCloudOnlineVoice(a) ? 1 : 0;
       const bCloud = isCloudOnlineVoice(b) ? 1 : 0;
       if (aCloud !== bCloud) return aCloud - bCloud;
@@ -271,85 +400,93 @@
       return String(a.name || "").localeCompare(String(b.name || ""), "zh-CN");
     });
 
-    const cur = state.voiceUri || "";
+    const cur = getPinnedVoiceUriForLang(activeLang);
     sel.innerHTML = "";
+    const langTag = getLangDisplayShortName(activeLang);
     const defOpt = document.createElement("option");
     defOpt.value = "";
-    defOpt.textContent = "🎙️ 默认自带 (秒响)";
+    if (activeLang === "en-US") {
+      defOpt.textContent = "🔊 Auto (English)";
+    } else if (activeLang === "zh-NE" && !matchingVoices.length && isCloudTtsReadyForLang("zh-NE")) {
+      defOpt.textContent = "✨ 晓北 · 东北原声";
+    } else {
+      defOpt.textContent = `🔊 自动优选 (${langTag})`;
+    }
     sel.appendChild(defOpt);
 
-    const groups = {
-      mandarin: { label: "普通话 · 国语", items: [] },
-      cantonese: { label: "粤语 · 广东话 (善怡等)", items: [] },
-      dialect: { label: "台湾腔与特色方言", items: [] },
-    };
     const seen = new Set();
     const seenLabels = new Set();
-    zhVoices.forEach((v) => {
+    matchingVoices.forEach((v) => {
       const uri = String(v.voiceURI || v.name || "").trim();
       if (!uri || seen.has(uri)) return;
       const lbl = formatVoiceLabel(v);
       if (seenLabels.has(lbl) && uri !== cur) return;
       seen.add(uri);
       seenLabels.add(lbl);
-      const info = classifyVoiceDialect(v);
-      groups[info.group].items.push({ uri, label: lbl });
+      const opt = document.createElement("option");
+      opt.value = uri;
+      opt.textContent = lbl;
+      sel.appendChild(opt);
     });
 
-    ["mandarin", "cantonese", "dialect"].forEach((gk) => {
-      const grp = groups[gk];
-      if (!grp.items.length) return;
-      const og = document.createElement("optgroup");
-      og.label = grp.label;
-      grp.items.forEach((it) => {
-        const opt = document.createElement("option");
-        opt.value = it.uri;
-        opt.textContent = it.label;
-        og.appendChild(opt);
-      });
-      sel.appendChild(og);
-    });
-    sel.value = cur && seen.has(cur) ? cur : "";
+    if (cur && seen.has(cur)) {
+      sel.value = cur;
+    } else {
+      sel.value = "";
+      if (cur && allVoices.length > 0) {
+        setPinnedVoiceUriForLang(activeLang, "");
+      }
+    }
   }
 
   function resolveSelectedVoice(preferLocalFallbackForLang) {
     if (!("speechSynthesis" in window)) return null;
     const voices = window.speechSynthesis.getVoices() || [];
+    const activeLang = String(state.voiceLang || state.preferredVoiceLang || "zh-CN").trim();
     if (preferLocalFallbackForLang) {
-      const target = String(preferLocalFallbackForLang).toLowerCase();
       return (
         voices.find(
-          (v) =>
-            !isCloudOnlineVoice(v) &&
-            normalizeVoiceBcp47Lang(v, "").toLowerCase().startsWith(target.slice(0, 5))
+          (v) => !isCloudOnlineVoice(v) && doesVoiceMatchLangCode(v, activeLang)
         ) || null
       );
     }
-    if (state.voiceUri) {
+    const pinnedUri = getPinnedVoiceUriForLang(activeLang);
+    if (pinnedUri) {
       const matches = voices.filter(
-        (v) => v.voiceURI === state.voiceUri || v.name === state.voiceUri
+        (v) =>
+          (v.voiceURI === pinnedUri || v.name === pinnedUri) &&
+          doesVoiceMatchLangCode(v, activeLang)
       );
       if (matches.length) {
         return matches.find((v) => v.localService !== false) || matches[0];
       }
-      return null;
     }
-    const prefLang = String(state.preferredVoiceLang || "")
-      .trim()
-      .replace(/_/g, "-")
-      .toLowerCase();
-    if (prefLang) {
-      const localPref = voices.find(
-        (v) =>
-          !isCloudOnlineVoice(v) &&
-          normalizeVoiceBcp47Lang(v, "").toLowerCase().startsWith(prefLang)
+    if (activeLang === "en-US") {
+      return (
+        voices.find((v) => !isCloudOnlineVoice(v) && /samantha/i.test(String(v.name || ""))) ||
+        voices.find((v) => !isCloudOnlineVoice(v) && doesVoiceMatchLangCode(v, "en-US")) ||
+        voices.find((v) => doesVoiceMatchLangCode(v, "en-US")) ||
+        null
       );
-      if (localPref) return localPref;
+    }
+    if (activeLang === "zh-HK") {
+      return (
+        voices.find((v) => !isCloudOnlineVoice(v) && doesVoiceMatchLangCode(v, "zh-HK")) ||
+        voices.find((v) => doesVoiceMatchLangCode(v, "zh-HK")) ||
+        null
+      );
+    }
+    if (activeLang === "zh-SC" || activeLang === "zh-NE" || activeLang === "zh-SN" || activeLang === "zh-TW") {
+      return (
+        voices.find((v) => !isCloudOnlineVoice(v) && doesVoiceMatchLangCode(v, activeLang)) ||
+        voices.find((v) => doesVoiceMatchLangCode(v, activeLang)) ||
+        null
+      );
     }
     const localZh = voices.find(
-      (v) => !isCloudOnlineVoice(v) && /^zh[-_]?CN/i.test(String(v.lang || ""))
+      (v) => !isCloudOnlineVoice(v) && doesVoiceMatchLangCode(v, "zh-CN")
     );
-    return localZh || null;
+    return localZh || voices.find((v) => doesVoiceMatchLangCode(v, "zh-CN")) || null;
   }
 
   function clearSpeechTimers() {
@@ -375,6 +512,13 @@
     state.speechSessionId += 1;
     clearSpeechTimers();
     activeUtterancePool.clear();
+    if (state.activeAudio) {
+      try {
+        state.activeAudio.pause();
+        state.activeAudio.src = "";
+      } catch (_ea) {}
+      state.activeAudio = null;
+    }
     if ("speechSynthesis" in window) {
       try {
         window.speechSynthesis.cancel();
@@ -385,18 +529,70 @@
   }
 
   function speakPassList(passStrings, onDone) {
-    if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
-      showToast("当前浏览器不支持语音合成朗读");
-      state.speaking = false;
-      updateSpeakBtnUI();
-      if (onDone) onDone();
-      return;
-    }
     const queue = (Array.isArray(passStrings) ? passStrings : [passStrings])
       .map((s) => String(s || "").trim())
       .filter(Boolean);
     if (!queue.length) {
       stopSpeaking();
+      if (onDone) onDone();
+      return;
+    }
+
+    const activeLangCode = String(state.voiceLang || state.preferredVoiceLang || "zh-CN").trim();
+    const browserVoicesNow = "speechSynthesis" in window ? window.speechSynthesis.getVoices() || [] : [];
+    const hasLocalDialectVoice = browserVoicesNow.some((v) => doesVoiceMatchLangCode(v, activeLangCode));
+
+    // When user chooses `zh-NE` (东北话) / `zh-SN` on iPhone Safari/Chrome (no Edge Xiaobei in WebKit),
+    // stream `/api/voice/tts.mp3` (`晓北` neural voice) directly via HTML5 Audio!
+    if (
+      (activeLangCode === "zh-NE" || activeLangCode === "zh-SN") &&
+      !hasLocalDialectVoice &&
+      isCloudTtsReadyForLang(activeLangCode) &&
+      typeof Audio !== "undefined"
+    ) {
+      stopSpeaking();
+      const sessionId = state.speechSessionId;
+      state.speaking = true;
+      updateSpeakBtnUI();
+
+      const playAudioIdx = (idx) => {
+        if (sessionId !== state.speechSessionId) return;
+        if (idx >= queue.length) {
+          state.activeAudio = null;
+          state.speaking = false;
+          updateSpeakBtnUI();
+          if (onDone) onDone();
+          return;
+        }
+        const u = applyWsParam(new URL("/api/voice/tts.mp3", window.location.origin));
+        u.searchParams.set("lang", activeLangCode);
+        u.searchParams.set("text", queue[idx]);
+        if (state.token) u.searchParams.set("token", state.token);
+        const audio = new Audio(u.toString());
+        state.activeAudio = audio;
+        const nextSeg = () => {
+          if (sessionId !== state.speechSessionId) return;
+          if (idx + 1 < queue.length) {
+            state.speechPassTimer = setTimeout(() => playAudioIdx(idx + 1), 220);
+          } else {
+            state.activeAudio = null;
+            state.speaking = false;
+            updateSpeakBtnUI();
+            if (onDone) onDone();
+          }
+        };
+        audio.onended = nextSeg;
+        audio.onerror = nextSeg;
+        audio.play().catch(() => nextSeg());
+      };
+      playAudioIdx(0);
+      return;
+    }
+
+    if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+      showToast("当前浏览器不支持语音合成朗读");
+      state.speaking = false;
+      updateSpeakBtnUI();
       if (onDone) onDone();
       return;
     }
@@ -460,7 +656,8 @@
       utter.rate = 1.04;
       utter.pitch = 1.0;
       const primaryPick = resolveSelectedVoice(null);
-      const targetLang = normalizeVoiceBcp47Lang(primaryPick, state.preferredVoiceLang || "zh-CN");
+      const fallbackBcp = voiceLangToBcp47Fallback(state.voiceLang || state.preferredVoiceLang || "zh-CN");
+      const targetLang = normalizeVoiceBcp47Lang(primaryPick, fallbackBcp);
       const chosen = forceLocalVoice ? resolveSelectedVoice(targetLang) : primaryPick;
       if (chosen) {
         utter.voice = chosen;
@@ -1232,6 +1429,103 @@
     return found ? `${found.name}` : uid;
   }
 
+  function populateLanguageDropdowns(langs, activeWebCode, activeScCode) {
+    const list =
+      Array.isArray(langs) && langs.length
+        ? langs
+        : [
+            { code: "zh-CN", short_label: "🎙️ 普通话", label: "普通话（标准播报）" },
+            { code: "zh-HK", short_label: "🇭🇰 粤语", label: "粤语 · 广东话" },
+            { code: "en-US", short_label: "🌐 English", label: "English（英文播报）" },
+            { code: "zh-SC", short_label: "🌶️ 四川话", label: "四川话 · 川渝方言" },
+            { code: "zh-NE", short_label: "❄️ 东北话", label: "东北话 · 东北方言" },
+          ];
+    const liveSel = el("vgLangSelect");
+    const scSel = el("vgShortcutLangSelect");
+    const chosenWeb = activeWebCode || state.voiceLang || "zh-CN";
+    const chosenSc = activeScCode || state.shortcutLang || "zh-CN";
+
+    if (liveSel) {
+      liveSel.innerHTML = "";
+      list.forEach((item) => {
+        const opt = document.createElement("option");
+        opt.value = item.code;
+        const avail = hasBrowserVoiceForLang(item.code);
+        const baseLbl = item.short_label || item.label || item.code;
+        opt.textContent = avail === false ? `${baseLbl} (无语音包·自动普通话)` : baseLbl;
+        liveSel.appendChild(opt);
+      });
+      if ([...liveSel.options].some((o) => o.value === chosenWeb)) {
+        liveSel.value = chosenWeb;
+      }
+    }
+    if (scSel) {
+      scSel.disabled = false;
+      scSel.innerHTML = "";
+      if (state.unitMode === "setup_once") {
+        const askOpt = document.createElement("option");
+        askOpt.value = "ask_once";
+        askOpt.textContent = "✨ 首次运行时弹窗选语言（推荐）";
+        scSel.appendChild(askOpt);
+      }
+      list.forEach((item) => {
+        const opt = document.createElement("option");
+        opt.value = item.code;
+        const scAvail = hasAppleOfflineShortcutVoiceForLang(item.code);
+        const iconPrefix = (item.short_label || "").split(/\s+/)[0];
+        const prefix = iconPrefix && !String(item.label || "").startsWith(iconPrefix) ? `${iconPrefix} ` : "";
+        const baseScLbl = `${prefix}${item.label || item.short_label || item.code}`;
+        opt.textContent = scAvail ? baseScLbl : `${baseScLbl}（未装离线包·自动普通话）`;
+        scSel.appendChild(opt);
+      });
+      const targetScVal =
+        state.unitMode !== "setup_once" && chosenSc === "ask_once"
+          ? state.voiceLang || "zh-CN"
+          : chosenSc;
+      if ([...scSel.options].some((o) => o.value === targetScVal)) {
+        scSel.value = targetScVal;
+      } else {
+        scSel.value = state.unitMode === "setup_once" ? "ask_once" : "zh-CN";
+      }
+    }
+    if (state.recognition) {
+      const matchProf = list.find((x) => x.code === chosenWeb);
+      state.recognition.lang = (matchProf && matchProf.sr_lang) || voiceLangToBcp47Fallback(chosenWeb);
+    }
+  }
+
+  function reconcileInstalledVoicePacks(showToastOnFallback) {
+    let changedWeb = false;
+    const curWeb = state.voiceLang || "zh-CN";
+    const webAvail = hasBrowserVoiceForLang(curWeb);
+    if (webAvail === false && curWeb !== "zh-CN") {
+      const missingName = getLangDisplayShortName(curWeb);
+      state.voiceLang = "zh-CN";
+      localStorage.setItem(LS_VOICE_LANG, "zh-CN");
+      changedWeb = true;
+      if (showToastOnFallback) {
+        showToast(`当前设备未安装「${missingName}」语音包，已自动改为标准普通话模式`);
+      }
+    }
+
+    const curSc =
+      state.shortcutLang ||
+      (state.unitMode === "setup_once" ? "ask_once" : state.voiceLang || "zh-CN");
+    if (curSc !== "ask_once" && !hasAppleOfflineShortcutVoiceForLang(curSc)) {
+      state.shortcutLang = state.unitMode === "setup_once" ? "ask_once" : "zh-CN";
+      localStorage.setItem(LS_SC_LANG, state.shortcutLang);
+    } else if (!state.shortcutLang) {
+      state.shortcutLang = curSc;
+    }
+
+    populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
+    populateVoiceOptions();
+    syncShortcutBuilderUI();
+    if (changedWeb) {
+      refreshBrief(false);
+    }
+  }
+
   function syncShortcutBuilderUI() {
     const safeName = sanitizeShortcutName(state.shortcutName || "小区车位");
     el("vgWakeNamePreview").textContent = safeName;
@@ -1243,9 +1537,36 @@
       if (state.unitMode === "menu") {
         unitHint.textContent = "每次运行时弹出单元门选择列表";
       } else if (state.unitMode === "setup_once") {
-        unitHint.textContent = "添加免设置，仅第 1 次运行时弹窗选单元，后续永久免选";
+        unitHint.textContent = "添加免设置，首次运行时依次点选「单元门 + 播报语言」，后续永久免选";
       } else {
         unitHint.textContent = `已绑定：${getSelectedUnitDisplayLabel()}（一键添加直接用）`;
+      }
+    }
+
+    const scLangRowSel = el("vgShortcutLangSelect");
+    const langHint = el("vgLangTargetHint");
+    if (scLangRowSel) {
+      scLangRowSel.disabled = false;
+    }
+    const isSetupOnceAskLang =
+      state.unitMode === "setup_once" && (!state.shortcutLang || state.shortcutLang === "ask_once");
+    if (langHint) {
+      if (isSetupOnceAskLang) {
+        langHint.textContent =
+          state.popupMode === "silent"
+            ? "首次运行弹窗点选语言（含东北话晓北原声），也可在右侧直接指定语言"
+            : "首次运行弹窗点选预装语言（普通话/粤语/English），与平面图0延迟同时显示";
+      } else if (state.unitMode === "setup_once") {
+        langHint.textContent = `首次运行仅选单元门，语言已锁定为：${getLangDisplayShortName(state.shortcutLang)}`;
+      } else {
+        const effScL =
+          !state.shortcutLang || state.shortcutLang === "ask_once"
+            ? state.voiceLang || "zh-CN"
+            : state.shortcutLang;
+        langHint.textContent =
+          effScL === "zh-NE" && state.popupMode === "silent"
+            ? "已绑定：东北话（纯语音模式播放晓北原声）"
+            : `已绑定语音：${getLangDisplayShortName(effScL)}（语音与画面同时一并显示）`;
       }
     }
 
@@ -1273,11 +1594,29 @@
     const uid = state.unitId || "8-1";
     const rep = state.repeat || 2;
     const vtype = state.vehicle || "sedan";
+    const webLang = state.voiceLang || state.preferredVoiceLang || "zh-CN";
+    const rawScLang =
+      state.unitMode !== "setup_once" && state.shortcutLang === "ask_once"
+        ? webLang
+        : state.shortcutLang || (state.unitMode === "setup_once" ? "ask_once" : webLang);
+    const scLang =
+      rawScLang === "ask_once"
+        ? "ask_once"
+        : hasAppleOfflineShortcutVoiceForLang(rawScLang)
+        ? rawScLang
+        : "zh-CN";
+    const scDialectReady =
+      (scLang === "zh-SC" || scLang === "zh-NE" || scLang === "zh-SN") &&
+      hasLocalAppleDialectPack(scLang);
 
     const briefUrl = applyWsParam(new URL("/api/voice/brief", window.location.origin));
     briefUrl.searchParams.set("unit", uid);
     briefUrl.searchParams.set("repeat", String(rep));
     briefUrl.searchParams.set("vehicle", vtype);
+    briefUrl.searchParams.set("lang", webLang);
+    if (hasBrowserVoiceForLang(webLang) === true && (webLang === "zh-SC" || webLang === "zh-NE")) {
+      briefUrl.searchParams.set("dialect_ready", "1");
+    }
     briefUrl.searchParams.set("format", "text");
     if (state.token) briefUrl.searchParams.set("token", state.token);
     el("vgBriefUrlCode").value = briefUrl.toString();
@@ -1288,6 +1627,7 @@
         : "/";
     const quickLaunchUrl = new URL(wsRootPath, window.location.origin);
     quickLaunchUrl.searchParams.set("unit", uid);
+    quickLaunchUrl.searchParams.set("lang", webLang);
     quickLaunchUrl.searchParams.set("autostart", "1");
     if (state.token) quickLaunchUrl.searchParams.set("token", state.token);
     el("vgAndroidQuickLaunchCode").value = quickLaunchUrl.toString();
@@ -1299,6 +1639,13 @@
     scUrl.searchParams.set("mode", state.shortcutAction);
     scUrl.searchParams.set("repeat", String(rep));
     scUrl.searchParams.set("vehicle", vtype);
+    scUrl.searchParams.set("lang", scLang);
+    if (scLang === "ask_once") {
+      scUrl.searchParams.set("lang_mode", "ask_once");
+    }
+    if (scDialectReady) {
+      scUrl.searchParams.set("dialect_ready", "1");
+    }
     scUrl.searchParams.set("show_map", state.popupMode || "text");
     if (state.unitMode === "setup_once") {
       scUrl.searchParams.set("device_uid", state.deviceUid);
@@ -1421,6 +1768,20 @@
     const data = await res.json();
     const gw = data.gateway || {};
     state.preferredVoiceLang = data.preferred_voice_lang || gw.preferred_voice_lang || "";
+    state.voiceLanguages = data.voice_languages || gw.voice_languages || [];
+    if (!state.voiceLang) {
+      state.voiceLang =
+        data.default_voice_lang ||
+        gw.default_voice_lang ||
+        state.preferredVoiceLang ||
+        "zh-CN";
+    }
+    if (!state.shortcutLang) {
+      state.shortcutLang = hasAppleOfflineShortcutVoiceForLang(state.voiceLang)
+        ? state.voiceLang
+        : "zh-CN";
+    }
+    reconcileInstalledVoicePacks(false);
 
     if (data.community_name) {
       el("vgTitle").textContent = data.community_name;
@@ -1491,6 +1852,9 @@
     u.searchParams.set("unit", state.unitId || "8-1");
     u.searchParams.set("repeat", String(state.repeat || 2));
     u.searchParams.set("vehicle", state.vehicle || "sedan");
+    if (state.voiceLang) {
+      u.searchParams.set("lang", state.voiceLang);
+    }
     u.searchParams.set("format", "json");
 
     try {
@@ -1561,12 +1925,35 @@
           question: q,
           unit_id: state.unitId,
           vehicle_type: state.vehicle,
+          voice_lang: state.voiceLang || "zh-CN",
         }),
       });
       const data = await res.json();
       if (!res.ok) {
         showToast(data.error || "提问失败");
         return;
+      }
+      if (data.voice_lang && data.voice_lang !== state.voiceLang) {
+        if (hasBrowserVoiceForLang(data.voice_lang) === false) {
+          state.voiceLang = "zh-CN";
+          localStorage.setItem(LS_VOICE_LANG, "zh-CN");
+          showToast(
+            `当前设备未安装「${getLangDisplayShortName(data.voice_lang)}」语音包，已自动切回标准普通话`
+          );
+          await refreshBrief(false);
+          state.latestAnswer = state.latestSingleText || state.latestAnswer;
+          el("vgAnswerText").textContent = state.latestAnswer;
+        } else {
+          state.voiceLang = data.voice_lang;
+          localStorage.setItem(LS_VOICE_LANG, state.voiceLang);
+          if (hasAppleOfflineShortcutVoiceForLang(state.voiceLang)) {
+            state.shortcutLang = state.voiceLang;
+            localStorage.setItem(LS_SC_LANG, state.shortcutLang);
+          }
+        }
+        populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
+        populateVoiceOptions();
+        syncShortcutBuilderUI();
       }
       state.latestAnswer = data.answer || data.speech_text || "";
       const emptyHint = el("vgAiEmptyHint");
@@ -2148,9 +2535,89 @@
       refreshBrief(false);
     });
 
+    const handleWebVoiceLangChange = (requestedLang) => {
+      const target = requestedLang || "zh-CN";
+      const avail = hasBrowserVoiceForLang(target);
+      if (avail === false && target !== "zh-CN") {
+        const missingName = getLangDisplayShortName(target);
+        state.voiceLang = "zh-CN";
+        localStorage.setItem(LS_VOICE_LANG, "zh-CN");
+        populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
+        populateVoiceOptions();
+        syncShortcutBuilderUI();
+        showToast(
+          `当前设备未预装「${missingName}」语音包，已自动改为普通话模式（避免普通话强读方言）`
+        );
+        refreshBrief(true);
+        return;
+      }
+      state.voiceLang = target;
+      localStorage.setItem(LS_VOICE_LANG, state.voiceLang);
+      if (state.shortcutLang !== "ask_once" && hasAppleOfflineShortcutVoiceForLang(target)) {
+        state.shortcutLang = target;
+        localStorage.setItem(LS_SC_LANG, state.shortcutLang);
+      }
+      populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
+      populateVoiceOptions();
+      syncShortcutBuilderUI();
+      refreshBrief(true);
+    };
+
+    const handleShortcutLangChange = (requestedLang) => {
+      const target = requestedLang || "zh-CN";
+      if (target === "ask_once") {
+        state.shortcutLang = "ask_once";
+        localStorage.setItem(LS_SC_LANG, "ask_once");
+        populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
+        syncShortcutBuilderUI();
+        return;
+      }
+      if (!hasAppleOfflineShortcutVoiceForLang(target) && target !== "zh-CN") {
+        const missingName = getLangDisplayShortName(target);
+        state.shortcutLang = "zh-CN";
+        localStorage.setItem(LS_SC_LANG, "zh-CN");
+        populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
+        syncShortcutBuilderUI();
+        if (isCloudTtsReadyForLang(target) && state.popupMode !== "silent") {
+          showToast(
+            `系统未装「${missingName}」离线包，为确保文字与平面图同时一并弹出已改为普通话（纯语音模式可播晓北原声）`
+          );
+        } else {
+          showToast(
+            `系统未预装「${missingName}」语音包，快捷指令已自动改为标准普通话模式（避免普通话强读方言）`
+          );
+        }
+        return;
+      }
+      state.shortcutLang = target;
+      localStorage.setItem(LS_SC_LANG, state.shortcutLang);
+      if (hasBrowserVoiceForLang(target) !== false) {
+        state.voiceLang = target;
+        localStorage.setItem(LS_VOICE_LANG, state.voiceLang);
+        populateVoiceOptions();
+        refreshBrief(false);
+      }
+      populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
+      syncShortcutBuilderUI();
+    };
+
+    const liveLangEl = el("vgLangSelect");
+    if (liveLangEl) {
+      liveLangEl.addEventListener("change", (e) => {
+        handleWebVoiceLangChange(e.target.value);
+      });
+    }
+
+    const scLangEl = el("vgShortcutLangSelect");
+    if (scLangEl) {
+      scLangEl.addEventListener("change", (e) => {
+        handleShortcutLangChange(e.target.value);
+      });
+    }
+
     el("vgVoiceSelect").addEventListener("change", (e) => {
-      state.voiceUri = e.target.value || "";
-      localStorage.setItem(LS_VOICE_URI, state.voiceUri);
+      const activeLang = String(state.voiceLang || state.preferredVoiceLang || "zh-CN").trim();
+      setPinnedVoiceUriForLang(activeLang, e.target.value || "");
       if (state.latestSingleText || state.latestSpeech) {
         speakCurrentBrief();
       }
@@ -2195,8 +2662,16 @@
     });
 
     el("vgUnitModeSelect").addEventListener("change", (e) => {
+      const prevMode = state.unitMode;
       state.unitMode = e.target.value;
       localStorage.setItem(LS_SC_UNIT_MODE, state.unitMode);
+      if (state.unitMode === "setup_once" && prevMode !== "setup_once" && !localStorage.getItem(LS_SC_LANG)) {
+        state.shortcutLang = "ask_once";
+      } else if (state.unitMode !== "setup_once" && state.shortcutLang === "ask_once") {
+        state.shortcutLang = state.voiceLang || "zh-CN";
+        localStorage.setItem(LS_SC_LANG, state.shortcutLang);
+      }
+      populateLanguageDropdowns(state.voiceLanguages, state.voiceLang, state.shortcutLang);
       syncShortcutBuilderUI();
     });
 
@@ -2209,7 +2684,7 @@
     el("vgPopupModeSelect").addEventListener("change", (e) => {
       state.popupMode = e.target.value || "text";
       localStorage.setItem(LS_SC_POPUP_MODE, state.popupMode);
-      syncShortcutBuilderUI();
+      reconcileInstalledVoicePacks(false);
     });
 
     el("vgMapAppSelect").addEventListener("change", (e) => {
@@ -2370,9 +2845,11 @@
     });
 
     if ("speechSynthesis" in window) {
-      populateVoiceOptions();
+      reconcileInstalledVoicePacks(false);
       if ("onvoiceschanged" in window.speechSynthesis) {
-        window.speechSynthesis.onvoiceschanged = populateVoiceOptions;
+        window.speechSynthesis.onvoiceschanged = () => {
+          reconcileInstalledVoicePacks(false);
+        };
       }
     }
 

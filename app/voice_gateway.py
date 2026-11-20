@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime
 import hashlib
 import hmac
+import importlib.util
 import io
 import json
 import logging
@@ -72,6 +74,545 @@ def _infer_paired_mobile_url(voice_base_url: str, configured_mobile_url: str = "
     if host:
         return f"{scheme}://{host}:{mob_port}"
     return f"http://127.0.0.1:{mob_port}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-Language & Geo-Aware Dialect Registry (Mandarin / Cantonese / English /
+# Sichuanese / Northeastern + Extensible Regional Packs)
+# ---------------------------------------------------------------------------
+
+VOICE_LANG_PROFILES: "OrderedDict[str, Dict[str, Any]]" = OrderedDict(
+    [
+        (
+            "zh-CN",
+            {
+                "code": "zh-CN",
+                "label": "普通话（标准播报）",
+                "short_label": "🎙️ 普通话",
+                "menu_item": "🎙️ 普通话（标准播报） [zh-CN]",
+                "apple_tts_lang": "zh-CN",
+                "apple_tts_voice": "",
+                "apple_preinstalled": True,
+                "web_tts_lang": "zh-CN",
+                "sr_lang": "zh-CN",
+                "slot_token": "1",  # 1 char -> Shortcut count(Characters) < 2
+                "default_enabled": True,
+                "geo_regions": ["CN", "BJ", "TJ", "HE", "SD", "HA", "HB", "HN", "JS", "ZJ", "AH", "JX", "FJ"],
+            },
+        ),
+        (
+            "zh-HK",
+            {
+                "code": "zh-HK",
+                "label": "粤语 · 广东话",
+                "short_label": "🇭🇰 粤语",
+                "menu_item": "🇭🇰 粤语 · 广东话 [zh-HK]",
+                # Apple ActionKit `WFSpeakTextLanguage` strictly requires `yue-HK` (NOT `zh-HK`!)
+                "apple_tts_lang": "yue-HK",
+                "apple_tts_voice": "com.apple.voice.compact.zh-HK.Sinji",
+                "apple_preinstalled": True,
+                "web_tts_lang": "zh-HK",
+                "sr_lang": "yue-Hant-HK",
+                "slot_token": "22",  # 2 chars -> Shortcut count(Characters) < 3
+                "default_enabled": True,
+                "geo_regions": ["GD", "HK", "MO", "GX", "GUANGDONG", "HONG KONG", "MACAU"],
+            },
+        ),
+        (
+            "en-US",
+            {
+                "code": "en-US",
+                "label": "English（英文播报）",
+                "short_label": "🌐 English",
+                "menu_item": "🌐 English（英文播报） [en-US]",
+                "apple_tts_lang": "en-US",
+                "apple_tts_voice": "com.apple.voice.compact.en-US.Samantha",
+                "apple_preinstalled": True,
+                "web_tts_lang": "en-US",
+                "sr_lang": "en-US",
+                "slot_token": "333",  # 3 chars -> Shortcut count(Characters) < 4
+                "default_enabled": True,
+                "geo_regions": ["INTL", "US", "GB", "AU", "CA", "SG", "NZ", "IE"],
+            },
+        ),
+        (
+            "zh-SC",
+            {
+                "code": "zh-SC",
+                "label": "四川话 · 川渝方言",
+                "short_label": "🌶️ 四川话",
+                "menu_item": "🌶️ 四川话 · 川渝方言 [zh-SC]",
+                "apple_tts_lang": "zh-CN",
+                "apple_tts_voice": "com.apple.voice.compact.zh-CN-u-sd-cnsc.Fangfang",
+                "apple_preinstalled": False,
+                "cloud_neural_voice": "",
+                "cloud_neural_rate": "+6%",
+                "web_tts_lang": "zh-CN",
+                "sr_lang": "zh-CN",
+                "slot_token": "4444",  # 4 chars -> Shortcut count(Characters) < 5
+                "default_enabled": True,
+                "geo_regions": ["SC", "CQ", "GZ", "YN", "SICHUAN", "CHONGQING", "CHENGDU"],
+            },
+        ),
+        (
+            "zh-NE",
+            {
+                "code": "zh-NE",
+                "label": "东北话 · 东北方言",
+                "short_label": "❄️ 东北话",
+                "menu_item": "❄️ 东北话 · 东北方言 [zh-NE]",
+                "apple_tts_lang": "zh-CN",
+                "apple_tts_voice": "com.apple.voice.enhanced.zh-CN-u-sd-cnln.Dongmei",
+                "apple_preinstalled": False,
+                "cloud_neural_voice": "zh-CN-liaoning-XiaobeiNeural",
+                "cloud_neural_rate": "+10%",
+                "web_tts_lang": "zh-CN-liaoning",
+                "sr_lang": "zh-CN",
+                "slot_token": "55555",  # 5 chars -> Shortcut count(Characters) < 6 (Xiaobei neural MP3!)
+                "default_enabled": True,
+                "geo_regions": ["NE", "LN", "JL", "HL", "LIAONING", "JILIN", "HEILONGJIANG", "SHENYANG", "HARBIN", "DALIAN"],
+            },
+        ),
+        # Pre-wired regional dialect packs for future geo-location switching (no Shortcut re-signing needed!)
+        (
+            "zh-SN",
+            {
+                "code": "zh-SN",
+                "label": "陕西话 · 关中方言",
+                "short_label": "🏮 陕西话",
+                "menu_item": "🏮 陕西话 · 关中方言 [zh-SN]",
+                "apple_tts_lang": "zh-CN",
+                "apple_tts_voice": "com.apple.voice.enhanced.zh-CN-u-sd-cnsn.Haohao",
+                "apple_preinstalled": False,
+                "cloud_neural_voice": "zh-CN-shaanxi-XiaoniNeural",
+                "cloud_neural_rate": "+8%",
+                "web_tts_lang": "zh-CN-shaanxi",
+                "sr_lang": "zh-CN",
+                "slot_token": "55555",  # 5 chars -> Shares Cloud Neural MP3 branch (`tts.mp3`)!
+                "default_enabled": False,
+                "geo_regions": ["SN", "SHAANXI", "XIAN"],
+            },
+        ),
+        (
+            "zh-TW",
+            {
+                "code": "zh-TW",
+                "label": "国语 · 闽台腔",
+                "short_label": "🌿 闽台国语",
+                "menu_item": "🌿 国语 · 闽台温柔播报 [zh-TW]",
+                "apple_tts_lang": "zh-TW",
+                "apple_tts_voice": "com.apple.voice.compact.zh-TW.Meijia",
+                "apple_preinstalled": True,
+                "web_tts_lang": "zh-TW",
+                "sr_lang": "zh-TW",
+                "slot_token": "7777777",  # 7 chars -> Shortcut else branch
+                "default_enabled": False,
+                "geo_regions": ["TW", "TAIWAN", "TAIPEI"],
+            },
+        ),
+    ]
+)
+
+DEFAULT_ACTIVE_VOICE_LANGS: List[str] = ["zh-CN", "zh-HK", "en-US", "zh-SC", "zh-NE"]
+
+
+def normalize_voice_lang(raw: Optional[str], default: str = "zh-CN") -> str:
+    """Normalize arbitrary user/menu/API input into a canonical `VOICE_LANG_PROFILES` key."""
+    s = str(raw or "").strip()
+    if not s or s.lower() in ("auto", "default", "none"):
+        return default if default in VOICE_LANG_PROFILES else "zh-CN"
+
+    # 1) Extract explicit `[code]` tag from `/api/voice/languages.txt` menu item if present
+    m_tag = re.search(r"\[([a-zA-Z]{2,3}-[a-zA-Z0-9_-]{2,12})\]", s)
+    if m_tag:
+        cand_tag = m_tag.group(1)
+        for k in VOICE_LANG_PROFILES:
+            if k.lower() == cand_tag.lower():
+                return k
+
+    low = s.lower().replace("_", "-")
+    for k in VOICE_LANG_PROFILES:
+        if low == k.lower():
+            return k
+
+    if any(w in low for w in ("zh-hk", "yue", "zh-mo", "canton")) or any(
+        w in s for w in ("粤", "粵", "广东", "廣東", "香港", "白话")
+    ):
+        return "zh-HK"
+    if low.startswith("en") or "english" in low or any(w in s for w in ("英文", "英语")):
+        return "en-US"
+    if any(w in low for w in ("zh-sc", "cnsc", "sichuan", "chuan", "chengdu", "chongqing")) or any(
+        w in s for w in ("四川", "川渝", "成都", "重庆", "巴适")
+    ):
+        return "zh-SC"
+    if any(w in low for w in ("zh-ne", "cnln", "liaoning", "dongbei")) or any(
+        w in s for w in ("东北", "辽宁", "吉林", "黑龙江", "沈阳", "哈尔滨", "老铁")
+    ):
+        return "zh-NE"
+    if any(w in low for w in ("zh-sn", "cnsn", "shaanxi", "xian")) or any(
+        w in s for w in ("陕西", "西安", "关中")
+    ):
+        return "zh-SN"
+    if any(w in low for w in ("zh-tw", "taiwan", "minnan")) or any(
+        w in s for w in ("台湾", "臺灣", "台灣", "闽台")
+    ):
+        return "zh-TW"
+    if any(w in low for w in ("zh-cn", "mandarin", "cmn", "putonghua")) or any(
+        w in s for w in ("普通话", "标准")
+    ):
+        return "zh-CN"
+    return default if default in VOICE_LANG_PROFILES else "zh-CN"
+
+
+def _edge_tts_available() -> bool:
+    return importlib.util.find_spec("edge_tts") is not None
+
+
+def is_shortcut_voice_supported(
+    lang_code: Optional[str],
+    dialect_pack_ready: bool = False,
+    allow_cloud_audio: bool = False,
+) -> bool:
+    norm = normalize_voice_lang(lang_code, default="zh-CN")
+    prof = VOICE_LANG_PROFILES.get(norm, VOICE_LANG_PROFILES["zh-CN"])
+    if prof.get("apple_preinstalled", True) or dialect_pack_ready:
+        return True
+    if allow_cloud_audio and prof.get("cloud_neural_voice") and _edge_tts_available():
+        return True
+    return False
+
+
+def uses_cloud_neural_shortcut_audio(
+    lang_code: Optional[str],
+    dialect_pack_ready: bool = False,
+    map_mode: str = "text",
+) -> bool:
+    # CRITICAL: In Apple Shortcuts, `is.workflow.actions.playsound` is strictly blocking (`audioPlayerDidFinishPlaying:`)
+    # and delays `previewdocument` / `showresult` until audio finishes!
+    # Therefore, ONLY `map_mode == "silent"` (pure voice, zero visual popup) may use `playsound`.
+    # All visual modes (`both`, `map`, `text`) MUST use `speaktext(WFSpeakTextWait=False)` so voice and
+    # `文字 + 平面图同屏` launch 100% simultaneously in a single screen!
+    if str(map_mode or "").strip().lower() != "silent":
+        return False
+    norm = normalize_voice_lang(lang_code, default="zh-CN")
+    prof = VOICE_LANG_PROFILES.get(norm, VOICE_LANG_PROFILES["zh-CN"])
+    if prof.get("apple_preinstalled", True) or dialect_pack_ready:
+        return False
+    return bool(prof.get("cloud_neural_voice")) and _edge_tts_available()
+
+
+def get_active_voice_languages(
+    enabled_codes: Optional[List[str]] = None,
+    geo_region: str = "",
+    preinstalled_only: bool = False,
+    allow_cloud_audio: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Return the active voice language profiles, supporting dynamic geo-region ordering &
+    regional dialect activation (`geo_region` from Cloudflare headers, workspace, or query).
+    When `preinstalled_only=True` (used by Apple Shortcuts `setup_once` visual modes),
+    returns languages with non-blocking `speaktext(WFSpeakTextWait=False)` voices (`zh-CN`,
+    `yue-HK`, `en-US`) so `文字 + 平面图同屏` always launches simultaneously without delay.
+    """
+    base_codes: List[str] = []
+    raw_list = enabled_codes if isinstance(enabled_codes, list) and enabled_codes else DEFAULT_ACTIVE_VOICE_LANGS
+    for item in raw_list:
+        c = normalize_voice_lang(item, default="")
+        if c and c in VOICE_LANG_PROFILES and c not in base_codes:
+            base_codes.append(c)
+    for core_c in DEFAULT_ACTIVE_VOICE_LANGS:
+        if core_c not in base_codes:
+            base_codes.append(core_c)
+
+    reg_upper = str(geo_region or "").strip().upper()
+    promoted_code: Optional[str] = None
+    if reg_upper and reg_upper not in ("AUTO", "ALL", "DEFAULT", "CN"):
+        for code, prof in VOICE_LANG_PROFILES.items():
+            regions = [str(r).upper() for r in (prof.get("geo_regions") or [])]
+            if reg_upper in regions:
+                if code not in base_codes:
+                    base_codes.append(code)
+                if code != "zh-CN":
+                    promoted_code = code
+                break
+
+    if promoted_code and promoted_code in base_codes:
+        # Keep Mandarin #1 and promote the detected local regional language/dialect right to #2!
+        rest = [c for c in base_codes if c not in ("zh-CN", promoted_code)]
+        ordered_codes = (["zh-CN", promoted_code] + rest) if "zh-CN" in base_codes else ([promoted_code] + rest)
+    else:
+        ordered_codes = base_codes
+
+    if preinstalled_only:
+        ordered_codes = [
+            c
+            for c in ordered_codes
+            if is_shortcut_voice_supported(c, dialect_pack_ready=False, allow_cloud_audio=allow_cloud_audio)
+        ]
+        if not ordered_codes:
+            ordered_codes = ["zh-CN"]
+
+    out: List[Dict[str, Any]] = []
+    for c in ordered_codes:
+        item = dict(VOICE_LANG_PROFILES[c])
+        item["shortcut_ready"] = is_shortcut_voice_supported(c, dialect_pack_ready=False, allow_cloud_audio=False)
+        item["cloud_tts_ready"] = bool(item.get("cloud_neural_voice")) and _edge_tts_available()
+        out.append(item)
+    return out
+
+
+def coerce_shortcut_safe_voice_lang(
+    lang_code: Optional[str],
+    dialect_pack_ready: bool = False,
+    allow_cloud_audio: bool = False,
+) -> str:
+    """
+    Ensure Shortcut `speaktext` never reads dialect slang in a Mandarin voice AND never blocks
+    visual `文字 + 平面图同屏` popups: unless `dialect_pack_ready=True` (device has Apple's `冬梅`/`盼盼`
+    installed) or `allow_cloud_audio=True` (`silent` pure-audio mode), uninstalled dialects cleanly
+    fall back to standard Mandarin (`zh-CN`).
+    """
+    norm = normalize_voice_lang(lang_code, default="zh-CN")
+    if is_shortcut_voice_supported(
+        norm, dialect_pack_ready=dialect_pack_ready, allow_cloud_audio=allow_cloud_audio
+    ):
+        return norm
+    return "zh-CN"
+
+
+def voice_lang_to_apple_tts(lang_code: Optional[str]) -> str:
+    norm = normalize_voice_lang(lang_code, default="zh-CN")
+    return str(VOICE_LANG_PROFILES.get(norm, VOICE_LANG_PROFILES["zh-CN"])["apple_tts_lang"])
+
+
+def voice_lang_to_apple_voice_id(lang_code: Optional[str]) -> str:
+    norm = normalize_voice_lang(lang_code, default="zh-CN")
+    return str(VOICE_LANG_PROFILES.get(norm, VOICE_LANG_PROFILES["zh-CN"]).get("apple_tts_voice") or "")
+
+
+def _build_apple_speaktext_params(lang_code: str, wf_text_obj: Any) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "WFSpeakTextWait": False,
+        "WFSpeakTextLanguage": voice_lang_to_apple_tts(lang_code),
+        "WFText": wf_text_obj,
+    }
+    vid = voice_lang_to_apple_voice_id(lang_code)
+    if vid:
+        params["WFSpeakTextVoice"] = vid
+    return params
+
+
+def voice_lang_to_slot_token(lang_code: Optional[str]) -> str:
+    norm = normalize_voice_lang(lang_code, default="zh-CN")
+    return str(VOICE_LANG_PROFILES.get(norm, VOICE_LANG_PROFILES["zh-CN"])["slot_token"])
+
+
+def translate_parking_term_to_english(raw_text: str, fallback_code: str = "") -> str:
+    """Deterministic, natural English translation for Chinese community/building/zone terms so `en-US` TTS never hits raw CJK."""
+    s = str(raw_text or "").strip()
+    if not s:
+        return fallback_code or "Parking Zone"
+
+    # Strip parenthetical notes like "（中心区）" or "(近南门)" if we already have building/unit info
+    s_clean = re.sub(r"[（(][^）)]*[）)]", " ", s)
+    s_clean = re.sub(r"(\d+)\s*(?:号楼|栋|幢|座)", r" Building \1 ", s_clean)
+    s_clean = re.sub(r"([A-Za-z]\d*)\s*座", r" Block \1 ", s_clean)
+    s_clean = re.sub(r"(\d+)\s*单元门?", r" Unit \1 ", s_clean)
+    s_clean = re.sub(r"(\d+)\s*号主?展馆", r" Hall \1 ", s_clean)
+
+    phrase_map = [
+        ("外围行车道路右侧停车带", "Outer Ring Road Right Strip"),
+        ("外围行车道路左侧停车带", "Outer Ring Road Left Strip"),
+        ("无划线弹性带", "Flexible Roadside Strip"),
+        ("路侧顺停区", "Roadside Strip"),
+        ("路侧停车带", "Roadside Strip"),
+        ("地面访客停车区", "Visitor Parking Lot"),
+        ("访客与接送停车带", "Drop-off & Visitor Strip"),
+        ("贵宾地面停车场", "VIP Surface Lot"),
+        ("地面停车带", "Surface Parking Strip"),
+        ("地面停车区", "Surface Parking Zone"),
+        ("窗台俯拍区", "Window-View Zone"),
+        ("断头路尽头", "Dead-End Zone"),
+        ("主干道顺停区", "Main Road Strip"),
+        ("主干道", "Main Road"),
+        ("研发塔楼大堂", "R&D Tower Lobby"),
+        ("办公大堂", "Office Lobby"),
+        ("研发大堂", "R&D Lobby"),
+        ("门诊医技楼大厅", "Outpatient Main Hall"),
+        ("住院部", "Inpatient"),
+        ("综合行政楼入口", "Admin Building Entrance"),
+        ("接送等候区", "Pickup Zone"),
+        ("会议中心入口", "Convention Entrance"),
+        ("检票口", "Gate"),
+        ("停车带", "Parking Strip"),
+        ("停车区", "Parking Zone"),
+        ("顺停区", "Roadside Strip"),
+        ("车位带", "Parking Strip"),
+        ("楼下", "Downstairs"),
+        ("靠近", "near "),
+        ("左侧", "Left Side"),
+        ("右侧", "Right Side"),
+        ("东侧", "East Side"),
+        ("西侧", "West Side"),
+        ("南侧", "South Side"),
+        ("北侧", "North Side"),
+        ("后面", "Rear"),
+        ("后侧", "Rear"),
+        ("前面", "Front"),
+        ("前侧", "Front"),
+        ("东校门", "East Gate"),
+        ("东门", "East Gate"),
+        ("西门", "West Gate"),
+        ("南门", "South Gate"),
+        ("北门", "North Gate"),
+        ("入口", "Entrance"),
+        ("大厅", "Lobby"),
+        ("大堂", "Lobby"),
+    ]
+    for zh_p, en_p in phrase_map:
+        s_clean = s_clean.replace(zh_p, f" {en_p} ")
+
+    # Remove remaining CJK punctuation/characters cleanly
+    s_ascii = re.sub(r"[\u4e00-\u9fff·•，。、：；！？]+", " ", s_clean)
+    s_ascii = re.sub(r"\s+", " ", s_ascii).strip(" -_,.")
+    if s_ascii and re.search(r"[A-Za-z]", s_ascii):
+        return s_ascii
+    if fallback_code:
+        if re.match(r"^\d+-\d+$", fallback_code):
+            parts = fallback_code.split("-")
+            return f"Building {parts[0]} Unit {parts[1]}"
+        return f"Zone {fallback_code}"
+    return "Recommended Zone"
+
+
+def _append_multilang_speaktext_actions(
+    actions: List[Dict[str, Any]],
+    speech_output_uuid: str,
+    lang_count_uuid: str,
+    tts_mp3_url: Optional[Any] = None,
+    allow_blocking_playsound: bool = False,
+) -> None:
+    """
+    Append nested numeric `conditional` (`count(Characters) < N`, `WFCondition=0`) branches:
+      - 1 char  (`< 2`): `zh-CN`  (Mandarin)
+      - 2 chars (`< 3`): `yue-HK` + `Sinji`    (Cantonese · 善怡)
+      - 3 chars (`< 4`): `en-US`  + `Samantha` (American English)
+      - 4 chars (`< 5`): `zh-CN`  + `Fangfang` (Sichuanese · 盼盼 when dialect_ready=1)
+      - 5 chars (`< 6`): `zh-CN`  + `Dongmei`  (Northeastern · 冬梅 with `WFSpeakTextWait=False` in all
+                         visual modes so `文字 + 平面图同屏` pops up simultaneously at 0ms; or `playsound`
+                         ONLY when `allow_blocking_playsound=True`, i.e. `silent` pure-audio mode!)
+      - 7+ chars (`else`): `zh-TW` + `Meijia`  (Taiwan Mandarin · 美佳)
+    NEVER emits `is.workflow.actions.notification`, ensuring `文字 + 平面图同屏` ALWAYS displays together!
+    """
+    branches = [
+        ("2", "zh-CN"),
+        ("3", "zh-HK"),
+        ("4", "en-US"),
+        ("5", "zh-SC"),
+        ("6", "zh-NE"),
+    ]
+    speech_text_token = {
+        "Value": {
+            "attachmentsByRange": {
+                "{0, 1}": {
+                    "OutputName": "URL的内容",
+                    "OutputUUID": speech_output_uuid,
+                    "Type": "ActionOutput",
+                }
+            },
+            "string": "\ufffc",
+        },
+        "WFSerializationType": "WFTextTokenString",
+    }
+    count_var_input = {
+        "Type": "Variable",
+        "Variable": {
+            "Value": {
+                "OutputName": "数量",
+                "OutputUUID": lang_count_uuid,
+                "Type": "ActionOutput",
+            },
+            "WFSerializationType": "WFTextTokenAttachment",
+        },
+    }
+    group_ids: List[str] = []
+    for threshold_str, prof_code in branches:
+        grp = str(uuid.uuid4()).upper()
+        group_ids.append(grp)
+        actions.append(
+            {
+                "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
+                "WFWorkflowActionParameters": {
+                    "GroupingIdentifier": grp,
+                    "WFControlFlowMode": 0,
+                    "WFCondition": 0,
+                    "WFNumberValue": threshold_str,
+                    "WFInput": count_var_input,
+                },
+            }
+        )
+        if prof_code == "zh-NE" and allow_blocking_playsound and tts_mp3_url is not None:
+            mp3_dl_uuid = str(uuid.uuid4()).upper()
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                    "WFWorkflowActionParameters": {
+                        "UUID": mp3_dl_uuid,
+                        "WFHTTPMethod": "GET",
+                        "WFURL": tts_mp3_url,
+                    },
+                }
+            )
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.playsound",
+                    "WFWorkflowActionParameters": {
+                        "WFInput": {
+                            "Value": {
+                                "OutputName": "URL的内容",
+                                "OutputUUID": mp3_dl_uuid,
+                                "Type": "ActionOutput",
+                            },
+                            "WFSerializationType": "WFTextTokenAttachment",
+                        }
+                    },
+                }
+            )
+        else:
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+                    "WFWorkflowActionParameters": _build_apple_speaktext_params(prof_code, speech_text_token),
+                }
+            )
+        actions.append(
+            {
+                "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
+                "WFWorkflowActionParameters": {
+                    "GroupingIdentifier": grp,
+                    "WFControlFlowMode": 1,
+                },
+            }
+        )
+
+    # Final fallback (`7+` chars -> `zh-TW`)
+    actions.append(
+        {
+            "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+            "WFWorkflowActionParameters": _build_apple_speaktext_params("zh-TW", speech_text_token),
+        }
+    )
+
+    for grp in reversed(group_ids):
+        actions.append(
+            {
+                "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
+                "WFWorkflowActionParameters": {
+                    "GroupingIdentifier": grp,
+                    "WFControlFlowMode": 2,
+                },
+            }
+        )
 _MAP_HELPER_LOCK = threading.Lock()
 _PLACE_SEARCH_CACHE: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
@@ -703,12 +1244,100 @@ class VoiceGatewayService:
         self._lock = threading.RLock()
         self._sign_lock = threading.Lock()
         self._signed_shortcut_cache: "OrderedDict[str, bytes]" = OrderedDict()
+        self._tts_mp3_cache: "OrderedDict[str, bytes]" = OrderedDict()
+        self._tts_mp3_bytes_total: int = 0
         self._rate_buckets: Dict[str, Deque[float]] = {}
         self._daily_date: str = ""
         self._daily_llm_calls: int = 0
         self._total_brief_calls: int = 0
         self._total_ask_calls: int = 0
         self.weixin_bridge = WeixinClawBridge(self)
+
+    def synthesize_tts_mp3(self, text: str, voice_lang: str = "zh-NE") -> Optional[bytes]:
+        """
+        Synthesize authentic dialect/language neural MP3 bytes (`晓北` for `zh-NE`, `晓妮` for `zh-SN`,
+        `晓曼` for `zh-HK`, `Jenny` for `en-US`, `晓晓` for `zh-CN`) with a bounded 4 MB RAM LRU cache.
+        """
+        clean_text = re.sub(r"\s+", " ", str(text or "")).strip()[:420]
+        if not clean_text or not _edge_tts_available():
+            return None
+
+        norm_lang = normalize_voice_lang(voice_lang, default="zh-CN")
+        prof = VOICE_LANG_PROFILES.get(norm_lang, VOICE_LANG_PROFILES["zh-CN"])
+        voice_name = str(prof.get("cloud_neural_voice") or "").strip()
+        rate_str = str(prof.get("cloud_neural_rate") or "+6%").strip()
+        if not voice_name:
+            fallback_voices = {
+                "zh-HK": ("zh-HK-HiuMaanNeural", "+6%"),
+                "en-US": ("en-US-JennyNeural", "+4%"),
+                "zh-TW": ("zh-TW-HsiaoChenNeural", "+6%"),
+                "zh-CN": ("zh-CN-XiaoxiaoNeural", "+6%"),
+            }
+            voice_name, rate_str = fallback_voices.get(norm_lang, ("zh-CN-XiaoxiaoNeural", "+6%"))
+
+        ckey = hashlib.sha256(f"{voice_name}|{rate_str}|{clean_text}".encode("utf-8")).hexdigest()[:20]
+        with self._lock:
+            hit = self._tts_mp3_cache.get(ckey)
+            if hit:
+                self._tts_mp3_cache.move_to_end(ckey)
+                return hit
+
+        async def _run_edge() -> bytes:
+            import edge_tts
+
+            comm = edge_tts.Communicate(clean_text, voice_name, rate=rate_str)
+            buf = bytearray()
+            async for chunk in comm.stream():
+                if chunk.get("type") == "audio":
+                    buf.extend(chunk.get("data") or b"")
+            return bytes(buf)
+
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                audio_bytes = loop.run_until_complete(asyncio.wait_for(_run_edge(), timeout=6.0))
+            finally:
+                loop.close()
+        except Exception as exc:
+            logger.warning("Cloud neural TTS (%s) failed: %s", voice_name, exc)
+            return None
+
+        if not audio_bytes or len(audio_bytes) < 256:
+            return None
+
+        max_entries = 48
+        max_bytes = 4 * 1024 * 1024  # 4 MB hard cap
+        with self._lock:
+            if ckey in self._tts_mp3_cache:
+                self._tts_mp3_bytes_total -= len(self._tts_mp3_cache.pop(ckey))
+            self._tts_mp3_cache[ckey] = audio_bytes
+            self._tts_mp3_bytes_total += len(audio_bytes)
+            while len(self._tts_mp3_cache) > max_entries or self._tts_mp3_bytes_total > max_bytes:
+                _, evicted = self._tts_mp3_cache.popitem(last=False)
+                self._tts_mp3_bytes_total = max(0, self._tts_mp3_bytes_total - len(evicted))
+        return audio_bytes
+
+    def prewarm_tts_async(self, unit_id: Optional[str], voice_lang: Optional[str], vehicle_type: str = "sedan") -> None:
+        """Asynchronously pre-warm RAM MP3 cache so subsequent Web / silent Shortcut playback hits in <1ms."""
+        norm_l = normalize_voice_lang(voice_lang, default="zh-CN")
+        prof = VOICE_LANG_PROFILES.get(norm_l, {})
+        if not prof.get("cloud_neural_voice") or not _edge_tts_available():
+            return
+
+        def _worker() -> None:
+            try:
+                br = self.build_voice_brief(
+                    unit_id=unit_id,
+                    repeat=1,
+                    vehicle_type=vehicle_type,
+                    channel="siri_prewarm",
+                    voice_lang=norm_l,
+                )
+                self.synthesize_tts_mp3(str(br.get("single_text") or ""), voice_lang=norm_l)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def start_background_workers(self) -> None:
         self.weixin_bridge.sync_worker_state()
@@ -804,11 +1433,18 @@ class VoiceGatewayService:
         eff_tok = self._effective_access_token()
         pub_voice = str(vg.get("public_voice_url") or "")
         pub_mob = _infer_paired_mobile_url(pub_voice, str(vg.get("public_mobile_url") or ""))
+        geo_reg = str(prof.get("geo_region") or vg.get("geo_region") or "auto")
+        active_langs = get_active_voice_languages(vg.get("enabled_voice_langs"), geo_reg)
         return {
             "workspace_id": self._ws_id(),
             "workspace_name": str(prof.get("name") or cfg.get("community_name") or "邻里公益寻位"),
             "scene_type": str(prof.get("scene_type") or "community"),
             "preferred_voice_lang": str(prof.get("preferred_voice_lang") or ""),
+            "default_voice_lang": normalize_voice_lang(
+                prof.get("preferred_voice_lang") or vg.get("default_voice_lang") or "zh-CN"
+            ),
+            "geo_region": geo_reg,
+            "voice_languages": active_langs,
             "enabled": bool(vg.get("enabled", True)),
             "port": int(cfg.get("voice_http_port", 18791)),
             "mobile_port": int(cfg.get("mobile_http_port", 18790)),
@@ -910,14 +1546,297 @@ class VoiceGatewayService:
         single_text: str,
         repeat_count: int,
         repeat_core: str = "",
+        voice_lang: str = "zh-CN",
     ) -> str:
         clean = str(single_text or "").strip()
+        lang = normalize_voice_lang(voice_lang, default="zh-CN")
         if not clean:
+            if lang == "en-US":
+                return "No live parking broadcast information is currently available."
+            if lang == "zh-HK":
+                return "目前暫無可用車位播報資訊。"
             return "当前暂无可用停车播报信息。"
         if int(repeat_count or 1) <= 1:
             return clean
         core = str(repeat_core or "").strip() or strip_greeting_for_repeat(clean)
-        return f"{clean} 再为您重复播报一遍：{core}"
+        connectors = {
+            "zh-CN": f"再为您重复播报一遍：{core}",
+            "zh-HK": f"再為您重複播報一次：{core}",
+            "en-US": f"Repeating once more: {core}",
+            "zh-SC": f"再给您摆一遍哈：{core}",
+            "zh-NE": f"再给您念叨一遍哈：{core}",
+            "zh-SN": f"再给咱嘹一遍：{core}",
+            "zh-TW": f"再為您重複播報一遍：{core}",
+        }
+        return f"{clean} {connectors.get(lang, connectors['zh-CN'])}"
+
+    def resolve_effective_voice_lang(
+        self,
+        explicit_lang: Optional[str] = None,
+        binding: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, bool]:
+        """Return `(canonical_lang_code, is_user_or_binding_selected)`."""
+        raw_exp = str(explicit_lang or "").strip()
+        if raw_exp and raw_exp.lower() not in ("auto", "default"):
+            return normalize_voice_lang(raw_exp, default="zh-CN"), True
+        if binding and str(binding.get("voice_lang") or "").strip():
+            return normalize_voice_lang(binding.get("voice_lang"), default="zh-CN"), True
+        prof = self._ws_profile()
+        vg_cfg = config_manager.get().get("voice_gateway", {})
+        ws_pref = str(prof.get("preferred_voice_lang") or vg_cfg.get("default_voice_lang") or "zh-CN").strip()
+        return normalize_voice_lang(ws_pref, default="zh-CN"), False
+
+    def _localize_broadcast_texts(
+        self,
+        voice_lang: str,
+        user_selected_lang: bool,
+        rec: Dict[str, Any],
+        total_free: int,
+        total_spots: int,
+        unit_id: str,
+        unit_name: str,
+    ) -> Tuple[str, str, str]:
+        """
+        Render `(single_text, repeat_text, display_text)` in `voice_lang`:
+        - `zh-CN`: Standard Mandarin (preserves custom workspace greeting templates 100%).
+        - `zh-HK`: Authentic spoken Cantonese (`歡迎返屋企 / 仲有 / 優先推介 / 行返去`).
+        - `en-US`: Crisp in-car American English with translated building/strip names (`Samantha`-ready).
+        - `zh-SC`: Warm idiomatic Sichuan/Chongqing dialect (`欢迎回屋头 / 巴适得很 / 走拢单元门`).
+        - `zh-NE`: Upbeat Northeastern dialect (`妥妥滴 / 咱院里 / 溜达回单元门`).
+        - `zh-SN` / `zh-TW`: Pre-wired regional dialect templates for geo-switching.
+        """
+        prof = self._ws_profile()
+        cfg = config_manager.get()
+        full_comm = str(prof.get("name") or cfg.get("community_name") or "邻里公益寻位").strip()
+        short_site = str(prof.get("short_name") or "").strip() or extract_short_site_name(full_comm)
+        scene_type = str(prof.get("scene_type") or "community").strip().lower()
+        role_title = str(prof.get("role_title") or ("业主" if scene_type == "community" else "贵宾")).strip()
+        has_custom_tpl = bool(str(prof.get("greeting_template") or "").strip())
+
+        base_single = str(rec.get("voice_text") or "").strip() or f"全区共{total_spots}个监测车位，当前净余{total_free}位。"
+        base_repeat = str(rec.get("repeat_voice_text") or "").strip() or strip_greeting_for_repeat(base_single)
+        base_display = str(rec.get("display_text") or "").strip() or base_single
+
+        lang = normalize_voice_lang(voice_lang, default="zh-CN")
+        # Preserve admin-authored custom workspace template when user didn't explicitly override dialect
+        if lang == "zh-CN" or (not user_selected_lang and has_custom_tpl and lang != "en-US"):
+            return base_single, base_repeat, base_display
+
+        has_rec = bool(rec.get("has_recommendation")) and isinstance(rec.get("primary"), dict)
+        prim = rec.get("primary") or {}
+        bkp = rec.get("backup") if isinstance(rec.get("backup"), dict) else None
+        p_zone = str(prim.get("zone_name") or prim.get("group_name") or "")
+        p_free = int(prim.get("effective_free") or 0)
+        p_walk = int(round(float(prim.get("walk_meters") or 0)))
+        movable_cnt = int(prim.get("movable_free") or 0)
+        ped_cnt = int(prim.get("pedestrian_free") or 0)
+        clean_cnt = int(prim.get("clean_free") or p_free)
+
+        if lang == "en-US":
+            en_unit = translate_parking_term_to_english(unit_name, fallback_code=unit_id)
+            if not has_rec:
+                s_en = (
+                    "Welcome! All monitored parking spots are currently occupied. "
+                    "Please use a nearby overflow parking lot."
+                )
+                r_en = "All monitored parking spots are currently full."
+                d_en = f"📍 {en_unit} · Full (0/{total_spots} free)\nPlease head to a nearby overflow lot."
+                return s_en, r_en, d_en
+
+            en_p_zone = translate_parking_term_to_english(p_zone, fallback_code=str(prim.get("group_code") or prim.get("zone_id") or ""))
+            en_hint = ""
+            if clean_cnt <= 0 and ped_cnt > 0:
+                en_hint = " Drive slowly as pedestrians may be nearby."
+            elif clean_cnt <= 0 and movable_cnt > 0:
+                en_hint = " Light movable items may need to be shifted aside."
+
+            en_bkp_full = ""
+            en_bkp_short = ""
+            en_bkp_card = ""
+            if bkp:
+                en_b_zone = translate_parking_term_to_english(
+                    str(bkp.get("zone_name") or ""), fallback_code=str(bkp.get("group_code") or "")
+                )
+                b_free = int(bkp.get("effective_free") or 0)
+                b_walk = int(round(float(bkp.get("walk_meters") or 0)))
+                en_bkp_full = f" Backup option: {en_b_zone}, {b_free} open, {b_walk} meters walk."
+                en_bkp_short = f", backup {en_b_zone} with {b_free} open"
+                en_bkp_card = f"\n↪️ Backup: {en_b_zone} ({b_free} free · {b_walk}m)"
+
+            welcome_en = "Welcome home!" if scene_type == "community" else "Welcome!"
+            spot_word_tot = "spot" if total_free == 1 else "spots"
+            spot_word_p = "spot" if p_free == 1 else "spots"
+            s_en = (
+                f"{welcome_en} {total_free} parking {spot_word_tot} available. "
+                f"Best match: {en_p_zone}, {p_free} {spot_word_p} open, "
+                f"about {p_walk} meters walk to {en_unit}.{en_hint}{en_bkp_full}"
+            )
+            r_en = f"Best match: {en_p_zone}, {p_free} {spot_word_p} open{en_bkp_short}."
+            d_en = (
+                f"📍 {en_unit} · Total {total_free}/{total_spots} free\n"
+                f"✅ Recommended: {en_p_zone} ({p_free} free · {p_walk}m walk){en_bkp_card}"
+            )
+            return s_en, r_en, d_en
+
+        if lang == "zh-HK":
+            greet_hk = (
+                f"尊貴嘅{short_site}業主，歡迎返屋企！"
+                if scene_type == "community"
+                else f"歡迎蒞臨{short_site}！"
+            )
+            dest_hk = "單元門口" if scene_type == "community" else unit_name
+            if not has_rec:
+                s_hk = f"{greet_hk}唔好意思，目前場內監測車位已經泊滿晒，建議您直接前往周邊後備停車場。"
+                return s_hk, "目前場內車位已泊滿，建議前往周邊車場。", base_display
+
+            hint_hk = ""
+            if clean_cnt <= 0 and ped_cnt > 0:
+                hint_hk = "車位附近有人臨時停留，慢駛靠近會自動讓開。"
+            elif clean_cnt <= 0 and movable_cnt > 0:
+                hint_hk = "車位內有輕巧雜物，稍微移開即可泊入。"
+            bkp_hk = ""
+            bkp_short_hk = ""
+            if bkp:
+                bz = str(bkp.get("zone_name") or "")
+                bf = int(bkp.get("effective_free") or 0)
+                bw = int(round(float(bkp.get("walk_meters") or 0)))
+                bkp_hk = f"後備可以揀 {bz}，仲有 {bf} 個位，行路大約 {bw} 米。"
+                bkp_short_hk = f"，後備 {bz} 仲有 {bf} 個"
+            s_hk = (
+                f"{greet_hk}目前屋苑仲有 {total_free} 個車位，優先為您推介 {p_zone}，"
+                f"而家仲有 {p_free} 個位，行返去{dest_hk}大約 {p_walk} 米。{hint_hk}{bkp_hk}"
+            )
+            r_hk = f"優先推介 {p_zone}，仲有 {p_free} 個車位{bkp_short_hk}。"
+            return s_hk, r_hk, base_display
+
+        if lang == "zh-SC":
+            greet_sc = (
+                f"尊贵的{short_site}{role_title}，欢迎回屋头！"
+                if scene_type == "community"
+                else f"欢迎来到{short_site}！"
+            )
+            dest_sc = "单元门" if scene_type == "community" else unit_name
+            if not has_rec:
+                s_sc = f"{greet_sc}不好意思哈，现在院坝头车位已经停满完了，建议您直接切周边备选停车场。"
+                return s_sc, "院里头车位已经停满完了，建议切周边备选车场。", base_display
+
+            hint_sc = ""
+            if clean_cnt <= 0 and ped_cnt > 0:
+                hint_sc = "车位旁有人临时站倒起，慢点开拢自然就让开了。"
+            elif clean_cnt <= 0 and movable_cnt > 0:
+                hint_sc = "里头有个轻巧物件，顺手挪一下就能停进去。"
+            bkp_sc = ""
+            bkp_short_sc = ""
+            if bkp:
+                bz = str(bkp.get("zone_name") or "")
+                bf = int(bkp.get("effective_free") or 0)
+                bw = int(round(float(bkp.get("walk_meters") or 0)))
+                bkp_sc = f"备选还可以切 {bz}，那边还有 {bf} 个位子，走过去 {bw} 米。"
+                bkp_short_sc = f"，备选切 {bz} 还有 {bf} 个"
+            s_sc = (
+                f"{greet_sc}巴适得很，现在院里拢共还有 {total_free} 个车位，优先给您推荐 {p_zone}，"
+                f"这儿还有 {p_free} 个空位，下车走拢{dest_sc}才 {p_walk} 米。{hint_sc}{bkp_sc}"
+            )
+            r_sc = f"优先推荐切 {p_zone}，还有 {p_free} 个车位{bkp_short_sc}，安逸得很。"
+            return s_sc, r_sc, base_display
+
+        if lang == "zh-NE":
+            greet_ne = (
+                f"欢迎回家呀{short_site}家人！"
+                if scene_type == "community"
+                else f"欢迎来到{short_site}呀老铁！"
+            )
+            dest_ne = "单元门" if scene_type == "community" else unit_name
+            if not has_rec:
+                s_ne = f"{greet_ne}哎呀不好意思，咱院里车位这会儿全停满了，建议您直接奔周边备选停车场吧。"
+                return s_ne, "咱院里车位这会儿停满了，建议直接奔周边停车场。", base_display
+
+            hint_ne = ""
+            if clean_cnt <= 0 and ped_cnt > 0:
+                hint_ne = "那块儿有人临时待着呢，慢点儿往前靠就让开了。"
+            elif clean_cnt <= 0 and movable_cnt > 0:
+                hint_ne = "位上有个小物件，搭把手挪一下就能停。"
+            bkp_ne = ""
+            bkp_short_ne = ""
+            if bkp:
+                bz = str(bkp.get("zone_name") or "")
+                bf = int(bkp.get("effective_free") or 0)
+                bw = int(round(float(bkp.get("walk_meters") or 0)))
+                bkp_ne = f"备选还能奔 {bz}，那旮沓还有 {bf} 个位，走道儿 {bw} 米。"
+                bkp_short_ne = f"，备选奔 {bz} 还有 {bf} 个"
+            s_ne = (
+                f"{greet_ne}妥妥滴，咱院里现在还有 {total_free} 个车位，优先推荐您奔 {p_zone}，"
+                f"那块儿还有 {p_free} 个空位，停好车溜达回{dest_ne}也就 {p_walk} 米。{hint_ne}{bkp_ne}"
+            )
+            r_ne = f"优先奔 {p_zone}，还有 {p_free} 个车位{bkp_short_ne}，老省心了。"
+            return s_ne, r_ne, base_display
+
+        if lang == "zh-SN":
+            if not has_rec:
+                return f"欢迎回{short_site}！这会儿院里车位满咧，建议去周边备选停车场。", "院里车位满咧，请去周边车场。", base_display
+            bkp_sn = f"备选还能去 {bkp.get('zone_name')}，还有 {int(bkp.get('effective_free') or 0)} 个位。" if bkp else ""
+            s_sn = (
+                f"欢迎回家！美得很，{short_site}现在还有 {total_free} 个车位，优先推荐 {p_zone}，"
+                f"还有 {p_free} 个空位，走到单元门 {p_walk} 米。{bkp_sn}"
+            )
+            r_sn = f"优先推荐 {p_zone}，还有 {p_free} 个车位。"
+            return s_sn, r_sn, base_display
+
+        if lang == "zh-TW":
+            if not has_rec:
+                return f"歡迎回到{short_site}，目前社區車位已滿，建議您前往周邊停車場。", "目前車位已滿，請前往周邊停車場。", base_display
+            bkp_tw = f"備選推薦 {bkp.get('zone_name')}，尚餘 {int(bkp.get('effective_free') or 0)} 位。" if bkp else ""
+            s_tw = (
+                f"歡迎回家！目前{short_site}尚餘 {total_free} 個停車位，優先為您推薦 {p_zone}，"
+                f"目前還有 {p_free} 個空位，步行至單元門約 {p_walk} 公尺。{bkp_tw}"
+            )
+            r_tw = f"優先推薦 {p_zone}，尚餘 {p_free} 個車位。"
+            return s_tw, r_tw, base_display
+
+        return base_single, base_repeat, base_display
+
+    @staticmethod
+    def _match_voice_lang_command_from_text(text: str) -> Optional[str]:
+        s = str(text or "").strip()
+        if not s:
+            return None
+        low = s.lower()
+        has_switch_verb = any(
+            v in low
+            for v in (
+                "切换",
+                "换成",
+                "改成",
+                "改用",
+                "设为",
+                "设置",
+                "换用",
+                "改讲",
+                "改说",
+                "播报语言",
+                "用粤语",
+                "用四川",
+                "用东北",
+                "用英文",
+                "用英语",
+                "用普通话",
+                "讲粤语",
+                "讲四川",
+                "讲东北",
+                "说粤语",
+                "说四川",
+                "说东北",
+                "switch to",
+                "speak in",
+                "in english",
+                "use english",
+                "in cantonese",
+            )
+        )
+        if not has_switch_verb:
+            return None
+        detected = normalize_voice_lang(s, default="")
+        return detected or None
 
     def build_voice_brief(
         self,
@@ -927,6 +1846,7 @@ class VoiceGatewayService:
         entry_gate_id: Optional[str] = None,
         channel: str = "siri",
         external_uid: str = "",
+        voice_lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         with self._lock:
@@ -935,6 +1855,7 @@ class VoiceGatewayService:
         cfg = config_manager.get()
         vg_cfg = cfg.get("voice_gateway", {})
         resolved_uid, resolved_uname, binding = self.resolve_unit_id(unit_id, channel, external_uid)
+        eff_lang, user_lang_sel = self.resolve_effective_voice_lang(voice_lang, binding)
 
         if repeat is None:
             rep = int(binding.get("repeat_count") if binding else (vg_cfg.get("default_repeat") or 2))
@@ -955,12 +1876,18 @@ class VoiceGatewayService:
         total_free = sum(int(z.get("effective_free") or 0) for z in zones)
         total_spots = sum(int(z.get("total_capacity") or z.get("total_spots") or 0) for z in zones)
 
-        single_text = str(rec.get("voice_text") or "").strip()
-        if not single_text:
-            single_text = f"全区共{total_spots}个监测车位，当前净余{total_free}位。"
-        repeat_text = str(rec.get("repeat_voice_text") or "").strip() or strip_greeting_for_repeat(single_text)
-        display_text = str(rec.get("display_text") or "").strip() or single_text
-        speech_text = self.format_repeated_speech(single_text, rep, repeat_core=repeat_text)
+        single_text, repeat_text, display_text = self._localize_broadcast_texts(
+            voice_lang=eff_lang,
+            user_selected_lang=user_lang_sel,
+            rec=rec,
+            total_free=total_free,
+            total_spots=total_spots,
+            unit_id=resolved_uid,
+            unit_name=resolved_uname,
+        )
+        speech_text = self.format_repeated_speech(
+            single_text, rep, repeat_core=repeat_text, voice_lang=eff_lang
+        )
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         raw_primary = rec.get("primary")
@@ -993,6 +1920,8 @@ class VoiceGatewayService:
             "community_name": comm_label,
             "unit_id": resolved_uid,
             "unit_name": resolved_uname,
+            "voice_lang": eff_lang,
+            "apple_tts_lang": voice_lang_to_apple_tts(eff_lang),
             "repeat": rep,
             "vehicle_type": vtype,
             "has_recommendation": bool(rec.get("has_recommendation")),
@@ -1095,6 +2024,7 @@ class VoiceGatewayService:
         channel: str = "siri",
         external_uid: str = "",
         client_ip: str = "local",
+        voice_lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         with self._lock:
@@ -1107,20 +2037,33 @@ class VoiceGatewayService:
         normalized_wake = re.sub(r"[，。！？,.!?、\s]+", "", clean_q)
 
         units = self.ctx.db.list_units()
+        cmd_lang = self._match_voice_lang_command_from_text(clean_q)
 
-        # 1) Fast-path: voice binding command ("绑定8号楼1单元" / "把我家设为6-1" / "默认去5号楼")
-        if any(kw in clean_q for kw in ("绑定", "设为我家", "设置我家", "默认去", "默认单元", "记住我家")):
-            matched_u = self._match_unit_from_text(clean_q, units)
-            if matched_u:
-                target_uid = str(matched_u["unit_id"])
-                target_uname = str(matched_u["name"])
-                rep_bind = 1 if ("一遍" in clean_q or "1遍" in clean_q) else 2
+        # 1) Fast-path: voice binding command ("绑定8号楼1单元" / "切换粤语" / "用四川话播报")
+        has_unit_bind_kw = any(
+            kw in clean_q for kw in ("绑定", "设为我家", "设置我家", "默认去", "默认单元", "记住我家")
+        )
+        if has_unit_bind_kw or cmd_lang:
+            matched_u = self._match_unit_from_text(clean_q, units) if has_unit_bind_kw else None
+            if matched_u or cmd_lang:
+                resolved_cur_u, resolved_cur_uname, cur_bind = self.resolve_unit_id(
+                    unit_id, channel, external_uid
+                )
+                target_uid = str(matched_u["unit_id"]) if matched_u else resolved_cur_u
+                target_uname = str(matched_u["name"]) if matched_u else resolved_cur_uname
+                rep_bind = (
+                    1
+                    if ("一遍" in clean_q or "1遍" in clean_q)
+                    else int(cur_bind.get("repeat_count") if cur_bind else 2)
+                )
+                eff_bind_lang = cmd_lang or voice_lang
                 if external_uid:
                     self.ctx.db.upsert_im_user_binding(
                         channel=channel,
                         external_uid=external_uid,
                         unit_id=target_uid,
                         repeat_count=rep_bind,
+                        voice_lang=eff_bind_lang,
                     )
                 brief = self.build_voice_brief(
                     unit_id=target_uid,
@@ -1128,14 +2071,37 @@ class VoiceGatewayService:
                     vehicle_type=vehicle_type,
                     channel=channel,
                     external_uid=external_uid,
+                    voice_lang=eff_bind_lang,
                 )
-                ans = f"已为您绑定目的地{target_uname}。{brief['single_text']}"
+                active_l = brief.get("voice_lang") or "zh-CN"
+                lang_label = VOICE_LANG_PROFILES.get(active_l, VOICE_LANG_PROFILES["zh-CN"])["label"]
+                if matched_u and cmd_lang:
+                    prefix_ack = (
+                        f"Saved default destination {translate_parking_term_to_english(target_uname, target_uid)} and English voice. "
+                        if active_l == "en-US"
+                        else f"已为您绑定目的地{target_uname}并切换为{lang_label}。"
+                    )
+                elif matched_u:
+                    prefix_ack = (
+                        f"Saved default destination {translate_parking_term_to_english(target_uname, target_uid)}. "
+                        if active_l == "en-US"
+                        else f"已为您绑定目的地{target_uname}。"
+                    )
+                else:
+                    ack_by_lang = {
+                        "en-US": "Switched broadcast language to English. ",
+                        "zh-HK": "已為您切換為粵語播報。",
+                        "zh-SC": "巴适，已给您切成四川话播报！",
+                        "zh-NE": "妥妥滴，已给您换成东北话播报！",
+                    }
+                    prefix_ack = ack_by_lang.get(active_l, f"已为您切换为{lang_label}。")
+                ans = f"{prefix_ack}{brief['single_text']}"
                 return {
                     **brief,
                     "engine": "fast_bind",
                     "question": clean_q,
                     "answer": ans,
-                    "speech_text": self.format_repeated_speech(ans, repeat or 1),
+                    "speech_text": self.format_repeated_speech(ans, repeat or 1, voice_lang=active_l),
                     "bound_unit_id": target_uid,
                     "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
                 }
@@ -1156,6 +2122,7 @@ class VoiceGatewayService:
                 vehicle_type=vehicle_type,
                 channel=channel,
                 external_uid=external_uid,
+                voice_lang=voice_lang,
             )
             return {
                 **brief,
@@ -1172,7 +2139,9 @@ class VoiceGatewayService:
             vehicle_type=vehicle_type,
             channel=channel,
             external_uid=external_uid,
+            voice_lang=voice_lang,
         )
+        eff_lang = str(brief.get("voice_lang") or "zh-CN")
 
         if not vg_cfg.get("llm_qa_enabled", True):
             return {
@@ -1191,6 +2160,7 @@ class VoiceGatewayService:
                 kw in clean_q
                 for kw in ("车位", "停车", "空位", "停哪", "号楼", "单元", "大门", "怎么走", "倒车", "SUV", "小车", "电瓶", "挪车")
             )
+            or any(kw in q_low for kw in ("park", "spot", "stall", "unit", "building", "gate"))
         )
         is_blatant_abuse = any(
             sig in q_low
@@ -1211,8 +2181,9 @@ class VoiceGatewayService:
         )
         if is_blatant_abuse and not has_parking_intent:
             polite_ans = (
-                f"我是本小区专属车载寻位语音助手，仅提供实时车位与步行导引服务。"
-                f"{brief['single_text']}"
+                f"I am the dedicated parking voice assistant for this community. {brief['single_text']}"
+                if eff_lang == "en-US"
+                else f"我是本小区专属车载寻位语音助手，仅提供实时车位与步行导引服务。{brief['single_text']}"
             )
             rep_guard = int(repeat) if repeat is not None else 1
             return {
@@ -1220,7 +2191,7 @@ class VoiceGatewayService:
                 "engine": "domain_guardrail",
                 "question": clean_q,
                 "answer": polite_ans,
-                "speech_text": self.format_repeated_speech(polite_ans, rep_guard),
+                "speech_text": self.format_repeated_speech(polite_ans, rep_guard, voice_lang=eff_lang),
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
             }
 
@@ -1271,11 +2242,20 @@ class VoiceGatewayService:
 
         prof = self._ws_profile()
         comm_name = str(prof.get("name") or cfg.get("community_name") or "小区公益寻位")
+        lang_persona_rule = {
+            "zh-CN": "请全程使用自然亲切的标准普通话口语作答。",
+            "zh-HK": "请全程使用地道香港/广东粤语口语用词作答（例如「歡迎返屋企、仲有、優先推介、行返去單元門口」），方便粤语语音引擎朗读。",
+            "en-US": "Respond strictly in natural, concise American English suitable for Apple CarPlay TTS (< 50 words). Translate Chinese building/zone names into clear English (e.g. Building 8 Unit 1, Building 6 Left Parking Strip) so English TTS contains zero Chinese characters.",
+            "zh-SC": "请全程使用亲切地道的四川/重庆方言口语作答（自然融入「欢迎回屋头、巴适、安逸、切哪边、走拢单元门」等日常川渝表达，但数字和楼栋名保持清晰易懂）。",
+            "zh-NE": "请全程使用热情爽朗的东北方言口语作答（自然融入「妥妥滴、咱院里、那块儿、溜达回单元门、老省心了」等日常东北表达，但数字和楼栋名保持清晰易懂）。",
+            "zh-SN": "请全程使用亲切自然的陕西关中方言口语作答。",
+            "zh-TW": "請全程使用溫柔親切的繁體國語口語作答。",
+        }.get(eff_lang, "请全程使用自然亲切的标准普通话口语作答。")
         sys_prompt = (
             f"你是「{comm_name}」车载免手语音寻位助手，正在为开车的业主提供自然亲切的实时停车引导。\n"
             "【回答铁律】\n"
-            "1. 自然亲切、简洁口语化，适合车载语音直接朗读（控制在 2~3 句话、90 字以内，不要使用 Markdown 星号、列表符号或代码块）。\n"
-            "2. 严禁播报任何具体车位编号或字母数字代码（例如绝对不要说 10LH2-02、5BV7-01、02号车位 等），开车时听编号费劲且无意义；只需要清楚告诉车主：目前剩余几个车位、优先推荐停在哪个停车带（剩余几个停车位、步行到单元门约多少米），如有备选停车带再补充备选哪里、剩余几个即可。\n"
+            f"1. {lang_persona_rule}适合车载语音直接朗读（控制在 2~3 句话、90 字以内，不要使用 Markdown 星号、列表符号或代码块）。\n"
+            "2. 严禁播报任何具体车位编号或字母数字代码（例如绝对不要说 10LH2-02、5BV7-01、02号车位、Spot 02 等），开车时听编号费劲且无意义；只需要清楚告诉车主：目前剩余几个车位、优先推荐停在哪个停车带（剩余几个停车位、步行到单元门约多少米），如有备选停车带再补充备选哪里、剩余几个即可。\n"
             "3. 严格依据下方实时车位数据作答，宁少勿多，绝不编造空车位。\n"
             "4. 若用户提问与本场所停车、车位、楼栋步行路线无关，请礼貌用一句话说明你仅提供实时寻位服务，并顺带播报当前总剩余车位数。\n\n"
             f"【实时态势数据】\n"
@@ -1315,7 +2295,7 @@ class VoiceGatewayService:
             "engine": "custom_llm",
             "question": clean_q,
             "answer": clean_ans,
-            "speech_text": self.format_repeated_speech(clean_ans, rep_out),
+            "speech_text": self.format_repeated_speech(clean_ans, rep_out, voice_lang=eff_lang),
             "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
@@ -1410,17 +2390,22 @@ class VoiceGatewayService:
         mobile_base_url: str = "",
         universal_server_question: bool = False,
         device_uid: str = "",
+        voice_lang: str = "zh-CN",
+        dialect_ready: bool = False,
+        ask_lang_on_first_run: bool = True,
     ) -> bytes:
         """
         Generate an Apple Shortcuts `.shortcut` workflow definition (binary plist):
         - Avoids `WFWorkflowImportQuestions` during normal Chrome/Safari import (which triggers an iOS 26
           Chrome `openInPlace` setup-sheet hang), supporting:
-          * `fixed` (default): directly uses the unit chosen on `:18791`, 1-tap install & 0-prompt run!
-          * `setup_once`: 1-tap install (no import wizard!), prompts ONCE on 1st run and saves permanently!
+          * `fixed` (default): directly uses the unit & language chosen on `:18791`, 1-tap install & 0-prompt run!
+          * `setup_once`: 1-tap install (no import wizard!). If `ask_lang_on_first_run=True`, prompts ONCE on 1st
+            run for Unit (1/2) + Broadcast Language (2/2); if user already picked a specific language on `:18791`,
+            prompts ONCE only for Unit and binds their chosen language immediately!
           * `menu`: prompts unit list on every run.
-        - Supports 3 popup modes (`text` only, `map` only, `both` text + map, plus `silent`) and runs
-          all `downloadurl` calls BEFORE `speaktext(WFSpeakTextWait=False)` so voice and visual popup
-          launch nearly simultaneously (~30ms apart) without XPC races!
+        - Uses `is.workflow.actions.text.split` (`WFTextComponentsAction`, verified against `WorkflowKit`),
+          native `yue-HK` + `Sinji` for Cantonese, `Samantha` for English, and Cloud Neural `晓北` (`tts.mp3` +
+          `playsound`) for Northeastern `zh-NE`!
         """
         clean_base = str(base_url or "").strip().rstrip("/")
         safe_name = self.sanitize_shortcut_name(shortcut_name, "小区车位")
@@ -1429,6 +2414,11 @@ class VoiceGatewayService:
         act_mode = "ask" if str(mode or "").strip().lower() == "ask" else "brief"
         u_mode = self._normalize_unit_mode(unit_mode)
         map_mode = self._normalize_show_map_mode(show_map)
+        is_silent_audio = act_mode == "brief" and map_mode == "silent"
+        norm_vlang = coerce_shortcut_safe_voice_lang(
+            voice_lang, dialect_pack_ready=dialect_ready, allow_cloud_audio=is_silent_audio
+        )
+        vlang_label = VOICE_LANG_PROFILES.get(norm_vlang, VOICE_LANG_PROFILES["zh-CN"])["label"]
         resolved_uid, unit_display, all_units = self._resolve_unit_display_and_list(unit_id)
 
         place_clean = str(arrival_place or "").strip()
@@ -1437,11 +2427,14 @@ class VoiceGatewayService:
         vtype_label = {"sedan": "标准轿车", "suv": "大型SUV/MPV", "compact": "紧凑小车"}.get(vtype, "标准轿车")
         mode_desc = "Siri 语音提问自有大模型" if act_mode == "ask" else f"极速车位播报（{rep_val} 遍 · {vtype_label}）"
         if u_mode == "menu":
-            dest_desc = f"每次运行时从单元门列表点选（默认备选 {resolved_uid}）"
+            dest_desc = f"每次运行时从单元门列表点选（默认备选 {resolved_uid}）｜ 语言：{vlang_label}"
         elif u_mode in ("setup_once", "import_question"):
-            dest_desc = f"首次运行时弹窗选一次单元并永久记住（默认 {unit_display}）"
+            if ask_lang_on_first_run:
+                dest_desc = f"首次运行时弹窗选一次单元门与播报语言并永久记住（默认 {unit_display}）"
+            else:
+                dest_desc = f"首次运行时弹窗选一次单元门（已锁定语言：{vlang_label}）"
         else:
-            dest_desc = unit_display
+            dest_desc = f"{unit_display} ｜ 语言：{vlang_label}"
         popup_desc = {
             "text": "播报同时弹出「精炼寻位文字」",
             "map": "播报同时弹出「纯净动态平面图」",
@@ -1578,13 +2571,18 @@ class VoiceGatewayService:
             manual_title_once = "✏️ 手动输入其他单元"
             menu_titles_once.append(manual_title_once)
 
+            unit_prompt_text = (
+                "首次设置 (1/2)：请选择您的默认回家单元门（之后永久免选）"
+                if ask_lang_on_first_run
+                else f"首次设置：请选择您的默认回家单元门（已选语言：{vlang_label}，之后永久免选）"
+            )
             actions.append(
                 {
                     "WFWorkflowActionIdentifier": "is.workflow.actions.choosefrommenu",
                     "WFWorkflowActionParameters": {
                         "GroupingIdentifier": mn_grp,
                         "WFControlFlowMode": 0,
-                        "WFMenuPrompt": "首次使用请选择您的默认单元门（仅需选这一次，后续永久直连播报）",
+                        "WFMenuPrompt": unit_prompt_text,
                         "WFMenuItems": menu_titles_once,
                     },
                 }
@@ -1658,29 +2656,133 @@ class VoiceGatewayService:
                     },
                 }
             )
-            qb_prefix = f"{clean_base}/api/voice/quick-bind?uid={quote(bind_id)}&unit="
-            qb_str = f"{qb_prefix}\ufffc{tok_qs}"
-            actions.append(
-                {
-                    "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
-                    "WFWorkflowActionParameters": {
-                        "WFHTTPMethod": "GET",
-                        "WFURL": {
-                            "Value": {
-                                "attachmentsByRange": {
-                                    "{" + str(len(qb_prefix)) + ", 1}": {
-                                        "OutputName": "URL编码后的文本",
-                                        "OutputUUID": mn_enc_uuid,
-                                        "Type": "ActionOutput",
-                                    }
-                                },
-                                "string": qb_str,
+            if ask_lang_on_first_run:
+                # Step 2/2: Live geo-aware language picker (`/api/voice/languages.txt` -> `text.split`!)
+                lg_dl_uuid = str(uuid.uuid4()).upper()
+                lg_sp_uuid = str(uuid.uuid4()).upper()
+                lg_ch_uuid = str(uuid.uuid4()).upper()
+                lg_enc_uuid = str(uuid.uuid4()).upper()
+                cloud_q = "audio=cloud" if is_silent_audio else ""
+                extra_q = tok_qs.lstrip("&")
+                langs_qs_parts = [p for p in (cloud_q, extra_q) if p]
+                langs_url_qs = ("?" + "&".join(langs_qs_parts)) if langs_qs_parts else ""
+                actions.extend(
+                    [
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                            "WFWorkflowActionParameters": {
+                                "UUID": lg_dl_uuid,
+                                "WFHTTPMethod": "GET",
+                                "WFURL": f"{clean_base}/api/voice/languages.txt{langs_url_qs}",
                             },
-                            "WFSerializationType": "WFTextTokenString",
                         },
-                    },
-                }
-            )
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.text.split",
+                            "WFWorkflowActionParameters": {
+                                "UUID": lg_sp_uuid,
+                                "WFTextSeparator": "New Lines",
+                                "text": {
+                                    "Value": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": lg_dl_uuid,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.choosefromlist",
+                            "WFWorkflowActionParameters": {
+                                "UUID": lg_ch_uuid,
+                                "WFChooseFromListActionPrompt": "首次设置 (2/2)：请选择播报语言与方言（之后永久免选）",
+                                "WFInput": {
+                                    "Value": {
+                                        "OutputName": "拆分文本",
+                                        "OutputUUID": lg_sp_uuid,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.urlencode",
+                            "WFWorkflowActionParameters": {
+                                "UUID": lg_enc_uuid,
+                                "WFEncodeMode": "Encode",
+                                "WFInput": {
+                                    "Value": {
+                                        "attachmentsByRange": {
+                                            "{0, 1}": {
+                                                "OutputName": "选取的项目",
+                                                "OutputUUID": lg_ch_uuid,
+                                                "Type": "ActionOutput",
+                                            }
+                                        },
+                                        "string": "\ufffc",
+                                    },
+                                    "WFSerializationType": "WFTextTokenString",
+                                },
+                            },
+                        },
+                    ]
+                )
+                qb_prefix = f"{clean_base}/api/voice/quick-bind?uid={quote(bind_id)}&unit="
+                qb_mid = "&lang="
+                qb_u_pos = len(qb_prefix)
+                qb_l_pos = qb_u_pos + 1 + len(qb_mid)
+                qb_str = f"{qb_prefix}\ufffc{qb_mid}\ufffc{tok_qs}"
+                actions.append(
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                        "WFWorkflowActionParameters": {
+                            "WFHTTPMethod": "GET",
+                            "WFURL": {
+                                "Value": {
+                                    "attachmentsByRange": {
+                                        "{" + str(qb_u_pos) + ", 1}": {
+                                            "OutputName": "URL编码后的文本",
+                                            "OutputUUID": mn_enc_uuid,
+                                            "Type": "ActionOutput",
+                                        },
+                                        "{" + str(qb_l_pos) + ", 1}": {
+                                            "OutputName": "URL编码后的文本",
+                                            "OutputUUID": lg_enc_uuid,
+                                            "Type": "ActionOutput",
+                                        },
+                                    },
+                                    "string": qb_str,
+                                },
+                                "WFSerializationType": "WFTextTokenString",
+                            },
+                        },
+                    }
+                )
+            else:
+                qb_prefix = f"{clean_base}/api/voice/quick-bind?uid={quote(bind_id)}&lang={quote(norm_vlang)}&unit="
+                qb_str = f"{qb_prefix}\ufffc{tok_qs}"
+                actions.append(
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                        "WFWorkflowActionParameters": {
+                            "WFHTTPMethod": "GET",
+                            "WFURL": {
+                                "Value": {
+                                    "attachmentsByRange": {
+                                        "{" + str(len(qb_prefix)) + ", 1}": {
+                                            "OutputName": "URL编码后的文本",
+                                            "OutputUUID": mn_enc_uuid,
+                                            "Type": "ActionOutput",
+                                        }
+                                    },
+                                    "string": qb_str,
+                                },
+                                "WFSerializationType": "WFTextTokenString",
+                            },
+                        },
+                    }
+                )
             actions.append(
                 {
                     "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
@@ -1786,6 +2888,10 @@ class VoiceGatewayService:
                         "Text": "请输入或确认您的回家目的单元门（如 8-1、3-1 或 8号楼1单元）：",
                     }
                 )
+
+        if not use_server_bound_uid and norm_vlang != "zh-CN":
+            d_flag = "&dialect_ready=1" if dialect_ready else ("&audio=cloud" if is_silent_audio else "")
+            tok_qs = f"&lang={quote(norm_vlang)}{d_flag}{tok_qs}"
 
         if not use_server_bound_uid:
             actions.append(
@@ -2004,30 +3110,116 @@ class VoiceGatewayService:
                 }
             )
 
-        # Start speaking immediately (`WFSpeakTextWait=False`), then ~30ms later pop up the chosen view
-        # (`仅文字` / `仅平面图` / `文字+平面图`) nearly simultaneously without waiting for speech to finish!
-        actions.append(
-            {
-                "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
-                "WFWorkflowActionParameters": {
-                    "WFSpeakTextWait": False,
-                    "WFSpeakTextLanguage": "zh-CN",
-                    "WFText": {
-                        "Value": {
-                            "attachmentsByRange": {
-                                "{0, 1}": {
-                                    "OutputName": "URL的内容",
-                                    "OutputUUID": speech_out_uuid,
-                                    "Type": "ActionOutput",
-                                }
-                            },
-                            "string": "\ufffc",
+        # If `setup_once` (`use_server_bound_uid`), resolve bound language slot before audio starts;
+        # otherwise use the exact Apple TTS language chosen on `:18791` directly with zero extra network calls!
+        lang_cnt_uuid: Optional[str] = None
+        if use_server_bound_uid:
+            my_lang_dl_uuid = str(uuid.uuid4()).upper()
+            lang_cnt_uuid = str(uuid.uuid4()).upper()
+            ml_parts = [p for p in (("audio=cloud" if is_silent_audio else ""), tok_qs.lstrip("&")) if p]
+            ml_qs = ("?" + "&".join(ml_parts)) if ml_parts else ""
+            actions.extend(
+                [
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                        "WFWorkflowActionParameters": {
+                            "UUID": my_lang_dl_uuid,
+                            "WFHTTPMethod": "GET",
+                            "WFURL": f"{clean_base}/api/voice/my-lang{ml_qs}",
                         },
-                        "WFSerializationType": "WFTextTokenString",
                     },
-                },
-            }
-        )
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.count",
+                        "WFWorkflowActionParameters": {
+                            "UUID": lang_cnt_uuid,
+                            "WFCountType": "Characters",
+                            "Input": {
+                                "Value": {
+                                    "OutputName": "URL的内容",
+                                    "OutputUUID": my_lang_dl_uuid,
+                                    "Type": "ActionOutput",
+                                },
+                                "WFSerializationType": "WFTextTokenAttachment",
+                            },
+                        },
+                    },
+                ]
+            )
+
+        # Start speaking immediately (`WFSpeakTextWait=False`), then ~5ms later pop up `文字 + 平面图同屏`
+        # (`previewdocument` / `showresult`) in ONE unified view — NEVER `notification` first + map later!
+        if lang_cnt_uuid:
+            tts_mp3_bound_url: Optional[Any] = None
+            if is_silent_audio:
+                tts_mp3_bound_url = _wrap_dl_param(
+                    _make_token_url(
+                        "/api/voice/tts.mp3?unit=",
+                        f"&repeat=1&vehicle_type={quote(vtype)}{tok_qs}",
+                    )
+                )
+            _append_multilang_speaktext_actions(
+                actions,
+                speech_out_uuid,
+                lang_cnt_uuid,
+                tts_mp3_url=tts_mp3_bound_url,
+                allow_blocking_playsound=is_silent_audio,
+            )
+        elif uses_cloud_neural_shortcut_audio(norm_vlang, dialect_pack_ready=dialect_ready, map_mode=map_mode):
+            # Pure-audio `silent` mode ONLY (no visual popup to block!):
+            mp3_direct_uuid = str(uuid.uuid4()).upper()
+            mp3_url_param = _wrap_dl_param(
+                _make_token_url(
+                    "/api/voice/tts.mp3?unit=",
+                    f"&repeat=1&vehicle_type={quote(vtype)}{tok_qs}",
+                )
+            )
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                    "WFWorkflowActionParameters": {
+                        "UUID": mp3_direct_uuid,
+                        "WFHTTPMethod": "GET",
+                        "WFURL": mp3_url_param,
+                    },
+                }
+            )
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.playsound",
+                    "WFWorkflowActionParameters": {
+                        "WFInput": {
+                            "Value": {
+                                "OutputName": "URL的内容",
+                                "OutputUUID": mp3_direct_uuid,
+                                "Type": "ActionOutput",
+                            },
+                            "WFSerializationType": "WFTextTokenAttachment",
+                        }
+                    },
+                }
+            )
+        else:
+            actions.append(
+                {
+                    "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+                    "WFWorkflowActionParameters": _build_apple_speaktext_params(
+                        norm_vlang,
+                        {
+                            "Value": {
+                                "attachmentsByRange": {
+                                    "{0, 1}": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": speech_out_uuid,
+                                        "Type": "ActionOutput",
+                                    }
+                                },
+                                "string": "\ufffc",
+                            },
+                            "WFSerializationType": "WFTextTokenString",
+                        },
+                    ),
+                }
+            )
 
         if map_mode in ("both", "map") and act_mode == "brief" and hud_dl_uuid:
             # Borderless Quick Look (`previewdocument`) — renders either Map-Only (`view=map`) or Text+Map (`view=both`)!
@@ -2182,26 +3374,33 @@ class VoiceGatewayService:
             out_p = SHORTCUTS_CACHE_DIR / f".tmp_sign_out_{tag}.shortcut"
             in_p.write_bytes(unsigned_bytes)
             os.chmod(in_p, 0o644)
-            proc = subprocess.run(
-                [
-                    MACOS_SHORTCUTS_BIN,
-                    "sign",
-                    "--mode",
-                    "anyone",
-                    "--input",
-                    str(in_p),
-                    "--output",
-                    str(out_p),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=45,
-            )
-            if proc.returncode == 0 and out_p.is_file():
-                signed = out_p.read_bytes()
-                if signed[:4] == b"AEA1":
-                    return signed
-            logger.warning("macOS shortcuts sign non-AEA1 rc=%s err=%s", proc.returncode, proc.stderr[:160])
+            for attempt in range(4):
+                out_p.unlink(missing_ok=True)
+                try:
+                    proc = subprocess.run(
+                        [
+                            MACOS_SHORTCUTS_BIN,
+                            "sign",
+                            "--mode",
+                            "anyone",
+                            "--input",
+                            str(in_p),
+                            "--output",
+                            str(out_p),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=45,
+                    )
+                    if proc.returncode == 0 and out_p.is_file():
+                        signed = out_p.read_bytes()
+                        if signed[:4] == b"AEA1":
+                            return signed
+                except subprocess.TimeoutExpired:
+                    logger.warning("macOS shortcuts sign timeout on attempt %d, retrying...", attempt + 1)
+                if attempt < 3:
+                    time.sleep(0.8 * (attempt + 1))
+            logger.warning("macOS shortcuts sign failed after retries")
         except Exception as exc:
             logger.warning("macOS shortcuts sign failed: %s", exc)
         finally:
@@ -2220,15 +3419,19 @@ class VoiceGatewayService:
         show_map: str = "text",
         mode: str = "brief",
         shortcut_name: str = "小区车位",
+        fixed_unit_id: str = "",
+        locked_lang: str = "",
     ) -> bytes:
         """
         Build a universal domain-bound Apple Shortcut plist designed for Ubuntu / Linux deployment:
         - `variant_kind == "dynamic"`: Zero `WFWorkflowImportQuestions` (1-tap install in Chrome & Safari!).
           Uses `/api/voice/check-bind` (`count < 1`): if already pre-bound via `:18791` webpage or prior run,
-          speaks & pops up `text` / `map` / `both` immediately; otherwise fetches live `/api/voice/units.txt`
-          (`choosefromlist`) ONCE on Run #1 and saves permanently!
+          speaks & pops up `text` / `map` / `both` immediately in the bound language; otherwise runs a 2-step
+          first-run wizard (`/api/voice/units.txt` + `/api/voice/languages.txt` -> `/api/voice/quick-bind`) ONCE!
         - `variant_kind == "menu"`: Dynamically fetches live `/api/voice/units.txt` (`choosefromlist`) on every run
           so newly added buildings/units on Ubuntu work immediately without re-signing!
+        - `variant_kind == "fixed"`: Hardcodes `unit=<fixed_unit_id>` (CGNAT-immune unit!) while dispatching
+          Apple TTS via `/api/voice/my-lang` so Mandarin / Cantonese / English / Sichuanese / Northeastern all work!
         """
         clean_base = str(base_url or "").strip().rstrip("/")
         safe_name = self.sanitize_shortcut_name(shortcut_name, "小区车位")
@@ -2246,7 +3449,7 @@ class VoiceGatewayService:
                 "WFWorkflowActionIdentifier": "is.workflow.actions.comment",
                 "WFWorkflowActionParameters": {
                     "WFCommentActionText": (
-                        f"【{safe_name}】免手语音寻位（Apple 官方签名 · Ubuntu 云端直连版）\n"
+                        f"【{safe_name}】免手语音寻位（Apple 官方签名 · Ubuntu 多语种云端直连版）\n"
                         f"网关：{clean_base} ｜ 显示：{popup_desc}"
                     )
                 },
@@ -2257,6 +3460,8 @@ class VoiceGatewayService:
             ask_q_uuid = str(uuid.uuid4()).upper()
             enc_q_uuid = str(uuid.uuid4()).upper()
             ans_uuid = str(uuid.uuid4()).upper()
+            my_lang_uuid = str(uuid.uuid4()).upper()
+            lang_cnt_uuid = str(uuid.uuid4()).upper()
             actions.append(
                 {
                     "WFWorkflowActionIdentifier": "is.workflow.actions.ask",
@@ -2291,49 +3496,58 @@ class VoiceGatewayService:
                 }
             )
             ask_prefix = f"{clean_base}/api/voice/ask?format=text&q="
-            actions.append(
-                {
-                    "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
-                    "WFWorkflowActionParameters": {
-                        "UUID": ans_uuid,
-                        "WFHTTPMethod": "GET",
-                        "WFURL": {
-                            "Value": {
-                                "attachmentsByRange": {
-                                    "{" + str(len(ask_prefix)) + ", 1}": {
-                                        "OutputName": "URL编码后的文本",
-                                        "OutputUUID": enc_q_uuid,
-                                        "Type": "ActionOutput",
-                                    }
+            actions.extend(
+                [
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                        "WFWorkflowActionParameters": {
+                            "UUID": ans_uuid,
+                            "WFHTTPMethod": "GET",
+                            "WFURL": {
+                                "Value": {
+                                    "attachmentsByRange": {
+                                        "{" + str(len(ask_prefix)) + ", 1}": {
+                                            "OutputName": "URL编码后的文本",
+                                            "OutputUUID": enc_q_uuid,
+                                            "Type": "ActionOutput",
+                                        }
+                                    },
+                                    "string": f"{ask_prefix}\ufffc",
                                 },
-                                "string": f"{ask_prefix}\ufffc",
+                                "WFSerializationType": "WFTextTokenString",
                             },
-                            "WFSerializationType": "WFTextTokenString",
                         },
                     },
-                }
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                        "WFWorkflowActionParameters": {
+                            "UUID": my_lang_uuid,
+                            "WFHTTPMethod": "GET",
+                            "WFURL": f"{clean_base}/api/voice/my-lang",
+                        },
+                    },
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.count",
+                        "WFWorkflowActionParameters": {
+                            "UUID": lang_cnt_uuid,
+                            "WFCountType": "Characters",
+                            "Input": {
+                                "Value": {
+                                    "OutputName": "URL的内容",
+                                    "OutputUUID": my_lang_uuid,
+                                    "Type": "ActionOutput",
+                                },
+                                "WFSerializationType": "WFTextTokenAttachment",
+                            },
+                        },
+                    },
+                ]
             )
-            actions.append(
-                {
-                    "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
-                    "WFWorkflowActionParameters": {
-                        "WFSpeakTextWait": False,
-                        "WFSpeakTextLanguage": "zh-CN",
-                        "WFText": {
-                            "Value": {
-                                "attachmentsByRange": {
-                                    "{0, 1}": {
-                                        "OutputName": "URL的内容",
-                                        "OutputUUID": ans_uuid,
-                                        "Type": "ActionOutput",
-                                    }
-                                },
-                                "string": "\ufffc",
-                            },
-                            "WFSerializationType": "WFTextTokenString",
-                        },
-                    },
-                }
+            _append_multilang_speaktext_actions(
+                actions,
+                ans_uuid,
+                lang_cnt_uuid,
+                allow_blocking_playsound=False,
             )
             actions.append(
                 {
@@ -2357,6 +3571,7 @@ class VoiceGatewayService:
             )
         else:
             enc_menu_unit_uuid: Optional[str] = None
+            fixed_u_clean = quote(str(fixed_unit_id or "").strip())
             if variant_kind == "menu":
                 u_dl = str(uuid.uuid4()).upper()
                 u_sp = str(uuid.uuid4()).upper()
@@ -2373,7 +3588,7 @@ class VoiceGatewayService:
                             },
                         },
                         {
-                            "WFWorkflowActionIdentifier": "is.workflow.actions.splittext",
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.text.split",
                             "WFWorkflowActionParameters": {
                                 "UUID": u_sp,
                                 "WFTextSeparator": "New Lines",
@@ -2394,7 +3609,7 @@ class VoiceGatewayService:
                                 "WFChooseFromListActionPrompt": "请选择回家目的单元门",
                                 "WFInput": {
                                     "Value": {
-                                        "OutputName": "拆分后的文本",
+                                        "OutputName": "拆分文本",
                                         "OutputUUID": u_sp,
                                         "Type": "ActionOutput",
                                     },
@@ -2424,6 +3639,8 @@ class VoiceGatewayService:
                         },
                     ]
                 )
+            elif variant_kind == "fixed":
+                pass
             else:
                 chk_uuid = str(uuid.uuid4()).upper()
                 cnt_uuid = str(uuid.uuid4()).upper()
@@ -2432,7 +3649,14 @@ class VoiceGatewayService:
                 u_sp = str(uuid.uuid4()).upper()
                 u_ch = str(uuid.uuid4()).upper()
                 u_en = str(uuid.uuid4()).upper()
+                lg_dl = str(uuid.uuid4()).upper()
+                lg_sp = str(uuid.uuid4()).upper()
+                lg_ch = str(uuid.uuid4()).upper()
+                lg_en = str(uuid.uuid4()).upper()
                 qb_prefix = f"{clean_base}/api/voice/quick-bind?unit="
+                qb_mid = "&lang="
+                qb_u_pos = len(qb_prefix)
+                qb_l_pos = qb_u_pos + 1 + len(qb_mid)
                 actions.extend(
                     [
                         {
@@ -2487,7 +3711,7 @@ class VoiceGatewayService:
                             },
                         },
                         {
-                            "WFWorkflowActionIdentifier": "is.workflow.actions.splittext",
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.text.split",
                             "WFWorkflowActionParameters": {
                                 "UUID": u_sp,
                                 "WFTextSeparator": "New Lines",
@@ -2505,10 +3729,14 @@ class VoiceGatewayService:
                             "WFWorkflowActionIdentifier": "is.workflow.actions.choosefromlist",
                             "WFWorkflowActionParameters": {
                                 "UUID": u_ch,
-                                "WFChooseFromListActionPrompt": "首次使用请点选默认单元门（仅需选一次，后续永久直连）",
+                                "WFChooseFromListActionPrompt": (
+                                    f"首次设置：请点选默认回家单元门（已锁定 {VOICE_LANG_PROFILES.get(locked_lang, {}).get('short_label', locked_lang)}）"
+                                    if locked_lang
+                                    else "首次设置 (1/2)：请点选默认回家单元门（之后永久免选）"
+                                ),
                                 "WFInput": {
                                     "Value": {
-                                        "OutputName": "拆分后的文本",
+                                        "OutputName": "拆分文本",
                                         "OutputUUID": u_sp,
                                         "Type": "ActionOutput",
                                     },
@@ -2536,6 +3764,11 @@ class VoiceGatewayService:
                                 },
                             },
                         },
+                    ]
+                )
+                if locked_lang:
+                    qb_locked_p = f"{clean_base}/api/voice/quick-bind?lang={quote(locked_lang)}&unit="
+                    actions.append(
                         {
                             "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
                             "WFWorkflowActionParameters": {
@@ -2543,29 +3776,120 @@ class VoiceGatewayService:
                                 "WFURL": {
                                     "Value": {
                                         "attachmentsByRange": {
-                                            "{" + str(len(qb_prefix)) + ", 1}": {
+                                            "{" + str(len(qb_locked_p)) + ", 1}": {
                                                 "OutputName": "URL编码后的文本",
                                                 "OutputUUID": u_en,
                                                 "Type": "ActionOutput",
                                             }
                                         },
-                                        "string": f"{qb_prefix}\ufffc",
+                                        "string": f"{qb_locked_p}\ufffc",
                                     },
                                     "WFSerializationType": "WFTextTokenString",
                                 },
                             },
-                        },
-                        {
-                            "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
-                            "WFWorkflowActionParameters": {
-                                "GroupingIdentifier": if_grp,
-                                "WFControlFlowMode": 2,
+                        }
+                    )
+                else:
+                    actions.extend(
+                        [
+                            {
+                                "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                                "WFWorkflowActionParameters": {
+                                    "UUID": lg_dl,
+                                    "WFHTTPMethod": "GET",
+                                    "WFURL": (
+                                        f"{clean_base}/api/voice/languages.txt?audio=cloud"
+                                        if map_mode == "silent"
+                                        else f"{clean_base}/api/voice/languages.txt"
+                                    ),
+                                },
                             },
+                            {
+                                "WFWorkflowActionIdentifier": "is.workflow.actions.text.split",
+                                "WFWorkflowActionParameters": {
+                                    "UUID": lg_sp,
+                                    "WFTextSeparator": "New Lines",
+                                    "text": {
+                                        "Value": {
+                                            "OutputName": "URL的内容",
+                                            "OutputUUID": lg_dl,
+                                            "Type": "ActionOutput",
+                                        },
+                                        "WFSerializationType": "WFTextTokenAttachment",
+                                    },
+                                },
+                            },
+                            {
+                                "WFWorkflowActionIdentifier": "is.workflow.actions.choosefromlist",
+                                "WFWorkflowActionParameters": {
+                                    "UUID": lg_ch,
+                                    "WFChooseFromListActionPrompt": "首次设置 (2/2)：请选择播报语言与方言（之后永久免选）",
+                                    "WFInput": {
+                                        "Value": {
+                                            "OutputName": "拆分文本",
+                                            "OutputUUID": lg_sp,
+                                            "Type": "ActionOutput",
+                                        },
+                                        "WFSerializationType": "WFTextTokenAttachment",
+                                    },
+                                },
+                            },
+                            {
+                                "WFWorkflowActionIdentifier": "is.workflow.actions.urlencode",
+                                "WFWorkflowActionParameters": {
+                                    "UUID": lg_en,
+                                    "WFEncodeMode": "Encode",
+                                    "WFInput": {
+                                        "attachmentsByRange": {
+                                            "{0, 1}": {
+                                                "OutputName": "选取的项目",
+                                                "OutputUUID": lg_ch,
+                                                "Type": "ActionOutput",
+                                            }
+                                        },
+                                        "string": "\ufffc",
+                                    },
+                                    "WFSerializationType": "WFTextTokenString",
+                                },
+                            },
+                            {
+                                "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                                "WFWorkflowActionParameters": {
+                                    "WFHTTPMethod": "GET",
+                                    "WFURL": {
+                                        "Value": {
+                                            "attachmentsByRange": {
+                                                "{" + str(qb_u_pos) + ", 1}": {
+                                                    "OutputName": "URL编码后的文本",
+                                                    "OutputUUID": u_en,
+                                                    "Type": "ActionOutput",
+                                                },
+                                                "{" + str(qb_l_pos) + ", 1}": {
+                                                    "OutputName": "URL编码后的文本",
+                                                    "OutputUUID": lg_en,
+                                                    "Type": "ActionOutput",
+                                                },
+                                            },
+                                            "string": f"{qb_prefix}\ufffc{qb_mid}\ufffc",
+                                        },
+                                        "WFSerializationType": "WFTextTokenString",
+                                    },
+                                },
+                            },
+                        ]
+                    )
+                actions.append(
+                    {
+                        "WFWorkflowActionIdentifier": "is.workflow.actions.conditional",
+                        "WFWorkflowActionParameters": {
+                            "GroupingIdentifier": if_grp,
+                            "WFControlFlowMode": 2,
                         },
-                    ]
+                    }
                 )
 
             def _pack_url(path_prefix: str, suffix: str = "") -> Any:
+                lang_q = f"&lang={quote(locked_lang)}" if locked_lang else ""
                 if enc_menu_unit_uuid:
                     full_p = f"{clean_base}{path_prefix}"
                     return {
@@ -2577,20 +3901,60 @@ class VoiceGatewayService:
                                     "Type": "ActionOutput",
                                 }
                             },
-                            "string": f"{full_p}\ufffc{suffix}",
+                            "string": f"{full_p}\ufffc{suffix}{lang_q}",
                         },
                         "WFSerializationType": "WFTextTokenString",
                     }
-                return f"{clean_base}{path_prefix}{suffix}"
+                if variant_kind == "fixed" and fixed_u_clean:
+                    return f"{clean_base}{path_prefix}{fixed_u_clean}{suffix}{lang_q}"
+                return f"{clean_base}{path_prefix}{suffix}{lang_q}"
 
             speech_uuid = str(uuid.uuid4()).upper()
+            my_lang_uuid: Optional[str] = None
+            lang_cnt_uuid: Optional[str] = None
+            is_pack_silent = map_mode == "silent"
+            cloud_sfx = "&audio=cloud" if is_pack_silent else ""
+            if not locked_lang:
+                my_lang_uuid = str(uuid.uuid4()).upper()
+                lang_cnt_uuid = str(uuid.uuid4()).upper()
+                actions.extend(
+                    [
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                            "WFWorkflowActionParameters": {
+                                "UUID": my_lang_uuid,
+                                "WFHTTPMethod": "GET",
+                                "WFURL": (
+                                    f"{clean_base}/api/voice/my-lang?audio=cloud"
+                                    if is_pack_silent
+                                    else f"{clean_base}/api/voice/my-lang"
+                                ),
+                            },
+                        },
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.count",
+                            "WFWorkflowActionParameters": {
+                                "UUID": lang_cnt_uuid,
+                                "WFCountType": "Characters",
+                                "Input": {
+                                    "Value": {
+                                        "OutputName": "URL的内容",
+                                        "OutputUUID": my_lang_uuid,
+                                        "Type": "ActionOutput",
+                                    },
+                                    "WFSerializationType": "WFTextTokenAttachment",
+                                },
+                            },
+                        },
+                    ]
+                )
             actions.append(
                 {
                     "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
                     "WFWorkflowActionParameters": {
                         "UUID": speech_uuid,
                         "WFHTTPMethod": "GET",
-                        "WFURL": _pack_url("/api/voice/brief?unit=", "&repeat=2&format=speech"),
+                        "WFURL": _pack_url("/api/voice/brief?unit=", f"&repeat=2&format=speech{cloud_sfx}"),
                     },
                 }
             )
@@ -2626,28 +3990,64 @@ class VoiceGatewayService:
                     }
                 )
 
-            actions.append(
-                {
-                    "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
-                    "WFWorkflowActionParameters": {
-                        "WFSpeakTextWait": False,
-                        "WFSpeakTextLanguage": "zh-CN",
-                        "WFText": {
-                            "Value": {
-                                "attachmentsByRange": {
-                                    "{0, 1}": {
-                                        "OutputName": "URL的内容",
-                                        "OutputUUID": speech_uuid,
-                                        "Type": "ActionOutput",
+            if locked_lang:
+                if uses_cloud_neural_shortcut_audio(locked_lang, dialect_pack_ready=False, map_mode=map_mode):
+                    mp3_pack_uuid = str(uuid.uuid4()).upper()
+                    actions.extend(
+                        [
+                            {
+                                "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
+                                "WFWorkflowActionParameters": {
+                                    "UUID": mp3_pack_uuid,
+                                    "WFHTTPMethod": "GET",
+                                    "WFURL": _pack_url("/api/voice/tts.mp3?unit=", "&repeat=1"),
+                                },
+                            },
+                            {
+                                "WFWorkflowActionIdentifier": "is.workflow.actions.playsound",
+                                "WFWorkflowActionParameters": {
+                                    "WFInput": {
+                                        "Value": {
+                                            "OutputName": "URL的内容",
+                                            "OutputUUID": mp3_pack_uuid,
+                                            "Type": "ActionOutput",
+                                        },
+                                        "WFSerializationType": "WFTextTokenAttachment",
                                     }
                                 },
-                                "string": "\ufffc",
                             },
-                            "WFSerializationType": "WFTextTokenString",
-                        },
-                    },
-                }
-            )
+                        ]
+                    )
+                else:
+                    actions.append(
+                        {
+                            "WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+                            "WFWorkflowActionParameters": _build_apple_speaktext_params(
+                                locked_lang,
+                                {
+                                    "Value": {
+                                        "attachmentsByRange": {
+                                            "{0, 1}": {
+                                                "OutputName": "URL的内容",
+                                                "OutputUUID": speech_uuid,
+                                                "Type": "ActionOutput",
+                                            }
+                                        },
+                                        "string": "\ufffc",
+                                    },
+                                    "WFSerializationType": "WFTextTokenString",
+                                },
+                            ),
+                        }
+                    )
+            elif lang_cnt_uuid:
+                _append_multilang_speaktext_actions(
+                    actions,
+                    speech_uuid,
+                    lang_cnt_uuid,
+                    tts_mp3_url=(_pack_url("/api/voice/tts.mp3?unit=", "&repeat=1") if is_pack_silent else None),
+                    allow_blocking_playsound=is_pack_silent,
+                )
 
             if map_mode == "text" and card_uuid:
                 actions.append(
@@ -2706,11 +4106,12 @@ class VoiceGatewayService:
         base_url: str,
         include_fixed_units: bool = True,
         target_root: Optional[Path] = None,
+        force_resign: bool = True,
     ) -> Dict[str, Any]:
         """
-        Pre-sign a complete multi-mode Ubuntu-Ready `.shortcut` pack (`text`, `map`, `both`,
-        `silent`, `ask` + `menu` + optional per-unit `fixed` presets) on macOS so Ubuntu 24.04
-        serves Apple-signed `AEA1` shortcuts for EVERY popup option without `/usr/bin/shortcuts`.
+        Pre-sign a complete multi-mode & multi-language Ubuntu-Ready `.shortcut` pack (`text`,
+        `map`, `both`, `silent`, `ask` + `menu` + optional per-unit `fixed` presets) on macOS
+        so Ubuntu 24.04 serves Apple-signed `AEA1` shortcuts for EVERY popup & dialect option.
         """
         clean_base = str(base_url or "").strip().rstrip("/")
         if not clean_base:
@@ -2723,7 +4124,7 @@ class VoiceGatewayService:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         jobs: List[Tuple[str, bytes]] = []
-        # 1) Dynamic Smart-Once variants (`text`, `map`, `both`, `silent`, `ask`)
+        # 1) Dynamic Smart-Once variants (`text`, `map`, `both`, `silent`, `ask`) — 2-step Unit + Language picker!
         for mm in ("text", "map", "both", "silent"):
             jobs.append(
                 (
@@ -2737,7 +4138,7 @@ class VoiceGatewayService:
                 self.build_ubuntu_pack_variant_plist(clean_base, variant_kind="dynamic", show_map="text", mode="ask"),
             )
         )
-        # 2) Live-Server Menu variants (`text`, `map`, `both`, `silent`)
+        # 2) Live-Server Menu variants (`text`, `map`, `both`, `silent`) + CGNAT-immune `zh-HK` / `en-US` / `zh-NE` locked packs!
         for mm in ("text", "map", "both", "silent"):
             jobs.append(
                 (
@@ -2745,7 +4146,24 @@ class VoiceGatewayService:
                     self.build_ubuntu_pack_variant_plist(clean_base, variant_kind="menu", show_map=mm, mode="brief"),
                 )
             )
-        # 3) Dedicated CGNAT-immune per-unit fixed presets for existing units (`text`, `map`, `both`)
+            for lcode in ("zh-HK", "en-US", "zh-NE"):
+                jobs.append(
+                    (
+                        f"dynamic_{mm}_{lcode}.shortcut",
+                        self.build_ubuntu_pack_variant_plist(
+                            clean_base, variant_kind="dynamic", show_map=mm, mode="brief", locked_lang=lcode
+                        ),
+                    )
+                )
+                jobs.append(
+                    (
+                        f"menu_{mm}_{lcode}.shortcut",
+                        self.build_ubuntu_pack_variant_plist(
+                            clean_base, variant_kind="menu", show_map=mm, mode="brief", locked_lang=lcode
+                        ),
+                    )
+                )
+        # 3) Dedicated CGNAT-immune per-unit fixed presets (`text`, `map`, `both`) with multi-language `my-lang` dispatch!
         unit_ids_signed: List[str] = []
         if include_fixed_units and hasattr(self.ctx, "db") and self.ctx.db is not None:
             for u in (self.ctx.db.list_units() or [])[:16]:
@@ -2758,13 +4176,12 @@ class VoiceGatewayService:
                     jobs.append(
                         (
                             f"fixed_{mm}_{safe_u}.shortcut",
-                            self.build_siri_shortcut_plist(
+                            self.build_ubuntu_pack_variant_plist(
                                 base_url=clean_base,
-                                unit_id=uid,
-                                repeat=2,
-                                unit_mode="fixed",
+                                variant_kind="fixed",
                                 show_map=mm,
                                 mode="brief",
+                                fixed_unit_id=uid,
                             ),
                         )
                     )
@@ -2773,7 +4190,7 @@ class VoiceGatewayService:
         with self._sign_lock:
             for fname, raw_plist in jobs:
                 dest = out_dir / fname
-                if dest.is_file() and dest.read_bytes()[:4] == b"AEA1":
+                if not force_resign and dest.is_file() and dest.read_bytes()[:4] == b"AEA1":
                     signed_files[fname] = dest.stat().st_size
                     continue
                 signed_b = self._sign_plist_via_macos_cli(raw_plist)
@@ -2785,8 +4202,10 @@ class VoiceGatewayService:
         manifest = {
             "base_url": clean_base,
             "slug": slug,
+            "pack_version": "2.0-multilang",
             "modes": ["text", "map", "both", "silent", "ask"],
             "unit_modes": ["fixed", "setup_once", "menu"],
+            "voice_languages": list(VOICE_LANG_PROFILES.keys()),
             "fixed_units": unit_ids_signed,
             "files": signed_files,
             "generated_at": datetime.datetime.now().isoformat(),
@@ -2810,9 +4229,11 @@ class VoiceGatewayService:
         map_mode: str,
         u_mode: str,
         resolved_uid: str,
+        voice_lang: str = "zh-CN",
+        ask_lang_on_first_run: bool = True,
     ) -> Optional[Tuple[bytes, str]]:
         """
-        Locate the exact Apple-signed (`AEA1`) `.shortcut` file for `(effective_base, act_mode, map_mode, u_mode, resolved_uid)`
+        Locate the exact Apple-signed (`AEA1`) `.shortcut` file for `(effective_base, act_mode, map_mode, u_mode, resolved_uid, voice_lang)`
         when running on Ubuntu / Linux without `/usr/bin/shortcuts`.
         """
         slug = _pack_slug_for_base_url(effective_base)
@@ -2836,17 +4257,28 @@ class VoiceGatewayService:
 
         norm_map = map_mode if map_mode in ("text", "map", "both", "silent") else "both"
         safe_u = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(resolved_uid or "").strip())
+        safe_l = coerce_shortcut_safe_voice_lang(
+            voice_lang, dialect_pack_ready=False, allow_cloud_audio=(norm_map == "silent")
+        )
 
         candidates_rel: List[str] = []
         if act_mode == "ask":
             candidates_rel.append("dynamic_ask.shortcut")
         else:
             if u_mode == "menu":
+                if safe_l in ("zh-HK", "en-US", "zh-NE"):
+                    candidates_rel.append(f"menu_{norm_map}_{safe_l}.shortcut")
                 candidates_rel.append(f"menu_{norm_map}.shortcut")
-            elif u_mode == "fixed" and safe_u:
-                candidates_rel.append(f"fixed_{norm_map}_{safe_u}.shortcut")
+            elif u_mode == "fixed":
+                if safe_l in ("zh-HK", "en-US", "zh-NE"):
+                    # Language-locked variant guarantees `yue-HK` / `en-US` / `zh-NE` voice even across 5G IP changes!
+                    candidates_rel.append(f"dynamic_{norm_map}_{safe_l}.shortcut")
+                if safe_u:
+                    candidates_rel.append(f"fixed_{norm_map}_{safe_u}.shortcut")
                 candidates_rel.append(f"dynamic_{norm_map}.shortcut")
             else:
+                if not ask_lang_on_first_run and safe_l in ("zh-HK", "en-US", "zh-NE"):
+                    candidates_rel.append(f"dynamic_{norm_map}_{safe_l}.shortcut")
                 candidates_rel.append(f"dynamic_{norm_map}.shortcut")
             candidates_rel.append(f"menu_{norm_map}.shortcut")
             candidates_rel.append("dynamic_text.shortcut")
@@ -2919,14 +4351,16 @@ class VoiceGatewayService:
         arrival_radius_m: int = 200,
         mobile_base_url: str = "",
         device_uid: str = "",
+        voice_lang: str = "zh-CN",
+        dialect_ready: bool = False,
+        ask_lang_on_first_run: bool = True,
     ) -> Tuple[bytes, bool, str]:
         """
         Build and return `(shortcut_bytes, is_apple_signed, delivery_source)`.
         1. Checks memory LRU + `data/shortcuts/signed_<hash>.shortcut` (`AEA1`).
         2. On macOS, invokes `/usr/bin/shortcuts sign --mode anyone` automatically and
            caches the signed `AEA1` archive.
-        3. On Linux/Docker/Windows, falls back to `data/shortcuts/universal-signed.shortcut`
-           if pre-signed in `./data`.
+        3. On Linux/Docker/Windows, falls back to `app/presigned_shortcuts` / `universal-signed.shortcut`.
         """
         effective_base = self._prefer_lan_base_url(base_url)
         rep_val = 1 if int(repeat or 2) <= 1 else 2
@@ -2935,6 +4369,11 @@ class VoiceGatewayService:
         act_mode = "ask" if str(mode or "").strip().lower() == "ask" else "brief"
         u_mode = self._normalize_unit_mode(unit_mode)
         map_mode = self._normalize_show_map_mode(show_map)
+        norm_vlang = coerce_shortcut_safe_voice_lang(
+            voice_lang,
+            dialect_pack_ready=dialect_ready,
+            allow_cloud_audio=(act_mode == "brief" and map_mode == "silent"),
+        )
         place_clean = str(arrival_place or "").strip()
         radius_clean = max(50, min(2000, int(arrival_radius_m or 200)))
         clean_dev_uid = re.sub(r"[^a-zA-Z0-9_-]+", "", str(device_uid or "").strip())[:36]
@@ -2946,8 +4385,8 @@ class VoiceGatewayService:
         )
 
         key_raw = (
-            f"v11|{self._ws_id()}|{effective_base}|{resolved_uid}|{units_digest}|{rep_val}|{vtype}|"
-            f"{act_mode}|{safe_name}|{u_mode}|{map_mode}|{place_clean}|{radius_clean}|{mobile_base_url}|{clean_dev_uid}|{token}"
+            f"v15|{self._ws_id()}|{effective_base}|{resolved_uid}|{units_digest}|{rep_val}|{vtype}|"
+            f"{act_mode}|{safe_name}|{u_mode}|{map_mode}|{norm_vlang}|{int(dialect_ready)}|{int(ask_lang_on_first_run)}|{place_clean}|{radius_clean}|{mobile_base_url}|{clean_dev_uid}|{token}"
         )
         cache_key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()[:16]
 
@@ -2984,6 +4423,9 @@ class VoiceGatewayService:
             arrival_radius_m=radius_clean,
             mobile_base_url=mobile_base_url,
             device_uid=clean_dev_uid,
+            voice_lang=norm_vlang,
+            dialect_ready=dialect_ready,
+            ask_lang_on_first_run=ask_lang_on_first_run,
         )
 
         if _can_macos_sign_shortcuts():
@@ -3012,6 +4454,8 @@ class VoiceGatewayService:
             map_mode=map_mode,
             u_mode=u_mode,
             resolved_uid=resolved_uid,
+            voice_lang=norm_vlang,
+            ask_lang_on_first_run=ask_lang_on_first_run,
         )
         if pack_match is not None:
             return pack_match[0], True, pack_match[1]
@@ -3328,6 +4772,7 @@ class VoiceGatewayService:
         token: str = "",
         view_mode: str = "both",
         external_uid: str = "",
+        voice_lang: Optional[str] = None,
     ) -> str:
         """
         Render a 100% self-contained, borderless Apple Quick Look Dynamic Map Card.
@@ -3340,7 +4785,10 @@ class VoiceGatewayService:
             vehicle_type=vehicle_type,
             channel="siri",
             external_uid=external_uid,
+            voice_lang=voice_lang,
         )
+        eff_lang = str(brief.get("voice_lang") or "zh-CN")
+        is_en = eff_lang == "en-US"
         svg_markup = self.render_inline_dynamic_map_svg(
             target_unit_id=brief.get("unit_id"),
             vehicle_type=brief.get("vehicle_type") or "sedan",
@@ -3357,53 +4805,72 @@ class VoiceGatewayService:
 
         short_site = extract_short_site_name(str(brief.get("community_name") or "小区"))
         uname = str(brief.get("unit_name") or brief.get("unit_id") or "")
+        if is_en:
+            uname = translate_parking_term_to_english(uname, str(brief.get("unit_id") or ""))
         tot_free = int(brief.get("total_effective_free") or 0)
         tot_spots = int(brief.get("total_spots") or 0)
         is_map_only = str(view_mode or "").strip().lower() in ("map", "map_only", "only_map")
 
         pz = brief.get("primary_zone")
         if pz:
-            headline = _esc(pz.get("zone_name") or "推荐停车区")
+            raw_zn = str(pz.get("zone_name") or "推荐停车区")
+            headline = _esc(translate_parking_term_to_english(raw_zn) if is_en else raw_zn)
             sub_metrics = (
-                f"推荐区余 {int(pz.get('effective_free') or 0)} 位 · "
-                f"步行约 {int(round(float(pz.get('distance_m') or 0)))} 米"
+                f"{int(pz.get('effective_free') or 0)} free · ~{int(round(float(pz.get('distance_m') or 0)))}m walk"
+                if is_en
+                else f"推荐区余 {int(pz.get('effective_free') or 0)} 位 · 步行约 {int(round(float(pz.get('distance_m') or 0)))} 米"
             )
         else:
-            headline = "当前院内监测车位已满"
-            sub_metrics = "建议前往周边备选停车场"
+            headline = "All Monitored Spots Occupied" if is_en else "当前院内监测车位已满"
+            sub_metrics = "Please head to a nearby overflow lot" if is_en else "建议前往周边备选停车场"
 
         alt_line = ""
         alts = brief.get("alternatives") or []
         if alts:
             a0 = alts[0]
+            a0_name = (
+                translate_parking_term_to_english(str(a0.get("display_name") or ""))
+                if is_en
+                else str(a0.get("display_name") or "")
+            )
             alt_line = (
-                f'<div class="alt">备选：{_esc(a0.get("display_name"))}（余 {int(a0.get("effective_free") or 0)} 位'
+                f'<div class="alt">Backup: {_esc(a0_name)} ({int(a0.get("effective_free") or 0)} free'
+                f' · {int(round(float(a0.get("distance_m") or 0)))}m)</div>'
+                if is_en
+                else f'<div class="alt">备选：{_esc(a0_name)}（余 {int(a0.get("effective_free") or 0)} 位'
                 f' · 步行 {int(round(float(a0.get("distance_m") or 0)))}m）</div>'
             )
 
         pill_cls = "pill-ok" if tot_free > 0 else "pill-full"
+        pill_short = f"{tot_free}/{tot_spots} Free" if is_en else f"余 {tot_free}/{tot_spots} 位"
+        pill_long = f"Total {tot_free}/{tot_spots} Free" if is_en else f"总余 {tot_free}/{tot_spots} 位"
         top_card_html = (
             f"""<div class="mini-head">
     <span class="dest">📍 {_esc(short_site)} · {_esc(uname)}</span>
-    <span class="pill {pill_cls}">余 {tot_free}/{tot_spots} 位</span>
+    <span class="pill {pill_cls}">{pill_short}</span>
   </div>"""
             if is_map_only
             else f"""<section class="card">
     <div class="row-top">
       <span class="dest">📍 {_esc(short_site)} · {_esc(uname)}</span>
-      <span class="pill {pill_cls}">总余 {tot_free}/{tot_spots} 位</span>
+      <span class="pill {pill_cls}">{pill_long}</span>
     </div>
     <h1 class="zone">{headline}</h1>
     <div class="metrics">{_esc(sub_metrics)}</div>
     {alt_line}
   </section>"""
         )
+        lg_free = "Free" if is_en else "空闲"
+        lg_occ = "Occupied" if is_en else "已停"
+        lg_drv = "Drive" if is_en else "行车"
+        lg_wlk = "Walk" if is_en else "步行"
+        lg_tip = "Pinch to zoom · Tap stall" if is_en else "双指缩放 · 点车位看状态"
         return f"""<!doctype html>
-<html lang="zh-CN">
+<html lang="{'en' if is_en else 'zh-CN'}">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=4,viewport-fit=cover" />
-<title>{_esc(short_site)} · 实时车位态势</title>
+<title>{_esc(short_site)} · {'Live Parking' if is_en else '实时车位态势'}</title>
 <style>
 :root{{--bg:#f5f5f7;--card:#ffffff;--text:#1d1d1f;--muted:#6e6e73;--accent:#0071e3;--line:rgba(0,0,0,0.07)}}
 *{{box-sizing:border-box;-webkit-tap-highlight-color:transparent}}
@@ -3437,12 +4904,12 @@ body{{margin:0;padding:12px;background:var(--bg);color:var(--text);font-family:-
     <div class="map-stage" id="mapStage">{svg_markup}</div>
     <div class="legend">
       <div class="dots">
-        <span class="dot"><i style="background:#16A34A"></i>空闲</span>
-        <span class="dot"><i style="background:#EF4444"></i>已停</span>
-        <span class="dot"><i style="background:#0071E3"></i>行车</span>
-        <span class="dot"><i style="background:#0D9488"></i>步行</span>
+        <span class="dot"><i style="background:#16A34A"></i>{lg_free}</span>
+        <span class="dot"><i style="background:#EF4444"></i>{lg_occ}</span>
+        <span class="dot"><i style="background:#0071E3"></i>{lg_drv}</span>
+        <span class="dot"><i style="background:#0D9488"></i>{lg_wlk}</span>
       </div>
-      <span id="spTip">双指缩放 · 点车位看状态</span>
+      <span id="spTip">{lg_tip}</span>
     </div>
   </section>
 </div>
@@ -3821,6 +5288,25 @@ def make_voice_http_handler(root_ctx: Any):
                 return cf_ip.split(",")[0].strip()
             return self.client_address[0] if self.client_address else "local"
 
+        def _geo_region_hint(self, qs: Dict[str, List[str]], vg: VoiceGatewayService) -> str:
+            q_reg = (qs.get("region") or qs.get("geo") or [""])[0].strip()
+            if q_reg:
+                return q_reg
+            cf_reg = (
+                self.headers.get("CF-Region-Code")
+                or self.headers.get("CF-Region")
+                or self.headers.get("X-Region-Code")
+                or ""
+            ).strip()
+            if cf_reg:
+                return cf_reg
+            cf_country = (self.headers.get("CF-IPCountry") or "").strip().upper()
+            if cf_country and cf_country not in ("CN", "XX", "T1"):
+                return cf_country
+            prof = vg._ws_profile()
+            vg_cfg = config_manager.get().get("voice_gateway", {})
+            return str(prof.get("geo_region") or vg_cfg.get("geo_region") or "auto").strip()
+
         def _request_base_url(self) -> str:
             proto = (self.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
             host = self.headers.get("Host") or f"127.0.0.1:{config_manager.get().get('voice_http_port', 18791)}"
@@ -3996,6 +5482,9 @@ def make_voice_http_handler(root_ctx: Any):
                         if hasattr(ctx, "get_public_workspace_profile")
                         else {}
                     )
+                    geo_hint = self._geo_region_hint(qs, vg)
+                    vg_cfg_st = config_manager.get().get("voice_gateway", {})
+                    voice_langs = get_active_voice_languages(vg_cfg_st.get("enabled_voice_langs"), geo_hint)
                     self._send_json(
                         {
                             "ok": True,
@@ -4003,6 +5492,9 @@ def make_voice_http_handler(root_ctx: Any):
                             "workspace": ws_pub,
                             "community_name": metrics.get("workspace_name", ""),
                             "preferred_voice_lang": metrics.get("preferred_voice_lang", ""),
+                            "default_voice_lang": metrics.get("default_voice_lang", "zh-CN"),
+                            "geo_region": geo_hint,
+                            "voice_languages": voice_langs,
                             "units": units,
                             "auth_required": bool(metrics.get("token_required")),
                             "authorized": bool(is_auth),
@@ -4038,8 +5530,19 @@ def make_voice_http_handler(root_ctx: Any):
                     rep_raw = (qs.get("repeat") or [""])[0]
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else None
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
+                    vlang = (qs.get("lang") or qs.get("voice_lang") or [""])[0] or None
                     uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     fmt = (qs.get("format") or ["json"])[0].lower()
+                    d_ready = ((qs.get("dialect_ready") or ["0"])[0]).lower() in ("1", "true", "yes")
+                    allow_cloud = ((qs.get("audio") or [""])[0]).lower() == "cloud"
+
+                    eff_req_lang = vlang
+                    if fmt in ("text", "txt", "plain", "speech", "card", "display") and not d_ready:
+                        bound_b = ctx.db.get_im_user_binding("siri", uid) if uid else None
+                        resolved_l, _ = vg.resolve_effective_voice_lang(vlang, bound_b)
+                        eff_req_lang = coerce_shortcut_safe_voice_lang(
+                            resolved_l, dialect_pack_ready=False, allow_cloud_audio=allow_cloud
+                        )
 
                     res = vg.build_voice_brief(
                         unit_id=unit_id,
@@ -4047,7 +5550,10 @@ def make_voice_http_handler(root_ctx: Any):
                         vehicle_type=vtype,
                         channel="siri",
                         external_uid=uid,
+                        voice_lang=eff_req_lang,
                     )
+                    if fmt not in ("card", "display", "text", "txt", "plain", "speech"):
+                        vg.prewarm_tts_async(res.get("unit_id"), res.get("voice_lang"), vtype or "sedan")
                     if fmt in ("card", "display"):
                         self._send_text(res["display_text"])
                     elif fmt in ("text", "txt", "plain", "speech"):
@@ -4056,14 +5562,57 @@ def make_voice_http_handler(root_ctx: Any):
                         self._send_json(res)
                     return
 
+                if path in ("/api/voice/tts.mp3", "/api/voice/tts"):
+                    unit_id = (qs.get("unit") or qs.get("unit_id") or [""])[0] or None
+                    rep_raw = (qs.get("repeat") or ["1"])[0]
+                    rep = int(rep_raw) if rep_raw.strip().isdigit() else 1
+                    vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
+                    vlang = (qs.get("lang") or qs.get("voice_lang") or [""])[0] or None
+                    uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
+                    direct_text = (qs.get("text") or [""])[0].strip()
+
+                    bound_t = ctx.db.get_im_user_binding("siri", uid) if uid else None
+                    eff_t_lang, _ = vg.resolve_effective_voice_lang(vlang, bound_t)
+                    eff_t_lang = coerce_shortcut_safe_voice_lang(
+                        eff_t_lang, dialect_pack_ready=False, allow_cloud_audio=True
+                    )
+
+                    if direct_text:
+                        tts_text = direct_text
+                    else:
+                        br_tts = vg.build_voice_brief(
+                            unit_id=unit_id,
+                            repeat=rep,
+                            vehicle_type=vtype,
+                            channel="siri",
+                            external_uid=uid,
+                            voice_lang=eff_t_lang,
+                        )
+                        tts_text = str(br_tts["speech_text"] if rep > 1 else br_tts["single_text"])
+
+                    mp3_bytes = vg.synthesize_tts_mp3(tts_text, voice_lang=eff_t_lang)
+                    if not mp3_bytes:
+                        self._send_json({"ok": False, "error": "云端方言语音合成暂不可用"}, 503)
+                        return
+                    self._send_bytes(mp3_bytes, content_type="audio/mpeg")
+                    return
+
                 if path == "/api/voice/ask":
                     q = (qs.get("q") or qs.get("question") or qs.get("text") or [""])[0]
                     unit_id = (qs.get("unit") or qs.get("unit_id") or [""])[0] or None
                     rep_raw = (qs.get("repeat") or [""])[0]
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else None
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
+                    vlang = (qs.get("lang") or qs.get("voice_lang") or [""])[0] or None
                     uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     fmt = (qs.get("format") or ["json"])[0].lower()
+                    d_ready = ((qs.get("dialect_ready") or ["0"])[0]).lower() in ("1", "true", "yes")
+
+                    eff_ask_lang = vlang
+                    if fmt in ("text", "txt", "plain", "speech") and not d_ready:
+                        bound_a = ctx.db.get_im_user_binding("siri", uid) if uid else None
+                        resolved_al, _ = vg.resolve_effective_voice_lang(vlang, bound_a)
+                        eff_ask_lang = coerce_shortcut_safe_voice_lang(resolved_al, dialect_pack_ready=False)
 
                     res = vg.ask_voice_assistant(
                         question=q,
@@ -4073,6 +5622,7 @@ def make_voice_http_handler(root_ctx: Any):
                         channel="siri",
                         external_uid=uid,
                         client_ip=self._client_ip(),
+                        voice_lang=eff_ask_lang,
                     )
                     if fmt in ("text", "txt", "plain", "speech"):
                         self._send_text(res["speech_text"])
@@ -4135,6 +5685,48 @@ def make_voice_http_handler(root_ctx: Any):
                     self._send_text("\n".join(lines))
                     return
 
+                if path == "/api/voice/languages.txt":
+                    geo_hint = self._geo_region_hint(qs, vg)
+                    inc_dialects = ((qs.get("include_dialects") or qs.get("all") or qs.get("dialect_ready") or ["0"])[0]).lower() in ("1", "true", "yes")
+                    allow_cloud_lg = ((qs.get("audio") or [""])[0]).lower() == "cloud"
+                    vg_cfg_lg = config_manager.get().get("voice_gateway", {})
+                    langs = get_active_voice_languages(
+                        vg_cfg_lg.get("enabled_voice_langs"),
+                        geo_hint,
+                        preinstalled_only=(not inc_dialects),
+                        allow_cloud_audio=allow_cloud_lg,
+                    )
+                    self._send_text("\n".join(item["menu_item"] for item in langs))
+                    return
+
+                if path == "/api/voice/my-lang":
+                    uid_ml = (qs.get("uid") or qs.get("user") or [""])[0].strip() or f"ip:{self._client_ip()}"
+                    exp_lang = (qs.get("lang") or qs.get("voice_lang") or [""])[0].strip() or None
+                    d_ready_ml = ((qs.get("dialect_ready") or ["0"])[0]).lower() in ("1", "true", "yes")
+                    allow_cloud_ml = ((qs.get("audio") or [""])[0]).lower() == "cloud"
+                    bound_ml = ctx.db.get_im_user_binding("siri", uid_ml) if uid_ml else None
+                    raw_eff_ml, _ = vg.resolve_effective_voice_lang(exp_lang, bound_ml)
+                    eff_lang_ml = coerce_shortcut_safe_voice_lang(
+                        raw_eff_ml, dialect_pack_ready=d_ready_ml, allow_cloud_audio=allow_cloud_ml
+                    )
+                    fmt_ml = (qs.get("format") or ["slot"])[0].strip().lower()
+                    if fmt_ml == "json":
+                        self._send_json(
+                            {
+                                "ok": True,
+                                "voice_lang": eff_lang_ml,
+                                "requested_voice_lang": raw_eff_ml,
+                                "apple_tts_lang": voice_lang_to_apple_tts(eff_lang_ml),
+                                "apple_tts_voice": voice_lang_to_apple_voice_id(eff_lang_ml),
+                                "slot_token": voice_lang_to_slot_token(eff_lang_ml),
+                            }
+                        )
+                    elif fmt_ml == "code":
+                        self._send_text(eff_lang_ml)
+                    else:
+                        self._send_text(voice_lang_to_slot_token(eff_lang_ml))
+                    return
+
                 if path == "/api/voice/check-bind":
                     uid_chk = (qs.get("uid") or qs.get("user") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     bound = ctx.db.get_im_user_binding("siri", uid_chk) if uid_chk else None
@@ -4144,14 +5736,19 @@ def make_voice_http_handler(root_ctx: Any):
                 if path == "/api/voice/quick-bind":
                     uid_qb = (qs.get("uid") or qs.get("user") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     raw_u_qb = (qs.get("unit") or qs.get("unit_id") or [""])[0].strip()
-                    if uid_qb and raw_u_qb:
-                        resolved_uid, _uname, _ = vg.resolve_unit_id(raw_u_qb, "siri", "")
+                    raw_l_qb = (qs.get("lang") or qs.get("voice_lang") or [""])[0].strip()
+                    norm_l_qb = normalize_voice_lang(raw_l_qb, default="") if raw_l_qb else None
+                    if uid_qb and (raw_u_qb or norm_l_qb):
+                        resolved_uid, _uname, cur_b = vg.resolve_unit_id(raw_u_qb or None, "siri", uid_qb)
                         ctx.db.upsert_im_user_binding(
                             channel="siri",
                             external_uid=uid_qb,
                             unit_id=resolved_uid,
-                            repeat_count=2,
+                            repeat_count=int(cur_b.get("repeat_count") if cur_b else 2),
+                            voice_lang=norm_l_qb,
                         )
+                        if norm_l_qb:
+                            vg.prewarm_tts_async(resolved_uid, norm_l_qb)
                         self._send_text(resolved_uid)
                     else:
                         self._send_text("8-1")
@@ -4163,6 +5760,7 @@ def make_voice_http_handler(root_ctx: Any):
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else 2
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or ["sedan"])[0]
                     vmode = (qs.get("view") or ["both"])[0]
+                    vlang = (qs.get("lang") or qs.get("voice_lang") or [""])[0] or None
                     ext_uid = (qs.get("uid") or qs.get("user") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     html_doc = vg.render_voice_hud_html(
                         request_base_url=self._request_base_url(),
@@ -4172,6 +5770,7 @@ def make_voice_http_handler(root_ctx: Any):
                         token=tok,
                         view_mode=vmode,
                         external_uid=ext_uid,
+                        voice_lang=vlang,
                     )
                     self._send_html(html_doc, 200)
                     return
@@ -4184,8 +5783,23 @@ def make_voice_http_handler(root_ctx: Any):
                     sc_mode = (qs.get("mode") or ["brief"])[0]
                     u_mode = (qs.get("unit_mode") or ["fixed"])[0]
                     show_map = (qs.get("show_map") or qs.get("popup_mode") or ["text"])[0]
+                    raw_sc_lang = (qs.get("lang") or qs.get("voice_lang") or [""])[0].strip()
+                    raw_lang_mode = (qs.get("lang_mode") or [""])[0].strip().lower()
+                    ask_lang_once = (
+                        raw_sc_lang.lower() in ("", "ask_once", "prompt_once", "auto")
+                        or raw_lang_mode in ("ask_once", "prompt_once")
+                    )
+                    d_ready_sc = ((qs.get("dialect_ready") or ["0"])[0]).lower() in ("1", "true", "yes")
                     dev_uid = (qs.get("device_uid") or qs.get("uid") or [""])[0].strip()
                     vg_cfg = config_manager.get().get("voice_gateway", {})
+                    clean_raw_lang = "" if raw_sc_lang.lower() in ("ask_once", "prompt_once", "auto") else raw_sc_lang
+                    norm_show_map = vg._normalize_show_map_mode(show_map)
+                    is_sc_silent = str(sc_mode or "brief").strip().lower() != "ask" and norm_show_map == "silent"
+                    eff_sc_lang = coerce_shortcut_safe_voice_lang(
+                        clean_raw_lang or vg._ws_profile().get("preferred_voice_lang") or vg_cfg.get("default_voice_lang") or "zh-CN",
+                        dialect_pack_ready=d_ready_sc,
+                        allow_cloud_audio=is_sc_silent,
+                    )
                     raw_name = (qs.get("name") or [""])[0].strip()
                     safe_sc_name = vg.sanitize_shortcut_name(raw_name, "小区车位")
                     arr_place = (qs.get("arrival_place") or [str(vg_cfg.get("arrival_place") or "")])[0].strip()
@@ -4199,10 +5813,12 @@ def make_voice_http_handler(root_ctx: Any):
                     cfg_tok = vg._effective_access_token()
 
                     # On Ubuntu/Linux (`not _can_macos_sign_shortcuts()`), sync `ip:<client_ip>` binding during `prepare=1`
-                    # so `dynamic_<mode>.shortcut` knows the exact unit selected on the webpage (or resets for `setup_once`)!
+                    # so `dynamic_<mode>.shortcut` / `fixed_*` / `menu_*` know the exact unit & language selected on the webpage
+                    # (or resets binding for `setup_once` so Run #1 prompts for Unit + Language)!
                     if want_prepare:
                         ip_bind_key = f"ip:{self._client_ip()}"
-                        if vg._normalize_unit_mode(u_mode) == "fixed" and unit_id:
+                        norm_um = vg._normalize_unit_mode(u_mode)
+                        if norm_um in ("fixed", "menu"):
                             r_uid, _r_uname, _ = vg.resolve_unit_id(unit_id, "siri", "")
                             ctx.db.upsert_im_user_binding(
                                 channel="siri",
@@ -4210,9 +5826,13 @@ def make_voice_http_handler(root_ctx: Any):
                                 unit_id=r_uid,
                                 repeat_count=rep,
                                 vehicle_type=vtype,
+                                voice_lang=eff_sc_lang,
                             )
-                        elif vg._normalize_unit_mode(u_mode) == "setup_once":
+                            vg.prewarm_tts_async(r_uid, eff_sc_lang, vtype)
+                        elif norm_um == "setup_once":
                             ctx.db.delete_im_user_binding("siri", ip_bind_key)
+                            if not ask_lang_once:
+                                vg.prewarm_tts_async(unit_id, eff_sc_lang, vtype)
 
                     if want_raw:
                         plist_bytes = vg.build_siri_shortcut_plist(
@@ -4229,6 +5849,9 @@ def make_voice_http_handler(root_ctx: Any):
                             arrival_radius_m=arr_rad,
                             mobile_base_url=pub_mob,
                             device_uid=dev_uid,
+                            voice_lang=eff_sc_lang,
+                            dialect_ready=d_ready_sc,
+                            ask_lang_on_first_run=ask_lang_once,
                         )
                         self._send_bytes(
                             plist_bytes,
@@ -4252,6 +5875,9 @@ def make_voice_http_handler(root_ctx: Any):
                         arrival_radius_m=arr_rad,
                         mobile_base_url=pub_mob,
                         device_uid=dev_uid,
+                        voice_lang=eff_sc_lang,
+                        dialect_ready=d_ready_sc,
+                        ask_lang_on_first_run=ask_lang_once,
                     )
                     if want_prepare:
                         icloud_url = str(vg_cfg.get("icloud_shortcut_url") or "").strip()
@@ -4367,6 +5993,7 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                     rep_val = body.get("repeat")
                     rep = int(rep_val) if rep_val is not None and str(rep_val).isdigit() else None
                     vtype = str(body.get("vehicle_type") or "") or None
+                    vlang = str(body.get("voice_lang") or body.get("lang") or (qs.get("lang") or [""])[0]) or None
                     uid = str(body.get("user") or body.get("uid") or "")
                     ch = str(body.get("channel") or "siri")
                     fmt = str(body.get("format") or (qs.get("format") or ["json"])[0]).lower()
@@ -4379,6 +6006,7 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                         channel=ch,
                         external_uid=uid,
                         client_ip=self._client_ip(),
+                        voice_lang=vlang,
                     )
                     if fmt in ("text", "txt", "plain", "speech"):
                         self._send_text(res["speech_text"])
@@ -4389,6 +6017,8 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                 if path == "/api/voice/bind":
                     uid = str(body.get("user") or body.get("uid") or "").strip()
                     raw_unit = str(body.get("unit") or body.get("unit_id") or "").strip()
+                    raw_vlang = str(body.get("voice_lang") or body.get("lang") or "").strip()
+                    norm_vlang = normalize_voice_lang(raw_vlang, default="") if raw_vlang else None
                     ch = str(body.get("channel") or "siri").strip()
                     rep = int(body.get("repeat") or 2)
                     vtype = str(body.get("vehicle_type") or "standard").strip()
@@ -4404,6 +6034,7 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                         repeat_count=rep,
                         vehicle_type=vtype,
                         display_name=dname,
+                        voice_lang=norm_vlang,
                     )
                     self._send_json(
                         {

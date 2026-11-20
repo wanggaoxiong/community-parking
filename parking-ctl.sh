@@ -457,6 +457,8 @@ print(f\"   覆盖模式 : 仅文字(text) · 仅平面图(map) · 文字+平面
     REMOTE_DIR="${3:-~/community-parking}"
     echo "🚀 正在同步代码、预签名包与本地已标定数据(data/) 至 ${REMOTE_HOST}:${REMOTE_DIR} ..."
     rsync -avz --progress \
+      --exclude '.git' \
+      --exclude '.env' \
       --exclude '.venv' \
       --exclude '__pycache__' \
       --exclude '.pytest_cache' \
@@ -466,6 +468,54 @@ print(f\"   覆盖模式 : 仅文字(text) · 仅平面图(map) · 文字+平面
       --exclude 'data/shortcuts/apple_map_helper*' \
       "${APP_DIR}/" "${REMOTE_HOST}:${REMOTE_DIR}/"
     echo "✅ 同步完成！登录 Ubuntu 执行: cd ${REMOTE_DIR} && cp -n .env.example .env && ./parking-ctl.sh docker-up"
+    ;;
+  deploy-ubuntu)
+    REMOTE_HOST="${2:-ericwang@40.82.129.122}"
+    SYNC_DATA_FLAG="${3:-}"
+    SSH_CTL="/tmp/cp-ssh-$$"
+    SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o "ControlPath=${SSH_CTL}" -o ControlPersist=300)
+    trap 'ssh -O exit -o "ControlPath=${SSH_CTL}" "${REMOTE_HOST}" >/dev/null 2>&1 || true' EXIT
+
+    if [[ ! -f "${HOME}/.ssh/id_ed25519.pub" && ! -f "${HOME}/.ssh/id_rsa.pub" ]]; then
+      mkdir -p "${HOME}/.ssh" && chmod 700 "${HOME}/.ssh"
+      ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/id_ed25519" >/dev/null 2>&1 || true
+    fi
+    PUB_KEY_CONTENT=""
+    if [[ -f "${HOME}/.ssh/id_ed25519.pub" ]]; then
+      PUB_KEY_CONTENT="$(cat "${HOME}/.ssh/id_ed25519.pub")"
+    elif [[ -f "${HOME}/.ssh/id_rsa.pub" ]]; then
+      PUB_KEY_CONTENT="$(cat "${HOME}/.ssh/id_rsa.pub")"
+    fi
+
+    echo "🔐 正在连接 ${REMOTE_HOST}（首次请输入一次 Ubuntu 登录密码，脚本将自动配置免密公钥并完成容器热更新）..."
+    ssh "${SSH_OPTS[@]}" "${REMOTE_HOST}" "mkdir -p ~/.ssh ~/community-parking && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    if [[ -n "${PUB_KEY_CONTENT}" ]]; then
+      ssh "${SSH_OPTS[@]}" "${REMOTE_HOST}" "grep -qxF '${PUB_KEY_CONTENT}' ~/.ssh/authorized_keys || echo '${PUB_KEY_CONTENT}' >> ~/.ssh/authorized_keys"
+    fi
+
+    RSYNC_EXCLUDES=(
+      --exclude '.git'
+      --exclude '.env'
+      --exclude '.venv'
+      --exclude '__pycache__'
+      --exclude '.pytest_cache'
+      --exclude '.DS_Store'
+      --exclude 'data/*.pid'
+      --exclude 'data/*.log*'
+      --exclude 'data/shortcuts/apple_map_helper*'
+    )
+    if [[ "${SYNC_DATA_FLAG}" != "--with-data" ]]; then
+      RSYNC_EXCLUDES+=(--exclude 'data/')
+      echo "📦 正在同步最新代码与 90 个 Apple 预签名快捷指令包（保留云端已有 .env 与 data/ 数据）..."
+    else
+      echo "📦 正在同步最新代码、预签名包及本地 data/ 数据（保留云端 .env）..."
+    fi
+
+    rsync -avz -e "ssh ${SSH_OPTS[*]}" "${RSYNC_EXCLUDES[@]}" "${APP_DIR}/" "${REMOTE_HOST}:community-parking/"
+
+    echo "🐳 正在 Ubuntu 上重新构建并热更新 Docker 容器栈..."
+    ssh "${SSH_OPTS[@]}" "${REMOTE_HOST}" 'cd ~/community-parking && if sg docker -c "docker info" >/dev/null 2>&1; then sg docker -c "./parking-ctl.sh docker-up"; else ./parking-ctl.sh docker-up; fi'
+    echo "🎉 Ubuntu 云端 (${REMOTE_HOST}) 与 Cloudflare 域名 (voice.listingworker.com / parking.listingworker.com) 已全部更新上线！"
     ;;
   sign-shortcut)
     # Pre-sign universal Apple Shortcut (AEA1) on macOS into data/shortcuts/universal-signed.shortcut
@@ -488,7 +538,7 @@ print('   提示: 将 data/ 目录随 Docker 挂载至 Linux/Windows 云端后�
 " "${BASE_ARG}" "${UNIT_ARG}"
     ;;
   *)
-    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|sign-pack|sync-ubuntu|sign-shortcut|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd|docker-up|docker-down|docker-restart|docker-logs}"
+    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|deploy-ubuntu|sign-pack|sync-ubuntu|sign-shortcut|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd|docker-up|docker-down|docker-restart|docker-logs}"
     exit 1
     ;;
 esac

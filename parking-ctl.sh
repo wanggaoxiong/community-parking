@@ -390,8 +390,17 @@ ensure_docker_ready() {
     DOCKER_CMD=(docker)
   else
     echo "🔐 当前 SSH 会话尚未刷新 docker 用户组，本次自动使用 sudo 调用 Docker..."
-    DOCKER_CMD=(sudo --preserve-env=CLOUDFLARE_TUNNEL_TOKEN,PUBLIC_MOBILE_URL,PUBLIC_VOICE_URL,VOICE_GATEWAY_TOKEN,VOICE_ICLOUD_SHORTCUT_URL,PARKING_ADMIN_BIND,PARKING_PORT,PARKING_MOBILE_PORT,PARKING_VOICE_PORT,PARKING_FTP_PORT docker)
+    DOCKER_CMD=(sudo --preserve-env=CLOUDFLARE_TUNNEL_TOKEN,PUBLIC_MOBILE_URL,PUBLIC_VOICE_URL,VOICE_GATEWAY_TOKEN,VOICE_ICLOUD_SHORTCUT_URL,PARKING_ADMIN_BIND,PARKING_PORT,PARKING_MOBILE_PORT,PARKING_VOICE_PORT,PARKING_FTP_PORT,PARKING_IMAGE,WATCHTOWER_POLL_INTERVAL,WATCHTOWER_ENABLE docker)
   fi
+}
+
+read_dotenv_var() {
+  local key="$1"
+  local val="${!key:-}"
+  if [[ -z "${val}" && -f "${APP_DIR}/.env" ]]; then
+    val="$(grep -E "^${key}=" "${APP_DIR}/.env" | tail -n 1 | cut -d'=' -f2- | tr -d '[:space:]\"'\''' || true)"
+  fi
+  echo "${val}"
 }
 
 case "${1:-status}" in
@@ -413,10 +422,7 @@ case "${1:-status}" in
       cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
       echo "📝 已自动从 .env.example 初始化 .env 配置文件"
     fi
-    CF_TOK="${CLOUDFLARE_TUNNEL_TOKEN:-}"
-    if [[ -z "${CF_TOK}" && -f "${APP_DIR}/.env" ]]; then
-      CF_TOK="$(grep -E '^CLOUDFLARE_TUNNEL_TOKEN=' "${APP_DIR}/.env" | tail -n 1 | cut -d'=' -f2- | tr -d '[:space:]\"'\''')"
-    fi
+    CF_TOK="$(read_dotenv_var CLOUDFLARE_TUNNEL_TOKEN)"
     if [[ -n "${CF_TOK}" ]]; then
       CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" "${DOCKER_CMD[@]}" compose --profile tunnel up -d --build
     else
@@ -424,8 +430,72 @@ case "${1:-status}" in
     fi
     wait_healthy && cmd_health
     ;;
+  docker-autoupdate)
+    cd "${APP_DIR}"
+    ensure_docker_ready
+    if [[ ! -f "${APP_DIR}/.env" && -f "${APP_DIR}/.env.example" ]]; then
+      cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
+      echo "📝 已自动从 .env.example 初始化 .env 配置文件"
+    fi
+    CF_TOK="$(read_dotenv_var CLOUDFLARE_TUNNEL_TOKEN)"
+    IMG_REF="$(read_dotenv_var PARKING_IMAGE)"
+    IMG_REF="${IMG_REF:-ghcr.io/wanggaoxiong/community-parking:latest}"
+    echo "📥 正在从 GHCR 拉取已通过 GitHub CI 门禁的镜像: ${IMG_REF} ..."
+    PARKING_IMAGE="${IMG_REF}" "${DOCKER_CMD[@]}" compose pull community-parking watchtower
+    PROFILES=(--profile autoupdate)
+    if [[ -n "${CF_TOK}" ]]; then
+      PROFILES+=(--profile tunnel)
+    fi
+    CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" PARKING_IMAGE="${IMG_REF}" WATCHTOWER_ENABLE=true \
+      "${DOCKER_CMD[@]}" compose "${PROFILES[@]}" up -d --remove-orphans
+    wait_healthy && cmd_health
+    echo "🛡️ 零端口无人值守热更(Watchtower) + 健康失败自动回滚守卫(RollbackGuard) 已激活！"
+    ;;
+  docker-rollback)
+    cd "${APP_DIR}"
+    ensure_docker_ready
+    TARGET_TAG="${2:-auto}"
+    IMG_REF="$(read_dotenv_var PARKING_IMAGE)"
+    IMG_REF="${IMG_REF:-ghcr.io/wanggaoxiong/community-parking:latest}"
+    echo "⏪ 正在执行容器快速回滚 (目标: ${TARGET_TAG}) ..."
+    if "${DOCKER_CMD[@]}" ps --format '{{.Names}}' | grep -qx 'community-parking-rollback-guard'; then
+      "${DOCKER_CMD[@]}" exec community-parking-rollback-guard \
+        python -m app.rollback_guard --upstream-image "${IMG_REF}" --rollback-now "${TARGET_TAG}"
+    else
+      GUARD_RUNNER="community-parking:last-known-good"
+      if ! "${DOCKER_CMD[@]}" image inspect "${GUARD_RUNNER}" >/dev/null 2>&1; then
+        GUARD_RUNNER="${IMG_REF}"
+      fi
+      "${DOCKER_CMD[@]}" run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "${APP_DIR}/data:/app/data" \
+        "${GUARD_RUNNER}" \
+        python -m app.rollback_guard --upstream-image "${IMG_REF}" --rollback-now "${TARGET_TAG}"
+    fi
+    wait_healthy && cmd_health
+    ;;
+  docker-status)
+    cd "${APP_DIR}"
+    ensure_docker_ready
+    echo "🐳 容器运行列表:"
+    "${DOCKER_CMD[@]}" ps -a --filter "name=community-parking" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+    if "${DOCKER_CMD[@]}" ps --format '{{.Names}}' | grep -qx 'community-parking-rollback-guard'; then
+      echo ""
+      echo "🛡️ 自动热更与回滚守卫状态:"
+      "${DOCKER_CMD[@]}" exec community-parking-rollback-guard python -m app.rollback_guard --status || true
+    elif [[ -f "${APP_DIR}/data/autoupdate/state.json" ]]; then
+      echo ""
+      echo "🛡️ 最近回滚守卫快照 (${APP_DIR}/data/autoupdate/state.json):"
+      cat "${APP_DIR}/data/autoupdate/state.json"
+    fi
+    if [[ -f "${APP_DIR}/data/autoupdate/rollback.log" ]]; then
+      echo ""
+      echo "📜 最近自动守护日志 (尾部 10 行):"
+      tail -n 10 "${APP_DIR}/data/autoupdate/rollback.log"
+    fi
+    ;;
   docker-down)
-    cd "${APP_DIR}" && ensure_docker_ready && "${DOCKER_CMD[@]}" compose --profile tunnel down
+    cd "${APP_DIR}" && ensure_docker_ready && "${DOCKER_CMD[@]}" compose --profile tunnel --profile autoupdate down
     ;;
   docker-restart)
     cd "${APP_DIR}" && ensure_docker_ready && "${DOCKER_CMD[@]}" compose restart && wait_healthy && cmd_health
@@ -538,7 +608,7 @@ print('   提示: 将 data/ 目录随 Docker 挂载至 Linux/Windows 云端后�
 " "${BASE_ARG}" "${UNIT_ARG}"
     ;;
   *)
-    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|deploy-ubuntu|sign-pack|sync-ubuntu|sign-shortcut|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd|docker-up|docker-down|docker-restart|docker-logs}"
+    echo "用法: $0 {start|stop|restart|status|health|logs|foreground|deploy-ubuntu|sign-pack|sync-ubuntu|sign-shortcut|install-launchd|uninstall-launchd|install-systemd|uninstall-systemd|docker-up|docker-autoupdate|docker-rollback|docker-status|docker-down|docker-restart|docker-logs}"
     exit 1
     ;;
 esac

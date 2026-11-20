@@ -1,0 +1,171 @@
+name: CI Gate & Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      promote_rollback_tag:
+        description: "可选远程一键回滚：填入历史镜像标签（如 previous 或 sha-3415cff）将其重新验证并发布为 latest"
+        required: false
+        default: ""
+
+concurrency:
+  group: ci-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  unit-tests:
+    name: Python 3.11 全量单元测试门禁
+    if: ${{ github.event.inputs.promote_rollback_tag == '' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Ubuntu runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0 ffmpeg curl
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate shell & Python syntax
+        run: |
+          bash -n parking-ctl.sh
+          python -m py_compile run.py app/*.py
+
+      - name: Run full unit test suite
+        run: |
+          python -m unittest discover -s tests -v
+
+  build-verify-and-publish:
+    name: 容器三端口真实验证与 GHCR 发布
+    needs: [unit-tests]
+    if: ${{ always() && (needs.unit-tests.result == 'success' || needs.unit-tests.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute account-portable GHCR image metadata
+        id: meta
+        run: |
+          REPO_LOWER="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_REPO="ghcr.io/${REPO_LOWER}"
+          SHORT_SHA="sha-${GITHUB_SHA::7}"
+          echo "image_repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Target GHCR Repository: ${IMAGE_REPO} (${SHORT_SHA})"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build candidate image (Normal Release / PR Gate)
+        if: ${{ github.event.inputs.promote_rollback_tag == '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: community-parking:ci-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Community Parking Smart Guidance (:8790 / :18790 / :18791)
+
+      - name: Pull historical tag for remote rollback promotion
+        if: ${{ github.event.inputs.promote_rollback_tag != '' }}
+        env:
+          PROMOTE_TAG: ${{ github.event.inputs.promote_rollback_tag }}
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+        run: |
+          echo "🔄 Pulling historical image ${IMAGE_REPO}:${PROMOTE_TAG} for rollback promotion..."
+          docker pull "${IMAGE_REPO}:${PROMOTE_TAG}"
+          docker tag "${IMAGE_REPO}:${PROMOTE_TAG}" community-parking:ci-candidate
+
+      - name: Live 3-Port Container Smoke Gate & Signed Shortcut Verification
+        run: |
+          docker run -d --name ci-smoke \
+            -e PUBLIC_VOICE_URL=https://voice.listingworker.com \
+            -p 18890:8790 -p 18790:18790 -p 18791:18791 \
+            community-parking:ci-candidate
+
+          READY=0
+          for i in $(seq 1 30); do
+            if curl --noproxy '*' -fsS http://127.0.0.1:18890/api/health >/dev/null 2>&1 \
+              && curl --noproxy '*' -fsS http://127.0.0.1:18790/api/health >/dev/null 2>&1 \
+              && curl --noproxy '*' -fsS http://127.0.0.1:18791/api/health >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "${READY}" -ne 1 ]]; then
+            echo "❌ Container failed 3-port smoke check! Aborting GHCR publish."
+            docker logs ci-smoke || true
+            exit 1
+          fi
+
+          MAGIC="$(curl --noproxy '*' -fsS 'http://127.0.0.1:18791/api/voice/siri.shortcut?unit=8-1&show_map=both' | head -c 4)"
+          if [[ "${MAGIC}" != "AEA1" ]]; then
+            echo "❌ Expected Apple-signed AEA1 shortcut header, got: ${MAGIC}"
+            exit 1
+          fi
+
+          # Verify graceful SIGTERM SQLite WAL checkpoint shutdown within 25s Spot window
+          docker stop -t 25 ci-smoke
+          docker rm -f ci-smoke
+          echo "✅ All 3 ports + Apple AEA1 shortcut + graceful WAL shutdown verified!"
+
+      - name: Backup current latest as :previous & Publish verified image to GHCR
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          PROMOTE_TAG: ${{ github.event.inputs.promote_rollback_tag }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE_REPO}:latest" >/dev/null 2>&1; then
+            echo "📌 Preserving existing ${IMAGE_REPO}:latest -> ${IMAGE_REPO}:previous..."
+            docker buildx imagetools create -t "${IMAGE_REPO}:previous" "${IMAGE_REPO}:latest" || true
+          fi
+
+          docker tag community-parking:ci-candidate "${IMAGE_REPO}:latest"
+          docker push "${IMAGE_REPO}:latest"
+
+          if [[ -z "${PROMOTE_TAG}" ]]; then
+            docker tag community-parking:ci-candidate "${IMAGE_REPO}:${SHORT_SHA}"
+            docker push "${IMAGE_REPO}:${SHORT_SHA}"
+            echo "🚀 Published ${IMAGE_REPO}:latest and ${IMAGE_REPO}:${SHORT_SHA}"
+          else
+            echo "⏪ Rolled back ${IMAGE_REPO}:latest to verified ${PROMOTE_TAG}"
+          fi

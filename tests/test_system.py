@@ -6914,6 +6914,266 @@ class CommunityParkingSystemTests(unittest.TestCase):
             voice_srv.shutdown()
             voice_srv.server_close()
 
+    def test_ci_cd_watchtower_and_autonomous_rollback_guard(self) -> None:
+        """Verify GitHub CI GHCR workflow, Watchtower Ubuntu 24.04 Compose config, and RollbackGuard state machine."""
+        from http.server import BaseHTTPRequestHandler
+        import shutil
+        import socketserver
+        import subprocess
+        from app.rollback_guard import DockerUnixClient, RollbackGuard, parse_image_reference
+
+        repo_root = Path(__file__).resolve().parents[1]
+
+        # 1) Verify `.github/workflows/ci-release.yml` is account-portable and gates GHCR publish behind tests + 3-port smoke
+        wf_path = repo_root / ".github" / "workflows" / "ci-release.yml"
+        self.assertTrue(wf_path.is_file())
+        wf_text = wf_path.read_text(encoding="utf-8")
+        self.assertIn("packages: write", wf_text)
+        self.assertIn("GITHUB_REPOSITORY", wf_text)
+        self.assertNotIn("ghcr.io/wanggaoxiong", wf_text)  # Zero hardcoded account in CI workflow!
+        self.assertIn("promote_rollback_tag", wf_text)
+        self.assertIn("AEA1", wf_text)
+        self.assertIn(":previous", wf_text)
+
+        # 2) Verify `docker-compose.yml` uses `nickfedor/watchtower`, label isolation, and `host-gateway` for Private SSH
+        compose_text = (repo_root / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("nickfedor/watchtower:latest", compose_text)
+        self.assertNotIn("containrrr/watchtower", compose_text)
+        self.assertIn("WATCHTOWER_LABEL_ENABLE=true", compose_text)
+        self.assertIn("WATCHTOWER_CLEANUP=false", compose_text)
+        self.assertIn("host.docker.internal:host-gateway", compose_text)
+        self.assertIn("app.rollback_guard", compose_text)
+
+        # 3) Verify `parking-ctl.sh` syntax and autoupdate/rollback subcommands
+        ctl_path = repo_root / "parking-ctl.sh"
+        chk = subprocess.run(["bash", "-n", str(ctl_path)], capture_output=True, text=True)
+        self.assertEqual(chk.returncode, 0, chk.stderr)
+        ctl_text = ctl_path.read_text(encoding="utf-8")
+        for subcmd in ("docker-autoupdate)", "docker-rollback)", "docker-status)"):
+            self.assertIn(subcmd, ctl_text)
+
+        # 4) Verify `parse_image_reference` handles custom ports, orgs, and implicit `:latest`
+        self.assertEqual(
+            parse_image_reference("ghcr.io/newowner/community-parking:latest"),
+            ("ghcr.io/newowner/community-parking", "latest"),
+        )
+        self.assertEqual(
+            parse_image_reference("localhost:5000/community-parking"),
+            ("localhost:5000/community-parking", "latest"),
+        )
+
+        # 5) End-to-end test of `RollbackGuard` over a real AF_UNIX mock Docker Engine API (v1.47)
+        sock_dir = Path(tempfile.mkdtemp(dir="/tmp", prefix="cpdk-"))
+        sock_path = sock_dir / "docker.sock"
+        guard_data_dir = sock_dir / "guard_data"
+
+        mock_docker: dict = {
+            "container": {
+                "Id": "111122223333444455556666",
+                "Name": "/community-parking",
+                "Image": "sha256:good_v1_000000000000",
+                "State": {
+                    "Status": "running",
+                    "Running": True,
+                    "Restarting": False,
+                    "ExitCode": 0,
+                    "Health": {"Status": "healthy"},
+                },
+                "Config": {
+                    "Hostname": "111122223333",
+                    "Image": "ghcr.io/wanggaoxiong/community-parking:latest",
+                    "Env": ["TZ=Asia/Shanghai", "PUBLIC_VOICE_URL=https://voice.listingworker.com"],
+                    "Cmd": ["python", "/app/run.py"],
+                    "Labels": {"com.centurylinklabs.watchtower.enable": "true"},
+                    "StopTimeout": 25,
+                },
+                "HostConfig": {
+                    "Binds": ["/home/ericwang/community-parking/data:/app/data"],
+                    "PortBindings": {"8790/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8790"}]},
+                    "RestartPolicy": {"Name": "always"},
+                    "NetworkMode": "community-parking_default",
+                },
+                "NetworkSettings": {
+                    "Networks": {
+                        "community-parking_default": {
+                            "Aliases": ["111122223333", "community-parking"],
+                            "IPAddress": "172.18.0.2",
+                        }
+                    }
+                },
+            },
+            "tags": {},
+            "upstream_latest_id": "sha256:good_v1_000000000000",
+            "recreate_calls": [],
+            "prune_calls": 0,
+        }
+
+        class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+
+        class _DockerMockHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def _reply(self, code: int, payload=None) -> None:
+                raw = json.dumps(payload).encode("utf-8") if payload is not None else b""
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                if raw:
+                    self.wfile.write(raw)
+
+            def do_GET(self) -> None:
+                parsed = urllib.parse.urlparse(self.path)
+                p = parsed.path
+                if p == "/version":
+                    self._reply(200, {"Version": "27.5.1", "ApiVersion": "1.47"})
+                    return
+                if p == "/v1.47/containers/community-parking/json":
+                    if mock_docker["container"] is None:
+                        self._reply(404, {"message": "No such container"})
+                    else:
+                        self._reply(200, mock_docker["container"])
+                    return
+                if p.startswith("/v1.47/images/") and p.endswith("/json"):
+                    ref = urllib.parse.unquote(p[len("/v1.47/images/") : -len("/json")])
+                    if ref == "ghcr.io/wanggaoxiong/community-parking:latest":
+                        self._reply(200, {"Id": mock_docker["upstream_latest_id"]})
+                    elif ref in mock_docker["tags"]:
+                        self._reply(200, {"Id": mock_docker["tags"][ref]})
+                    else:
+                        self._reply(404, {"message": f"No such image: {ref}"})
+                    return
+                self._reply(404, {"message": f"Unhandled GET {p}"})
+
+            def do_POST(self) -> None:
+                parsed = urllib.parse.urlparse(self.path)
+                p = parsed.path
+                qs = urllib.parse.parse_qs(parsed.query)
+                clen = int(self.headers.get("Content-Length") or "0")
+                body = json.loads(self.rfile.read(clen).decode("utf-8")) if clen > 0 else {}
+
+                if p.startswith("/v1.47/images/") and p.endswith("/tag"):
+                    src = urllib.parse.unquote(p[len("/v1.47/images/") : -len("/tag")])
+                    repo = (qs.get("repo") or [""])[0]
+                    tag = (qs.get("tag") or ["latest"])[0]
+                    mock_docker["tags"][f"{repo}:{tag}"] = src
+                    self._reply(201, {})
+                    return
+                if p == "/v1.47/images/prune":
+                    mock_docker["prune_calls"] += 1
+                    self._reply(200, {"SpaceReclaimed": 0})
+                    return
+                if p == "/v1.47/images/create":
+                    self._reply(200, {"status": "Pull complete"})
+                    return
+                if p.startswith("/v1.47/containers/") and p.endswith("/stop"):
+                    self._reply(204)
+                    return
+                if p == "/v1.47/containers/create":
+                    mock_docker["recreate_calls"].append(body)
+                    new_img_ref = body["Image"]
+                    resolved_id = mock_docker["tags"].get(new_img_ref, mock_docker["upstream_latest_id"])
+                    mock_docker["container"] = {
+                        "Id": "999988887777666655554444",
+                        "Name": "/community-parking",
+                        "Image": resolved_id,
+                        "State": {
+                            "Status": "running",
+                            "Running": True,
+                            "Restarting": False,
+                            "ExitCode": 0,
+                            "Health": {"Status": "healthy"},
+                        },
+                        "Config": body,
+                        "HostConfig": body["HostConfig"],
+                        "NetworkSettings": {
+                            "Networks": {
+                                "community-parking_default": {
+                                    "Aliases": body["NetworkingConfig"]["EndpointsConfig"][
+                                        "community-parking_default"
+                                    ]["Aliases"]
+                                }
+                            }
+                        },
+                    }
+                    self._reply(201, {"Id": "999988887777666655554444"})
+                    return
+                if p.startswith("/v1.47/containers/") and p.endswith("/start"):
+                    self._reply(204)
+                    return
+                self._reply(404, {"message": f"Unhandled POST {p}"})
+
+            def do_DELETE(self) -> None:
+                mock_docker["container"] = None
+                self._reply(204)
+
+        unix_srv = _UnixServer(str(sock_path), _DockerMockHandler)
+        t_unix = threading.Thread(target=unix_srv.serve_forever, daemon=True)
+        t_unix.start()
+        try:
+            d_client = DockerUnixClient(sock_path=str(sock_path))
+            guard = RollbackGuard(
+                docker_client=d_client,
+                data_dir=guard_data_dir,
+                upstream_image="ghcr.io/wanggaoxiong/community-parking:latest",
+                startup_grace_seconds=30.0,
+                upstream_probe_seconds=60.0,
+            )
+
+            # Tick 1: Healthy v1 -> pinned as `community-parking:last-known-good`
+            r1 = guard.step(now_mono=100.0)
+            self.assertEqual(r1["action"], "healthy")
+            self.assertEqual(mock_docker["tags"].get("community-parking:last-known-good"), "sha256:good_v1_000000000000")
+            self.assertEqual(mock_docker["prune_calls"], 1)
+
+            # Tick 2: Watchtower updates smoothly to healthy v2 -> v1 saved as `previous-good`, v2 promoted to `last-known-good`
+            mock_docker["container"]["Image"] = "sha256:good_v2_000000000000"
+            mock_docker["upstream_latest_id"] = "sha256:good_v2_000000000000"
+            r2 = guard.step(now_mono=200.0)
+            self.assertEqual(r2["action"], "healthy")
+            self.assertEqual(mock_docker["tags"].get("community-parking:previous-good"), "sha256:good_v1_000000000000")
+            self.assertEqual(mock_docker["tags"].get("community-parking:last-known-good"), "sha256:good_v2_000000000000")
+
+            # Tick 3: Watchtower updates to broken v3 (`unhealthy`) -> instant auto-rollback to v2 + Watchtower paused!
+            mock_docker["container"]["Image"] = "sha256:bad_v3_0000000000000"
+            mock_docker["upstream_latest_id"] = "sha256:bad_v3_0000000000000"
+            mock_docker["container"]["State"]["Health"]["Status"] = "unhealthy"
+            r3 = guard.step(now_mono=300.0)
+            self.assertEqual(r3["action"], "rolled_back")
+            self.assertEqual(r3["restored_image"], "community-parking:last-known-good")
+            self.assertEqual(guard.state["blocked_bad_image_id"], "sha256:bad_v3_0000000000000")
+            self.assertTrue(guard.state["rollback_active"])
+            recreated_v2 = mock_docker["recreate_calls"][-1]
+            self.assertEqual(recreated_v2["Image"], "community-parking:last-known-good")
+            self.assertEqual(recreated_v2["Labels"]["com.centurylinklabs.watchtower.enable"], "false")
+            # Ephemeral old container short ID (`111122223333`) stripped from DNS aliases while `community-parking` kept!
+            aliases_v2 = recreated_v2["NetworkingConfig"]["EndpointsConfig"]["community-parking_default"]["Aliases"]
+            self.assertIn("community-parking", aliases_v2)
+            self.assertNotIn("111122223333", aliases_v2)
+
+            # Tick 4 (+70s later): Upstream GHCR is STILL `bad_v3` -> stays safely on `last-known-good`, zero loop!
+            r4 = guard.step(now_mono=370.0)
+            self.assertEqual(r4["action"], "healthy")
+            self.assertTrue(guard.state["rollback_active"])
+            self.assertEqual(len(mock_docker["recreate_calls"]), 1)
+
+            # Tick 5 (+70s later): Developer pushes fixed v4 to GHCR -> guard auto-resumes & re-enables Watchtower!
+            mock_docker["upstream_latest_id"] = "sha256:fixed_v4_00000000000"
+            r5 = guard.step(now_mono=445.0)
+            self.assertEqual(r5["action"], "resumed_autoupdate")
+            self.assertEqual(r5["new_image_id"], "sha256:fixed_v4_00000000000")
+            self.assertFalse(guard.state["rollback_active"])
+            self.assertEqual(guard.state["blocked_bad_image_id"], "")
+            recreated_v4 = mock_docker["recreate_calls"][-1]
+            self.assertEqual(recreated_v4["Image"], "ghcr.io/wanggaoxiong/community-parking:latest")
+            self.assertEqual(recreated_v4["Labels"]["com.centurylinklabs.watchtower.enable"], "true")
+        finally:
+            unix_srv.shutdown()
+            unix_srv.server_close()
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -244,3 +244,51 @@ sudo loginctl enable-linger "$USER"
      - **内置全模式 Apple 官方签名包（`app/presigned_shortcuts/`）**：仓库已针对 `https://voice.listingworker.com` 与 `http://40.82.129.122:18791` 预置全套 `AEA1` 官方签名快捷指令包，在 Ubuntu 上无需 `/usr/bin/shortcuts` 即可原生分发 **仅文字（`text`）**、**仅动态平面图（`map`）**、**文字+平面图同屏（`both`）**、**纯语音（`silent`）** 与 **大模型问答（`ask`）**，且同时支持单元直连、首次运行选一次（`setup_once`）与每次动态菜单（实时拉取 `/api/voice/units.txt`）。
      - **更换新域名时重新生成签名包**：在任意 Mac 执行一次 `./parking-ctl.sh sign-pack "https://voice.新域名.com"` 即可一键重签全套模式包；也可随时在 `:8790` 粘贴 iCloud 快捷指令分享链接（`https://www.icloud.com/shortcuts/...`）分发。
 
+---
+
+## 六、零入站端口自动发布、自动回滚与私有 SSH 架构（Ubuntu 24.04 生产推荐）
+
+当代码托管在 GitHub `Public` 仓库时，Ubuntu 24.04 云主机可彻底关闭公网 `22 / 8790 / 18790 / 18791` 全部入站端口，实现 **“本地 `git push` -> GitHub Actions 测试门禁 -> GHCR 镜像仓库 -> Ubuntu 自动拉取热更 + 异常秒级回滚”**：
+
+### 1. 在 Ubuntu 上一键开启自动热更与回滚守卫
+
+首次在 Ubuntu 目录配置好 `.env`（含 `CLOUDFLARE_TUNNEL_TOKEN`）后执行一次：
+
+```bash
+cd ~/community-parking
+./parking-ctl.sh docker-autoupdate
+```
+
+该命令会自动拉取已通过 CI 门禁的 GHCR 镜像，并同时启动 4 个协同容器：
+- `community-parking`：核心三端口服务（`:8790` 管理台 + `:18790` 手机看图 + `:18791` Siri 语音网关）；
+- `community-parking-tunnel`：Cloudflare Zero Trust 出站加密隧道（更新业务容器时**绝不重启隧道**）；
+- `community-parking-watchtower`：基于 `nickfedor/watchtower`（原生兼容 Ubuntu 24.04 Docker API 1.44+），每 5 分钟轮询一次 GHCR 新镜像并携带 `25s` 优雅停机窗口平滑替换主容器；
+- `community-parking-rollback-guard`：本地健康巡检与防死循环自动回滚守卫。
+
+### 2. 三层安全回滚机制
+
+1. **GitHub CI 门禁拦截（第一道防线，`.github/workflows/ci-release.yml`）**：
+   - 每次推送 `main` 先跑通 Python 全量单元测试 + 真实 Docker 三端口健康探测 + Apple `AEA1` 签名包校验 + `SIGTERM` WAL 落盘校验；任一环节失败则拒绝推送到 `ghcr.io`，线上容器毫发无损。
+2. **Ubuntu 本地健康失败自动回滚（第二道防线，`app/rollback_guard.py`）**：
+   - 每当新版本通过三端口 `HEALTHCHECK`，守卫自动将其锚定为 `community-parking:last-known-good`（同时保留上一版为 `previous-good`）并清理悬空旧层；
+   - 若新版本出现 `unhealthy`、异常退出或超时卡死，守卫立即用 `last-known-good` 重建主容器，临时将主容器 `watchtower.enable` 置为 `false` 并记录 `blocked_bad_image_id`（防止 Watchtower 反复拉取同一个坏包死循环）；
+   - 待后续向 GitHub 推送新修复提交、上游镜像摘要更新后，守卫自动恢复升级并重新开启 Watchtower。
+3. **人工一键回滚（本地命令或免登录 GitHub 网页远程回滚）**：
+   - **免登录服务器远程回滚**：打开 GitHub 仓库 -> `Actions` -> `CI Gate & Publish Docker Image` -> `Run workflow`，在 `promote_rollback_tag` 填入 `previous`（或任意历史 `sha-xxxxxxx`），5 分钟内 Ubuntu 自动回退；
+   - **服务器内秒级回滚**：执行 `./parking-ctl.sh docker-rollback`（查看状态执行 `./parking-ctl.sh docker-status`）。
+
+### 3. 跨 GitHub 账号无缝迁移说明
+
+- GitHub Actions 工作流动态读取 `${{ github.repository }}` 与内置 `GITHUB_TOKEN`，迁移或转移仓库到您的其他 GitHub 账号时**零代码改动、无需配置任何 Secret**（保持仓库与 Package 为 Public 即可免 Token 拉取；若未来改为 Private 仓库，仅需在 Ubuntu 执行一次 `docker login ghcr.io`）。
+- 仓库改放到新账号后，仅需将 Ubuntu 上 `.env` 中的一行：
+  `PARKING_IMAGE=ghcr.io/新账号名小写/community-parking:latest`
+  更新后执行一次 `./parking-ctl.sh docker-autoupdate` 即可无缝切换。
+
+### 4. Cloudflare Tunnel 托管私有 SSH（彻底关闭公网 22 端口）
+
+`docker-compose.yml` 已为 `cloudflared` 注入 `host.docker.internal:host-gateway`：
+1. 在 Cloudflare Zero Trust -> **Networks -> Tunnels -> Public Hostname** 新增 `ssh.listingworker.com` -> `SSH` -> `host.docker.internal:22`；
+2. 在 **Access -> Applications** 为 `ssh.listingworker.com` 绑定与 `admin.listingworker.com` 相同的本人邮箱验证码策略；
+3. 在云厂商安全组彻底删除公网 `22` 入站规则，日常应急直接通过 Cloudflare 浏览器 Web SSH 终端或本机 `cloudflared access ssh` 安全接入。
+
+

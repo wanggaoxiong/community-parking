@@ -7,10 +7,8 @@
 # 2) 连同免费 Cloudflare Tunnel 一键打通公网 HTTPS (免公网IP、免备案、0元服务1000+车主):
 #      CLOUDFLARE_TUNNEL_TOKEN=你的隧道Token docker compose --profile tunnel up -d --build
 #
-# Spot 竞价实例重启/回收保护机制:
-# - restart: always -> 宿主机断电、云厂商 Spot 重启恢复、Docker 守护进程拉起时自动在线
-# - stop_grace_period: 25s -> 利用云平台 Spot 30s 回收窗口优雅响应 SIGTERM，停止拉流并执行
-#   PRAGMA wal_checkpoint(TRUNCATE)，确保 data/parking.db 与 runtime_config.json 零损毁
+# 3) 零入站端口无人值守模式 (GitHub CI 门禁 -> GHCR -> Watchtower 自动热更 + 健康失败自动回滚):
+#      ./parking-ctl.sh docker-autoupdate
 # ==============================================================================
 
 services:
@@ -18,10 +16,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: community-parking:latest
+    image: ${PARKING_IMAGE:-ghcr.io/wanggaoxiong/community-parking:latest}
     container_name: community-parking
     restart: always
     stop_grace_period: 25s
+    labels:
+      com.centurylinklabs.watchtower.enable: "${WATCHTOWER_ENABLE:-true}"
     environment:
       - TZ=Asia/Shanghai
       - PUBLIC_MOBILE_URL=${PUBLIC_MOBILE_URL:-}
@@ -46,11 +46,12 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # 可选侧车: Cloudflare Zero Trust 免费出站隧道 (--profile tunnel 启用)
+  # 可选侧车 1: Cloudflare Zero Trust 免费出站隧道 (--profile tunnel 启用)
   # 在 Cloudflare Zero Trust 后台将:
   #   parking.你的域名.com -> http://community-parking:18790  (微信浮窗看图+播报)
   #   voice.你的域名.com   -> http://community-parking:18791  (Siri 车载免手唤醒+AI问答)
-  # 注意: :8790 管理后台与内网摄像头完全无需暴露到公网！
+  #   admin.你的域名.com   -> http://community-parking:8790   (配合 Cloudflare Access 邮箱验证码锁)
+  #   ssh.你的域名.com     -> ssh://host.docker.internal:22   (配合云防火墙彻底关闭公网 22 端口)
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: community-parking-tunnel
@@ -58,7 +59,73 @@ services:
     restart: always
     depends_on:
       - community-parking
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # 可选侧车 2: Watchtower 无人值守镜像拉取热更 (--profile autoupdate 启用)
+  # 采用维护分支 nickfedor/watchtower 原生兼容 Ubuntu 24.04 Docker Engine API 1.44+；
+  # 严格开启 WATCHTOWER_LABEL_ENABLE=true，仅热更主业务容器，绝不中断 cloudflared 隧道与回滚守卫。
+  watchtower:
+    image: nickfedor/watchtower:latest
+    container_name: community-parking-watchtower
+    profiles: ["autoupdate"]
+    restart: always
+    depends_on:
+      - community-parking
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    environment:
+      - TZ=Asia/Shanghai
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_CLEANUP=false
+      - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-300}
+      - WATCHTOWER_TIMEOUT=25s
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # 可选侧车 3: 健康失败自动回滚与防死循环守卫 (--profile autoupdate 启用)
+  # 持续巡检主容器三端口 HEALTHCHECK：健康时自动锚定 community-parking:last-known-good，
+  # 若新版本启动异常或健康检查失败，秒级自动回退至上一健康版本并临时冻结坏镜像防循环拉取，
+  # 待上游 GHCR 发布新修复版本后自动恢复升级。
+  rollback-guard:
+    image: ${PARKING_IMAGE:-ghcr.io/wanggaoxiong/community-parking:latest}
+    container_name: community-parking-rollback-guard
+    profiles: ["autoupdate"]
+    restart: always
+    depends_on:
+      - community-parking
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    command: ["python", "-m", "app.rollback_guard"]
+    environment:
+      - TZ=Asia/Shanghai
+      - PARKING_IMAGE=${PARKING_IMAGE:-ghcr.io/wanggaoxiong/community-parking:latest}
+      - ROLLBACK_TARGET_CONTAINER=community-parking
+      - ROLLBACK_CHECK_INTERVAL=${ROLLBACK_CHECK_INTERVAL:-15}
+      - ROLLBACK_STARTUP_GRACE=${ROLLBACK_STARTUP_GRACE:-75}
+      - ROLLBACK_UPSTREAM_PROBE_INTERVAL=${ROLLBACK_UPSTREAM_PROBE_INTERVAL:-300}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; assert os.path.exists('/var/run/docker.sock')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
     logging:
       driver: "json-file"
       options:

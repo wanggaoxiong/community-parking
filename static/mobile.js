@@ -150,14 +150,19 @@
       state.unitId = queryUnit || savedUnit || "";
 
       const savedRepeat = localStorage.getItem(STORAGE_KEYS.repeatCount);
-      if (savedRepeat === "0" || savedRepeat === "1" || savedRepeat === "2") {
+      const savedCont = localStorage.getItem(STORAGE_KEYS.continuous);
+      if (savedRepeat === "1" || savedRepeat === "2") {
         state.repeatCount = Number(savedRepeat);
       } else {
         state.repeatCount = 2;
       }
 
-      const savedCont = localStorage.getItem(STORAGE_KEYS.continuous);
-      if (savedCont === "0" || savedCont === "1") {
+      if (savedRepeat === "0") {
+        // Migrate legacy muted state cleanly into Auto-Broadcast OFF while keeping 2-pass manual playback ready
+        state.continuousBroadcast = false;
+        localStorage.setItem(STORAGE_KEYS.repeatCount, "2");
+        localStorage.setItem(STORAGE_KEYS.continuous, "0");
+      } else if (savedCont === "0" || savedCont === "1") {
         state.continuousBroadcast = savedCont === "1";
       } else {
         state.continuousBroadcast = true;
@@ -245,6 +250,9 @@
     }
   }
 
+  const SPEAKER_SVG = `<svg class="m-icon-svg" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 6.2h2.3L8.2 3.4v9.2L4.8 9.8H2.5a.7.7 0 0 1-.7-.7V6.9c0-.4.3-.7.7-.7Z"/><path d="M10.8 5.5a3.6 3.6 0 0 1 0 5"/><path d="M12.8 3.7a6.2 6.2 0 0 1 0 8.6"/></svg>`;
+  const EQ_BARS_HTML = `<span class="m-eq-bars" aria-hidden="true"><i></i><i></i><i></i></span>`;
+
   function syncBroadcastControlUi() {
     const segBtns = els.repeatModeGroup.querySelectorAll(".m-seg-btn");
     segBtns.forEach((btn) => {
@@ -254,43 +262,38 @@
       btn.setAttribute("aria-checked", active ? "true" : "false");
     });
 
-    const contActive = state.continuousBroadcast && state.repeatCount > 0;
+    const contActive = Boolean(state.continuousBroadcast);
     els.btnContinuousToggle.classList.toggle("is-on", contActive);
     els.btnContinuousToggle.setAttribute(
       "aria-pressed",
-      state.continuousBroadcast ? "true" : "false"
+      contActive ? "true" : "false"
     );
-    els.continuousLabel.textContent = state.continuousBroadcast
-      ? "持续 · 开"
-      : "持续 · 关";
+    els.continuousLabel.textContent = "自动播报";
 
     els.btnSpeakAction.classList.toggle("is-speaking", state.isSpeaking);
     els.btnSpeakAction.classList.toggle(
       "needs-unlock",
-      !state.isSpeaking && state.speechBlockedByAutoplay && state.repeatCount > 0
+      !state.isSpeaking && state.speechBlockedByAutoplay && contActive
     );
 
     if (state.isSpeaking) {
-      els.btnSpeakAction.textContent =
+      const stopTxt =
         state.totalPasses > 1
-          ? `⏹ 停止 (${state.currentPass}/${state.totalPasses})`
-          : "⏹ 停止";
+          ? `停止 ${state.currentPass}/${state.totalPasses}`
+          : "停止";
+      els.btnSpeakAction.innerHTML = `${EQ_BARS_HTML}<span>${stopTxt}</span>`;
       els.voiceStatusBadge.textContent =
         state.totalPasses > 1
-          ? `🔊 第 ${state.currentPass}/${state.totalPasses} 遍播报中…`
-          : "🔊 语音播报中…";
-    } else if (state.speechBlockedByAutoplay && state.repeatCount > 0) {
-      els.btnSpeakAction.textContent = "🔊 点按播报";
-      els.voiceStatusBadge.textContent = "👆 轻触开启语音";
+          ? `正在播报 (${state.currentPass}/${state.totalPasses})`
+          : "语音播报中…";
+    } else if (state.speechBlockedByAutoplay && contActive) {
+      els.btnSpeakAction.innerHTML = `${SPEAKER_SVG}<span>轻触播报</span>`;
+      els.voiceStatusBadge.textContent = "轻触解锁语音";
     } else {
-      els.btnSpeakAction.textContent = "🔊 播报";
-      if (state.repeatCount === 0) {
-        els.voiceStatusBadge.textContent = "🔇 已静音";
-      } else if (state.continuousBroadcast) {
-        els.voiceStatusBadge.textContent = `🔁 持续(${state.repeatCount}遍)待命`;
-      } else {
-        els.voiceStatusBadge.textContent = `🔊 ${state.repeatCount}遍播报待命`;
-      }
+      els.btnSpeakAction.innerHTML = `${SPEAKER_SVG}<span>播报</span>`;
+      els.voiceStatusBadge.textContent = contActive
+        ? `自动播报 · ${state.repeatCount}遍`
+        : `按需播报 · ${state.repeatCount}遍`;
     }
   }
 
@@ -349,8 +352,8 @@
       .replace(/\s*-\s*Chinese.*$/i, "")
       .trim();
     const isOnline = isCloudOnlineVoice(v);
-    const speedTag = isOnline ? "联网自然" : "本地秒响";
-    return `${isOnline ? "✨" : "⚡"} ${rawName} · ${info.tag} (${speedTag})`;
+    const speedTag = isOnline ? "自然" : "极速";
+    return `${rawName} · ${info.tag} (${speedTag})`;
   }
 
   function populateVoiceSelectOptions() {
@@ -375,7 +378,7 @@
     els.voiceSelect.innerHTML = "";
     const defOpt = document.createElement("option");
     defOpt.value = "";
-    defOpt.textContent = "🎙️ 默认自带 (秒响)";
+    defOpt.textContent = "默认音色";
     els.voiceSelect.appendChild(defOpt);
 
     const groups = {
@@ -755,6 +758,9 @@
         2
       )} ${vh.toFixed(2)}`
     );
+    if (els.btnZoomReset) {
+      els.btnZoomReset.hidden = z <= 1.02;
+    }
   }
 
   function zoomAroundRatio(newZoom, anchorRatioX = 0.5, anchorRatioY = 0.5) {
@@ -1622,6 +1628,7 @@
       els.recBadgeTag.textContent = "车位暂满";
       els.recZoneName.textContent = "小区地面公益车位暂满";
       els.recFreePill.textContent = "净余 0";
+      els.recFreePill.hidden = true;
 
       let nearestWalkM = null;
       if (Array.isArray(ov.spot_groups)) {
@@ -1633,7 +1640,7 @@
         }
       }
       els.recWalkPill.textContent =
-        nearestWalkM != null ? `🚶 最近车位带 ${nearestWalkM}m` : "建议周边临停";
+        nearestWalkM != null ? `最近 ${nearestWalkM}m` : "周边临停";
       els.recBackupText.textContent =
         rec.voice_text || "当前暂无可用空位，请留意周边临停导引";
       return;
@@ -1652,8 +1659,9 @@
     els.recBadgeTag.textContent = "首选推荐";
     els.recZoneName.textContent =
       primary.broadcast_zone_name || primary.zone_name || primary.zone_id;
+    els.recFreePill.hidden = false;
     els.recFreePill.textContent = `净余 ${freeCnt} 位`;
-    els.recWalkPill.textContent = `🚶 距单元门 ${walkM}`;
+    els.recWalkPill.textContent = `步行 ${walkM}`;
 
     const b0 =
       rec.backup || (Array.isArray(rec.backups) ? rec.backups[0] : null);
@@ -1772,9 +1780,9 @@
         if (forceSpeak) {
           state.sessionMutedByQuery = false;
           speakBroadcast(voiceText, state.repeatCount, "manual");
-        } else if (wasInitialLoad && !state.sessionMutedByQuery) {
+        } else if (state.continuousBroadcast && wasInitialLoad && !state.sessionMutedByQuery) {
           speakBroadcast(voiceText, state.repeatCount, "initial");
-        } else if (!state.sessionMutedByQuery && sigChanged && (state.continuousBroadcast || !state.isSpeaking)) {
+        } else if (state.continuousBroadcast && !state.sessionMutedByQuery && sigChanged) {
           speakBroadcast(voiceText, state.repeatCount, "change");
         }
       }
@@ -2004,18 +2012,13 @@
       const btn = ev.target.closest(".m-seg-btn");
       if (!btn) return;
       state.userInteracted = true;
-      const nextRepeat = Number(btn.dataset.repeat);
+      const nextRepeat = Number(btn.dataset.repeat) === 1 ? 1 : 2;
       state.repeatCount = nextRepeat;
       persistSettings();
       requestWakeLockIfNeeded();
-
-      if (nextRepeat === 0) {
-        stopBroadcast(true);
-      } else {
-        syncBroadcastControlUi();
-        if (state.latestVoiceText) {
-          speakBroadcast(state.latestVoiceText, nextRepeat, "mode-switch");
-        }
+      syncBroadcastControlUi();
+      if (state.latestVoiceText) {
+        speakBroadcast(state.latestVoiceText, nextRepeat, "mode-switch");
       }
     });
 
@@ -2025,14 +2028,8 @@
       persistSettings();
       requestWakeLockIfNeeded();
       if (!state.continuousBroadcast) {
-        clearContinuousTimer();
-        syncBroadcastControlUi();
+        stopBroadcast(true);
       } else {
-        // Turning continuous ON when muted restores 2-pass broadcast automatically
-        if (state.repeatCount === 0) {
-          state.repeatCount = 2;
-          persistSettings();
-        }
         syncBroadcastControlUi();
         if (state.latestVoiceText && !state.isSpeaking) {
           speakBroadcast(

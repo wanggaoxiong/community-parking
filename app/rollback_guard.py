@@ -466,6 +466,7 @@ class RollbackGuard:
         override_target_image: str = "",
         pause_watchtower: bool = True,
         fallback_inspect: dict[str, Any] | None = None,
+        now_mono: float | None = None,
     ) -> dict[str, Any]:
         rollback_ref = override_target_image.strip()
         if not rollback_ref:
@@ -505,7 +506,7 @@ class RollbackGuard:
             except Exception:
                 pass
         self._unhealthy_since.clear()
-        self._last_upstream_probe_ts = time.monotonic()
+        self._last_upstream_probe_ts = time.monotonic() if now_mono is None else now_mono
         self._save_state()
         self._log(f"✅ Rollback completed -> container {new_cid[:12]} started from {rollback_ref}")
         return {
@@ -526,6 +527,7 @@ class RollbackGuard:
                 return self.trigger_rollback(
                     reason=f"Container {self.target_container} missing after update",
                     pause_watchtower=bool(self.state.get("rollback_active")),
+                    now_mono=now,
                 )
             return {"action": "waiting_for_container"}
 
@@ -555,6 +557,7 @@ class RollbackGuard:
                 bad_image_id=current_image_id,
                 pause_watchtower=(current_image_id != last_good_id),
                 fallback_inspect=inspect_data,
+                now_mono=now,
             )
 
         if status in {"exited", "dead"}:
@@ -564,6 +567,7 @@ class RollbackGuard:
                 bad_image_id=current_image_id,
                 pause_watchtower=(current_image_id != last_good_id),
                 fallback_inspect=inspect_data,
+                now_mono=now,
             )
 
         # Transitional states (`starting` / `restarting` / `created`): enforce grace window
@@ -579,6 +583,7 @@ class RollbackGuard:
                 bad_image_id=current_image_id,
                 pause_watchtower=(current_image_id != last_good_id),
                 fallback_inspect=inspect_data,
+                now_mono=now,
             )
 
         return {

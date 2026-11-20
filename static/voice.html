@@ -82,6 +82,7 @@
             <div class="vg-select-wrap vg-compact-select">
               <select id="vgVehicleSelect" class="vg-sub-select" aria-label="选择车型">
                 <option value="sedan">🚗 轿车</option>
+                <option value="ev">⚡ 新能源</option>
                 <option value="suv">🚙 大型SUV</option>
                 <option value="compact">🛵 小车</option>
               </select>
@@ -104,6 +105,9 @@
             </div>
           </div>
         </div>
+
+        <!-- 带标签特色车位实时空余速查胶囊栏（当场内标有 ⚡新能源 / 🤝招租 / 🚙宽体 等标签车位时自动显现） -->
+        <div id="vgTagAvailBar" class="vg-tag-avail-bar hidden" role="region" aria-label="特色标签车位空余筛选"></div>
 
         <!-- 精炼一行寻位摘要（绝不重复显示两遍文字） -->
         <div class="vg-summary-bar" aria-live="polite">
@@ -159,6 +163,8 @@
 
         <div class="vg-quick-chips" id="vgQuickChipsRow">
           <button type="button" class="vg-chip" data-q="现在停哪个区域走回家最近？还有几个位？">停哪最近？</button>
+          <button type="button" class="vg-chip vg-chip-ev" data-q="现在新能源充电车位还有空位吗？停哪最近？">⚡ 新能源空位</button>
+          <button type="button" class="vg-chip" data-q="小区现在有哪些对外招租或错峰共享车位？">🤝 招租/共享位</button>
           <button type="button" class="vg-chip" data-q="我是大型SUV，现在有哪些好停的车位？">大型SUV好停吗？</button>
           <button type="button" class="vg-chip" data-q="除了首选区域，还有哪些备选空位？">备选空位</button>
           <span id="vgCustomChipsList" class="vg-custom-chips-inline"></span>
@@ -205,7 +211,7 @@
             type="text"
             class="vg-composer-input"
             maxlength="160"
-            placeholder="问一句：如“回3栋1单元停哪最近？”"
+            placeholder="问一句：如“新能源车位还有空吗？”或“回3栋停哪？”"
           />
           <button id="vgAskSendBtn" type="button" class="vg-composer-send">发送</button>
         </div>

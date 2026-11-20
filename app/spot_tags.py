@@ -268,6 +268,184 @@ def is_spot_privately_reserved(
     return True
 
 
+def resolve_tag_filter_code(raw_tag: Optional[str]) -> str:
+    """Normalize a single query/filter tag code or alias; returns '' for 'all'/empty."""
+    s = str(raw_tag or "").strip()
+    if not s or s.lower() in ("all", "any", "none", "全部", "不限"):
+        return ""
+    norm = normalize_spot_tags([s], max_custom=1)
+    return norm[0] if norm else ""
+
+
+def get_tag_display_info(tag_code: str) -> Dict[str, Any]:
+    """Return display metadata (`code`, `label`, `short_badge`, `color`) for built-in or custom tag."""
+    clean = resolve_tag_filter_code(tag_code)
+    if not clean:
+        return {"code": "", "label": "全部车位", "short_badge": "", "color": "#0071E3"}
+    if clean in SPOT_TAG_MAP:
+        return dict(SPOT_TAG_MAP[clean])
+    return {
+        "code": clean,
+        "label": clean,
+        "short_badge": "#",
+        "icon": "tag",
+        "color": "#0EA5E9",
+        "bg_soft": "rgba(14, 165, 233, 0.14)",
+        "description": f"自定义标签：{clean}",
+        "auto_detect": False,
+    }
+
+
+_NATURAL_TEXT_TAG_PATTERNS: List[Tuple[str, Tuple[str, ...]]] = [
+    (
+        "ev_charging",
+        (
+            "新能源",
+            "充电桩",
+            "充电位",
+            "充电车位",
+            "充电空位",
+            "电桩",
+            "找桩",
+            "寻桩",
+            "有桩",
+            "带桩",
+            "快充",
+            "慢充",
+            "超充",
+            "纯电",
+            "绿牌",
+            "插混",
+            "电车",
+            "充个电",
+            "充下电",
+            "叉電",
+            "充電",
+            "新能源車",
+            "ev ",
+            "ev?",
+            "ev spot",
+            "ev stall",
+            "ev charg",
+            "charger",
+            "charging",
+            "electric car",
+            "electric vehicle",
+        ),
+    ),
+    (
+        "rentable",
+        (
+            "对外出租",
+            "对外招租",
+            "车位出租",
+            "车位招租",
+            "出租车位",
+            "招租车位",
+            "可租",
+            "待租",
+            "租车位",
+            "月租",
+            "包月",
+            "长租",
+            "短租",
+            "错峰共享",
+            "共享车位",
+            "招租",
+            "出租",
+            "rent",
+            "for rent",
+            "lease",
+        ),
+    ),
+    (
+        "accessible",
+        (
+            "无障碍",
+            "無障礙",
+            "轮椅",
+            "关爱车位",
+            "残疾人",
+            "accessible",
+            "handicap",
+            "wheelchair",
+        ),
+    ),
+    (
+        "large_friendly",
+        (
+            "宽体",
+            "大车位",
+            "加宽车位",
+            "加宽位",
+            "宽车位",
+            "好倒车",
+            "wide spot",
+            "large spot",
+        ),
+    ),
+    (
+        "visitor",
+        (
+            "访客",
+            "訪客",
+            "来访",
+            "亲友临停",
+            "临时访客",
+            "visitor",
+            "guest spot",
+        ),
+    ),
+    (
+        "private",
+        (
+            "产权位",
+            "产权车位",
+            "固定车位",
+            "固定位",
+            "私家车位",
+            "专属车位",
+            "private spot",
+            "reserved spot",
+        ),
+    ),
+]
+
+
+def match_spot_tag_from_text(
+    text: str,
+    extra_custom_tags: Iterable[str] = (),
+) -> Optional[str]:
+    """Extract a queried parking spot tag code from spoken/typed natural language."""
+    s = str(text or "").strip()
+    if not s:
+        return None
+    low = f" {s.lower()} "
+
+    # Guard against matching "电动车/电瓶车" (two-wheel e-bike) as EV car charging
+    scrubbed = (
+        s.replace("两轮电动车", "")
+        .replace("电瓶车", "")
+        .replace("电动自行车", "")
+    )
+    scrub_low = f" {scrubbed.lower()} "
+
+    # Check custom operator tags first (exact substring match, longest first)
+    for ctag in sorted({str(t or "").strip() for t in extra_custom_tags if str(t or "").strip()}, key=len, reverse=True):
+        if ctag.lower() in scrub_low:
+            return ctag
+
+    for code, keywords in _NATURAL_TEXT_TAG_PATTERNS:
+        for kw in keywords:
+            if kw.isascii():
+                if kw in scrub_low:
+                    return code
+            else:
+                if kw in scrubbed:
+                    return code
+    return None
+
+
 def merge_spot_tags_on_recalibration(
     prev_tags_raw: Any,
     prev_meta_raw: Any,

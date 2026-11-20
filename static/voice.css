@@ -1243,6 +1243,81 @@ body {
   backdrop-filter: blur(10px);
 }
 
+/* Tagged Spot Live Availability Strip on :18791 */
+.vg-tag-avail-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 2px 2px 4px;
+}
+
+.vg-tag-avail-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.vg-tag-avail-bar.hidden {
+  display: none !important;
+}
+
+.vg-tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 29px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  background: #f8fafc;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.vg-tag-pill em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 5.5px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.06);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.vg-tag-pill.has-free em {
+  background: rgba(24, 169, 52, 0.14);
+  color: #117a27;
+}
+
+.vg-tag-pill.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 2px 7px rgba(0, 113, 227, 0.22);
+}
+
+.vg-tag-pill.is-active[data-tag="ev_charging"] {
+  background: #059669;
+  border-color: #059669;
+}
+
+.vg-tag-pill.is-active em {
+  background: rgba(255, 255, 255, 0.22);
+  color: #ffffff;
+}
+
+.vg-chip.vg-chip-ev {
+  border-color: rgba(16, 185, 129, 0.35);
+  background: rgba(16, 185, 129, 0.08);
+  color: #047857;
+}
+
 @media (max-width: 500px) {
   .vg-sub-controls {
     flex-wrap: wrap;

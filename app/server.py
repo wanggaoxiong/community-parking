@@ -78,6 +78,7 @@ def _build_mobile_overview_payload(
     unit_id: Optional[str] = None,
     vehicle_type: str = "sedan",
     entry_gate_id: Optional[str] = None,
+    tag_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build a lightweight, privacy-sanitized read-only payload exclusively for the mobile owner viewer (:18790).
@@ -209,14 +210,20 @@ def _build_mobile_overview_payload(
         driver_tag="手机端查看",
         acquire_lock=False,
         entry_gate_id=entry_gate_id or None,
+        tag_filter=tag_filter,
     )
     sanitized_rec = {
         "has_recommendation": bool(rec_raw.get("has_recommendation")),
         "unit": rec_raw.get("unit"),
         "vehicle_type": rec_raw.get("vehicle_type", vtype),
+        "tag_filter": rec_raw.get("tag_filter", ""),
+        "tag_label": rec_raw.get("tag_label", ""),
+        "tag_total_spots": rec_raw.get("tag_total_spots", 0),
+        "tag_effective_free": rec_raw.get("tag_effective_free", 0),
         "primary": rec_raw.get("primary"),
         "backup": rec_raw.get("backup"),
         "voice_text": rec_raw.get("voice_text", ""),
+        "repeat_voice_text": rec_raw.get("repeat_voice_text", ""),
         "recommended_route": rec_raw.get("recommended_route"),
         "door_walk_path": rec_raw.get("door_walk_path"),
     }
@@ -235,12 +242,14 @@ def _build_mobile_overview_payload(
         "mobile_version": _compute_mobile_version(),
         "selected_unit_id": resolved_uid,
         "vehicle_type": vtype,
+        "tag_filter": rec_raw.get("tag_filter", ""),
         "total_capacity": total_cap,
         "total_effective_free": total_free,
         "total_ev_spots": total_ev,
         "total_ev_free": total_ev_free,
         "total_rentable_spots": total_rentable,
         "spot_tag_catalog": SPOT_TAG_CATALOG,
+        "tag_availability": spatial_gov.get("tag_availability", []),
         "units": units_list,
         "zones": sanitized_zones,
         "spot_groups": sanitized_groups,
@@ -718,6 +727,7 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                             "total_ev_free": total_ev_free,
                             "total_rentable_spots": total_rentable,
                             "spot_tag_catalog": SPOT_TAG_CATALOG,
+                            "tag_availability": spatial_gov.get("tag_availability", []),
                             "units": units_list,
                             "zones": zones,
                             "cameras": cams_list,
@@ -743,9 +753,14 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     vtype = (qs.get("vehicle_type") or ["sedan"])[0]
                     sel_uid = (qs.get("unit_id") or qs.get("unit") or [""])[0] or None
                     gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     self._send_json(
                         _build_mobile_overview_payload(
-                            ctx, unit_id=sel_uid, vehicle_type=vtype, entry_gate_id=gate_id
+                            ctx,
+                            unit_id=sel_uid,
+                            vehicle_type=vtype,
+                            entry_gate_id=gate_id,
+                            tag_filter=tag_flt,
                         )
                     )
                     return
@@ -765,18 +780,24 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     unit_id = (qs.get("unit_id") or qs.get("unit") or ["3-1"])[0]
                     vtype = (qs.get("vehicle_type") or ["sedan"])[0]
                     entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     res = ctx.recommender.recommend(
                         unit_id=unit_id,
                         vehicle_type=vtype if vtype in ("sedan", "suv", "compact", "ev") else "sedan",
                         driver_tag="手机端查看",
                         acquire_lock=False,
                         entry_gate_id=entry_gate_id,
+                        tag_filter=tag_flt,
                     )
                     self._send_json(
                         {
                             "has_recommendation": bool(res.get("has_recommendation")),
                             "unit": res.get("unit"),
                             "vehicle_type": res.get("vehicle_type", "sedan"),
+                            "tag_filter": res.get("tag_filter", ""),
+                            "tag_label": res.get("tag_label", ""),
+                            "tag_total_spots": res.get("tag_total_spots", 0),
+                            "tag_effective_free": res.get("tag_effective_free", 0),
                             "primary": res.get("primary"),
                             "backup": res.get("backup"),
                             "voice_text": res.get("voice_text", ""),
@@ -823,12 +844,14 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                         vtype = "suv" if car_len >= 4.85 else ("compact" if car_len <= 4.1 else "sedan")
                     acq = (qs.get("acquire_lock") or ["1"])[0] not in ("0", "false", "False")
                     entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     res = ctx.recommender.recommend(
                         unit_id=unit_id,
                         vehicle_type=vtype,
                         driver_tag=(qs.get("driver_tag") or ["小区车主"])[0],
                         acquire_lock=acq,
                         entry_gate_id=entry_gate_id,
+                        tag_filter=tag_flt,
                     )
                     self._send_json(res)
                     return
@@ -838,12 +861,14 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     unit_id = qs.get("unit_id", ["3-1"])[0]
                     vtype = qs.get("vehicle_type", ["sedan"])[0]
                     entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     res = ctx.recommender.recommend(
                         unit_id=unit_id,
                         vehicle_type=vtype,
                         driver_tag="车载语音快捷指令",
                         acquire_lock=True,
                         entry_gate_id=entry_gate_id,
+                        tag_filter=tag_flt,
                     )
                     if qs.get("format", ["text"])[0] == "json":
                         self._send_json(res)
@@ -1024,12 +1049,14 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                 if path == "/api/recommend":
                     body = self._read_json()
                     raw_eg = body.get("entry_gate_id")
+                    raw_tag = body.get("tag_filter") if "tag_filter" in body else body.get("tag")
                     res = ctx.recommender.recommend(
                         unit_id=str(body.get("unit_id", "3-1")),
                         vehicle_type=str(body.get("vehicle_type", "sedan")),
                         driver_tag=str(body.get("driver_tag", "小区车主")),
                         acquire_lock=bool(body.get("acquire_lock", True)),
                         entry_gate_id=str(raw_eg).strip() if raw_eg is not None else None,
+                        tag_filter=str(raw_tag).strip() if raw_tag is not None else None,
                     )
                     self._send_json(res)
                     return
@@ -2474,9 +2501,14 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     vtype = (qs.get("vehicle_type") or ["sedan"])[0]
                     sel_uid = (qs.get("unit_id") or qs.get("unit") or [""])[0] or None
                     gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     self._send_json(
                         _build_mobile_overview_payload(
-                            ctx, unit_id=sel_uid, vehicle_type=vtype, entry_gate_id=gate_id
+                            ctx,
+                            unit_id=sel_uid,
+                            vehicle_type=vtype,
+                            entry_gate_id=gate_id,
+                            tag_filter=tag_flt,
                         )
                     )
                     return
@@ -2496,18 +2528,24 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     unit_id = (qs.get("unit_id") or qs.get("unit") or ["3-1"])[0]
                     vtype = (qs.get("vehicle_type") or ["sedan"])[0]
                     entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     res = ctx.recommender.recommend(
                         unit_id=unit_id,
                         vehicle_type=vtype if vtype in ("sedan", "suv", "compact", "ev") else "sedan",
                         driver_tag="手机端查看",
                         acquire_lock=False,
                         entry_gate_id=entry_gate_id,
+                        tag_filter=tag_flt,
                     )
                     self._send_json(
                         {
                             "has_recommendation": bool(res.get("has_recommendation")),
                             "unit": res.get("unit"),
                             "vehicle_type": res.get("vehicle_type", "sedan"),
+                            "tag_filter": res.get("tag_filter", ""),
+                            "tag_label": res.get("tag_label", ""),
+                            "tag_total_spots": res.get("tag_total_spots", 0),
+                            "tag_effective_free": res.get("tag_effective_free", 0),
                             "primary": res.get("primary"),
                             "backup": res.get("backup"),
                             "voice_text": res.get("voice_text", ""),

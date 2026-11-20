@@ -4092,6 +4092,89 @@ class VisionPipeline:
             elif ref_delta_val > 0.155 and (ground_car_score >= 0.44 or symmetric_achromatic_car) and not neighbor_bleed_suspected:
                 ground_car_score = max(ground_car_score, 0.58 + min(0.28, (ref_delta_val - 0.155) * 1.3))
 
+        # Flat 2D Ground Stencil / Painted EV or Accessible Icon Filter (`地面喷涂新能源小车/轮椅/数字标线`):
+        # When >52% of the stall core is exposed bare pavement matching the empty front apron,
+        # >94% of the core is explained solely by bare pavement + smooth green/cyan/blue/white
+        # road paint (with 2px anti-aliasing), and there is virtually zero 3D dark chassis/tire
+        # shadow or orange/terracotta/lock object, suppress stencil-induced ground edges so empty
+        # EV bays (even with a rear charging pedestal in the upper 3D prism) stay cleanly FREE!
+        ground_stencil_filtered = False
+        if (
+            not colored_paving_filtered
+            and not has_chassis_shadow_bar
+            and cone_ratio < 0.008
+            and brick_ratio < 0.008
+        ):
+            aps_y0, aps_y1 = int(h * 0.72), int(h * 0.90)
+            aps_x0, aps_x1 = int(w * 0.22), int(w * 0.78)
+            aps_hsv = hsv_full[aps_y0:aps_y1, aps_x0:aps_x1]
+            aps_lab = lab_full[aps_y0:aps_y1, aps_x0:aps_x1]
+            aps_valid = (valid_mask[aps_y0:aps_y1, aps_x0:aps_x1] > 127) & ~(
+                (aps_hsv[:, :, 1] < 42) & (aps_hsv[:, :, 2] > 175)
+            )
+            st_y0, st_y1 = int(h * 0.28), int(h * 0.74)
+            st_x0, st_x1 = int(w * 0.22), int(w * 0.78)
+            st_valid = valid_mask[st_y0:st_y1, st_x0:st_x1] > 127
+            if int(np.sum(aps_valid)) >= 40 and int(np.sum(st_valid)) >= 120:
+                bg_l_med = float(np.median(aps_lab[:, :, 0][aps_valid]))
+                bg_a_med = float(np.median(aps_lab[:, :, 1][aps_valid]))
+                bg_b_med = float(np.median(aps_lab[:, :, 2][aps_valid]))
+                st_lab = lab_full[st_y0:st_y1, st_x0:st_x1]
+                st_hsv = hsv_full[st_y0:st_y1, st_x0:st_x1]
+                d_bg_lab = np.sqrt(
+                    (st_lab[:, :, 0] - bg_l_med) ** 2
+                    + (st_lab[:, :, 1] - bg_a_med) ** 2
+                    + (st_lab[:, :, 2] - bg_b_med) ** 2
+                )
+                bare_pave_mask = d_bg_lab < 15.0
+                bare_pave_ratio = float(np.mean(bare_pave_mask[st_valid]))
+                colored_stencil_px = (
+                    (st_hsv[:, :, 0] >= 35)
+                    & (st_hsv[:, :, 0] <= 118)
+                    & (st_hsv[:, :, 1] >= 42)
+                    & (st_hsv[:, :, 2] >= 78)
+                )
+                white_stencil_px = (st_hsv[:, :, 1] < 42) & (st_hsv[:, :, 2] > 175)
+                flat_stencil_mask = colored_stencil_px | white_stencil_px
+                stencil_ratio = float(np.mean(flat_stencil_mask[st_valid]))
+                col_stencil_cnt = int(np.sum(colored_stencil_px & st_valid))
+                stencil_v_std = (
+                    float(np.std(st_hsv[:, :, 2][colored_stencil_px & st_valid]))
+                    if col_stencil_cnt >= 20
+                    else 0.0
+                )
+                dark_3d_ratio = float(
+                    np.mean((st_lab[:, :, 0] < max(36.0, bg_l_med * 0.64))[st_valid])
+                )
+                dil_stencil = (
+                    cv2.dilate(flat_stencil_mask.astype(np.uint8) * 255, np.ones((5, 5), np.uint8)) > 0
+                )
+                explained_flat_ratio = float(np.mean((bare_pave_mask | dil_stencil)[st_valid]))
+                if (
+                    bare_pave_ratio >= 0.52
+                    and 0.025 <= stencil_ratio <= 0.40
+                    and stencil_v_std <= 34.0
+                    and explained_flat_ratio >= 0.94
+                    and dark_3d_ratio < 0.035
+                ):
+                    ground_stencil_filtered = True
+                    ground_car_score = 0.04
+                    ground_rear_score = 0.04
+                    active_cols = 0
+                    center_edge_ratio = 0.02
+                    rear_edge_r = 0.02
+                    obj_blob_ratio = 0.0
+                    rear_zone_occ = 0.0
+                    mid_zone_occ = 0.0
+                    mouth_zone_occ = 0.0
+                    chromatic_car_detected = False
+                    chromatic_anomaly = False
+                    painted_green_vehicle_body = False
+                    symmetric_achromatic_car = False
+                    bilateral_smooth_car = False
+                    symmetric_full_car = False
+                    smooth_white_cargo_body = False
+
         # 3. 3D Vehicle-Occupied Envelope Layer (`车辆立体轮廓层`) + Ground-Anchored Fusion
         car_score = ground_car_score
         eff_edge_ratio = center_edge_ratio
@@ -4272,6 +4355,7 @@ class VisionPipeline:
             "underbody_shadow_ratio": round(underbody_shadow_ratio, 3),
             "chromatic_anomaly": bool(chromatic_anomaly),
             "colored_paving_filtered": bool(colored_paving_filtered),
+            "ground_stencil_filtered": bool(ground_stencil_filtered),
             "painted_green_vehicle_body": bool(painted_green_vehicle_body),
             "low_light_scene": bool(low_light_patch),
             "rear_wheelstop_filtered": bool(rear_wheelstop_filtered),
@@ -4898,7 +4982,7 @@ class VisionPipeline:
                 "2. 【严禁将透水红砖/彩砖地面与车位后段防撞石/防撞条误判为占用或障碍（核心铁律）】：\n"
                 "   - 小区车位常铺设红色/橙红/灰红透水砖或植草砖（晴天阳光直射或雨后湿润反光时表面会呈现明亮橙红色，与灰色柏油马路颜色截然不同），且车位后沿靠近路牙/绿篱处常装有【水泥防撞石、黄黑橡胶防撞条/止退器（车轮挡）】用于防止倒车出界！\n"
                 "   - 【严禁把橙红透水砖空地面误判为红色汽车】：真正的汽车必有立体车顶/深色挡风玻璃/A柱B柱车窗框/后视镜/车轮轮胎与车底浓黑阴影；若青色地面框内只是平坦的橙红/砖红色地面砖铺装（即使反光发亮）而无车窗玻璃和立体车厢，必须判为 status=\"FREE\", obstacle_type=\"none\", parking_pose=\"empty_clear\", action_hint=\"\"！\n"
-                "   - 透水红砖/彩砖铺装地面、砖缝纹理、地面喷涂车位号、以及车位后段的固定【防撞石 / 黄黑防撞条 / 止退器 / 路缘石】均属于正常空车位基础设施，绝不是车辆也不是障碍物！\n"
+                "   - 透水红砖/彩砖铺装地面、砖缝纹理、地面喷涂车位号、地面喷涂的新能源小汽车/充电插头/闪电/无障碍轮椅平面图标与绿色边框线、以及车位后段的固定【立柱/壁挂充电桩、充电枪线、防撞石 / 黄黑防撞条 / 止退器 / 路缘石】均属于正常空车位基础设施，绝不是停放车辆也不是障碍物！\n"
                 "   - 同样，若汽车完全停在隔壁车位线外（注意不要把左右相邻车位的白色/深色车身侧面误算进本位青色框），或摇晃树枝/绿叶/灌木仅伸入上方黄色 3D 框、地面仅有斑驳树影/落叶而青色地面框无本位车轮/底盘接触，也必须判为 status=\"FREE\", obstacle_type=\"none\", parking_pose=\"empty_clear\"。\n"
                 "   - 同时请判断车辆定位姿态 `parking_pose`：若车辆已正常停在车位标定框内部静止停稳，填 \"parked_stationary\"；若车身斜跨在车位前口与马路之间正在倒车入库/驶出揉库，填 \"maneuvering\"；若车位空置无车，填 \"empty_clear\"。\n"
                 "3. 【临时有人或猫狗小动物（动态活体让行）】：若车位内有行人驻足/路过，或有猫、狗等宠物/小动物停留，活体会在车辆慢速驶近时自行避让，车位可用！必须判为 status=\"FREE\", obstacle_type=\"pedestrian\"，并在 action_hint 提示（如“临时有人，驶近请减速示意让行”或“车位内有猫狗小动物，请慢速鸣笛观察避让后停入”）。\n"

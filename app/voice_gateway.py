@@ -31,6 +31,12 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 from app.config import BASE_DIR, DATA_DIR, config_manager
+from app.spot_tags import (
+    SPOT_TAG_CATALOG,
+    get_tag_display_info,
+    match_spot_tag_from_text,
+    resolve_tag_filter_code,
+)
 from app.vision_pipeline import VisionPipeline
 from app.workspaces import extract_short_site_name, strip_greeting_for_repeat
 
@@ -1633,6 +1639,76 @@ class VoiceGatewayService:
         movable_cnt = int(prim.get("movable_free") or 0)
         ped_cnt = int(prim.get("pedestrian_free") or 0)
         clean_cnt = int(prim.get("clean_free") or p_free)
+        active_tag_code = str(rec.get("tag_filter") or "").strip()
+        active_tag_cn = str(rec.get("tag_label") or "").strip()
+        tag_tot_n = int(rec.get("tag_total_spots") or 0)
+        tag_free_n = int(rec.get("tag_effective_free") or 0)
+        en_tag_map = {
+            "ev_charging": "EV charging",
+            "rentable": "rentable shared",
+            "private": "private reserved",
+            "large_friendly": "wide SUV-friendly",
+            "accessible": "accessible",
+            "visitor": "visitor",
+        }
+
+        if active_tag_code and lang != "zh-CN":
+            if lang == "en-US":
+                en_t = en_tag_map.get(active_tag_code, active_tag_code)
+                en_unit = translate_parking_term_to_english(unit_name, fallback_code=unit_id)
+                if not has_rec:
+                    if tag_tot_n <= 0:
+                        s_en = f"No {en_t} parking spots are configured yet. {total_free} regular spots are open."
+                    else:
+                        s_en = f"All {tag_tot_n} {en_t} spots are currently occupied. {total_free} regular spots remain available."
+                    return s_en, f"No {en_t} spots currently open.", base_display
+                en_pz = translate_parking_term_to_english(
+                    p_zone, fallback_code=str(prim.get("group_code") or prim.get("zone_id") or "")
+                )
+                s_en = (
+                    f"Welcome! {tag_free_n} of {tag_tot_n} {en_t} spots available. "
+                    f"Best match: {en_pz}, {p_free} open, about {p_walk} meters walk to {en_unit}."
+                )
+                return s_en, f"Best {en_t} match: {en_pz}, {p_free} open.", base_display
+            if lang == "zh-HK":
+                if not has_rec:
+                    s_hk = (
+                        f"目前屋苑暫未配置「{active_tag_cn}」車位。"
+                        if tag_tot_n <= 0
+                        else f"目前屋苑 {tag_tot_n} 個「{active_tag_cn}」車位已泊滿晒，普通車位仲有 {total_free} 個。"
+                    )
+                    return s_hk, f"{active_tag_cn}車位目前已滿。", base_display
+                s_hk = (
+                    f"目前屋苑「{active_tag_cn}」車位共 {tag_tot_n} 個、仲有 {tag_free_n} 個空位，"
+                    f"優先為您推介 {p_zone}，而家仲有 {p_free} 個{active_tag_cn}空位，行返去單元門口約 {p_walk} 米。"
+                )
+                return s_hk, f"優先推介 {p_zone}，仲有 {p_free} 個{active_tag_cn}位。", base_display
+            if lang == "zh-SC":
+                if not has_rec:
+                    s_sc = (
+                        f"院里头暂时还没配「{active_tag_cn}」车位哈。"
+                        if tag_tot_n <= 0
+                        else f"不好意思哈，院里 {tag_tot_n} 个「{active_tag_cn}」车位都停满完了，普通车位还有 {total_free} 个。"
+                    )
+                    return s_sc, f"{active_tag_cn}车位暂时停满了。", base_display
+                s_sc = (
+                    f"巴适得很，院里「{active_tag_cn}」车位共 {tag_tot_n} 个、还有 {tag_free_n} 个空位，"
+                    f"优先给您推荐切 {p_zone}，这儿还有 {p_free} 个{active_tag_cn}位子，走拢单元门才 {p_walk} 米。"
+                )
+                return s_sc, f"优先切 {p_zone}，还有 {p_free} 个{active_tag_cn}位。", base_display
+            if lang == "zh-NE":
+                if not has_rec:
+                    s_ne = (
+                        f"咱院里暂时还没设「{active_tag_cn}」车位呢。"
+                        if tag_tot_n <= 0
+                        else f"哎呀，咱院里 {tag_tot_n} 个「{active_tag_cn}」车位这会儿全满了，普通车位还有 {total_free} 个。"
+                    )
+                    return s_ne, f"{active_tag_cn}车位这会儿停满了。", base_display
+                s_ne = (
+                    f"妥妥滴，咱院里「{active_tag_cn}」车位共 {tag_tot_n} 个、这会儿还有 {tag_free_n} 个空位，"
+                    f"优先推荐您奔 {p_zone}，那块儿还有 {p_free} 个{active_tag_cn}空位，溜达回单元门也就 {p_walk} 米。"
+                )
+                return s_ne, f"优先奔 {p_zone}，还有 {p_free} 个{active_tag_cn}位，老省心了。", base_display
 
         if lang == "en-US":
             en_unit = translate_parking_term_to_english(unit_name, fallback_code=unit_id)
@@ -1849,6 +1925,7 @@ class VoiceGatewayService:
         channel: str = "siri",
         external_uid: str = "",
         voice_lang: Optional[str] = None,
+        tag_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         with self._lock:
@@ -1864,8 +1941,9 @@ class VoiceGatewayService:
         else:
             rep = 1 if int(repeat) <= 1 else 2
 
+        norm_tag = resolve_tag_filter_code(tag_filter)
         vtype = self._normalize_vehicle_type(
-            vehicle_type or (binding.get("vehicle_type") if binding else "sedan")
+            vehicle_type or ("ev" if norm_tag == "ev_charging" else (binding.get("vehicle_type") if binding else "sedan"))
         )
         rec = self.ctx.recommender.recommend(
             unit_id=resolved_uid,
@@ -1873,8 +1951,13 @@ class VoiceGatewayService:
             driver_tag="18791免手语音播报",
             acquire_lock=False,
             entry_gate_id=entry_gate_id,
+            tag_filter=norm_tag or None,
         )
-        zones = self.ctx.recommender.get_zone_summaries()
+        zones = self.ctx.recommender.get_zone_summaries(vehicle_type=vtype)
+        tag_availability = self.ctx.recommender.build_tag_availability(
+            zone_summaries=zones,
+            selected_unit_id=resolved_uid,
+        )
         total_free = sum(int(z.get("effective_free") or 0) for z in zones)
         total_spots = sum(int(z.get("total_capacity") or z.get("total_spots") or 0) for z in zones)
 
@@ -1926,6 +2009,11 @@ class VoiceGatewayService:
             "apple_tts_lang": voice_lang_to_apple_tts(eff_lang),
             "repeat": rep,
             "vehicle_type": vtype,
+            "tag_filter": rec.get("tag_filter", ""),
+            "tag_label": rec.get("tag_label", ""),
+            "tag_total_spots": rec.get("tag_total_spots", 0),
+            "tag_effective_free": rec.get("tag_effective_free", 0),
+            "tag_availability": tag_availability,
             "has_recommendation": bool(rec.get("has_recommendation")),
             "total_effective_free": total_free,
             "total_spots": total_spots,
@@ -2027,6 +2115,7 @@ class VoiceGatewayService:
         external_uid: str = "",
         client_ip: str = "local",
         voice_lang: Optional[str] = None,
+        tag_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         with self._lock:
@@ -2108,16 +2197,29 @@ class VoiceGatewayService:
                     "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
                 }
 
-        # Extract inline unit mention if user asked e.g. "我现在去5号楼2单元停哪最近"
+        # Extract inline unit mention & natural-language spot tag mention (e.g. "新能源车位还有空吗", "有没有对外招租车位")
         inline_unit = self._match_unit_from_text(clean_q, units)
         effective_unit = str(inline_unit["unit_id"]) if inline_unit else unit_id
-        if not vehicle_type and any(w in clean_q for w in ("小车", "微型", "MINI", "mini", "紧凑")):
+
+        builtin_tag_codes = {c["code"] for c in SPOT_TAG_CATALOG}
+        custom_tags_in_db: List[str] = []
+        for sp_db in self.ctx.db.list_spots():
+            for t_db in sp_db.get("tags") or []:
+                if t_db not in builtin_tag_codes and t_db not in custom_tags_in_db:
+                    custom_tags_in_db.append(t_db)
+        detected_tag = resolve_tag_filter_code(tag_filter) or (
+            match_spot_tag_from_text(clean_q, custom_tags_in_db) or ""
+        )
+
+        if not vehicle_type and detected_tag == "ev_charging":
+            vehicle_type = "ev"
+        elif not vehicle_type and any(w in clean_q for w in ("小车", "微型", "MINI", "mini", "紧凑")):
             vehicle_type = "compact"
         elif not vehicle_type and any(w in clean_q for w in ("商务车", "SUV", "suv", "MPV", "大车")):
             vehicle_type = "suv"
 
         # 2) Fast-path: pure wake words ("", "回家", "车位", "找车位") -> <20ms deterministic brief
-        if normalized_wake in WAKE_BRIEF_WORDS:
+        if normalized_wake in WAKE_BRIEF_WORDS and not detected_tag:
             brief = self.build_voice_brief(
                 unit_id=effective_unit,
                 repeat=repeat,
@@ -2134,7 +2236,7 @@ class VoiceGatewayService:
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
             }
 
-        # Always compute deterministic baseline first (serves as live context + zero-fail fallback)
+        # Always compute deterministic baseline first (honoring `detected_tag` so even zero-LLM mode answers tag queries accurately!)
         brief = self.build_voice_brief(
             unit_id=effective_unit,
             repeat=repeat if repeat is not None else 1,
@@ -2142,8 +2244,36 @@ class VoiceGatewayService:
             channel=channel,
             external_uid=external_uid,
             voice_lang=voice_lang,
+            tag_filter=detected_tag or None,
         )
         eff_lang = str(brief.get("voice_lang") or "zh-CN")
+
+        # Handle general "特色/标签车位空余汇总" question deterministically when user asks about all tags
+        asking_all_tags_summary = (
+            not detected_tag
+            and any(kw in clean_q for kw in ("标签车位", "特色车位", "带标签", "哪些标签", "分类空位"))
+        )
+        active_tag_rows = [
+            ta for ta in (brief.get("tag_availability") or []) if int(ta.get("total_spots") or 0) > 0
+        ]
+        if asking_all_tags_summary:
+            if active_tag_rows:
+                seg_txts = [
+                    f"{ta['label']}净余 {ta['effective_free']}/{ta['total_spots']} 位"
+                    for ta in active_tag_rows
+                ]
+                sum_ans = f"当前小区特色标签车位空余情况：{'；'.join(seg_txts)}。全区总计净余 {brief['total_effective_free']} 位。"
+            else:
+                sum_ans = f"当前小区暂未标记特色标签车位，全区普通车位净余 {brief['total_effective_free']} 位。"
+            rep_s = int(repeat) if repeat is not None else 1
+            return {
+                **brief,
+                "engine": "tag_summary_fast",
+                "question": clean_q,
+                "answer": sum_ans,
+                "speech_text": self.format_repeated_speech(sum_ans, rep_s, voice_lang=eff_lang),
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            }
 
         if not vg_cfg.get("llm_qa_enabled", True):
             return {
@@ -2154,15 +2284,20 @@ class VoiceGatewayService:
             }
 
         # Zero-false-positive pre-shield only for unmistakable prompt-injection / code-generation abuse;
-        # everyday conversational parking/route questions always flow smoothly to the custom LLM.
+        # everyday conversational parking/route/EV/rental/tag questions always flow smoothly.
         q_low = clean_q.lower()
         has_parking_intent = bool(
             inline_unit
+            or detected_tag
             or any(
                 kw in clean_q
-                for kw in ("车位", "停车", "空位", "停哪", "号楼", "单元", "大门", "怎么走", "倒车", "SUV", "小车", "电瓶", "挪车")
+                for kw in (
+                    "车位", "停车", "空位", "停哪", "号楼", "单元", "大门", "怎么走", "倒车",
+                    "SUV", "小车", "电瓶", "挪车", "新能源", "充电", "电桩", "电车", "绿牌",
+                    "招租", "出租", "包月", "月租", "共享", "宽体", "无障碍", "轮椅", "访客", "产权", "标签",
+                )
             )
-            or any(kw in q_low for kw in ("park", "spot", "stall", "unit", "building", "gate"))
+            or any(kw in q_low for kw in ("park", "spot", "stall", "unit", "building", "gate", "ev", "charg", "rent"))
         )
         is_blatant_abuse = any(
             sig in q_low
@@ -2253,18 +2388,48 @@ class VoiceGatewayService:
             "zh-SN": "请全程使用亲切自然的陕西关中方言口语作答。",
             "zh-TW": "請全程使用溫柔親切的繁體國語口語作答。",
         }.get(eff_lang, "请全程使用自然亲切的标准普通话口语作答。")
+        tag_ctx_lines: List[str] = []
+        for ta in active_tag_rows:
+            z_parts: List[str] = []
+            for tz in (ta.get("zones") or [])[:3]:
+                sm = tz.get("sample_meta") or {}
+                meta_bits = [
+                    sm.get("charger_power", ""),
+                    sm.get("rental_window", ""),
+                    sm.get("rental_price", ""),
+                    f"联系:{sm['rental_contact']}" if sm.get("rental_contact") else "",
+                ]
+                meta_str = f"({' / '.join(b for b in meta_bits if b)})" if any(meta_bits) else ""
+                z_parts.append(
+                    f"{tz['zone_name']}余{tz['effective_free']}/{tz['total_spots']}位(步{tz['walk_meters']}m){meta_str}"
+                )
+            tag_ctx_lines.append(
+                f"- [{ta['label']}({ta['short_badge']})]：全区净余 {ta['effective_free']}/{ta['total_spots']} 位"
+                + (f" -> {'；'.join(z_parts)}" if z_parts else "")
+            )
+        if not tag_ctx_lines:
+            tag_ctx_lines.append("- 当前暂未单独标记新能源充电或对外招租等特色标签车位。")
+
         sys_prompt = (
             f"你是「{comm_name}」车载免手语音寻位助手，正在为开车的业主提供自然亲切的实时停车引导。\n"
             "【回答铁律】\n"
             f"1. {lang_persona_rule}适合车载语音直接朗读（控制在 2~3 句话、90 字以内，不要使用 Markdown 星号、列表符号或代码块）。\n"
-            "2. 严禁播报任何具体车位编号或字母数字代码（例如绝对不要说 10LH2-02、5BV7-01、02号车位、Spot 02 等），开车时听编号费劲且无意义；只需要清楚告诉车主：目前剩余几个车位、优先推荐停在哪个停车带（剩余几个停车位、步行到单元门约多少米），如有备选停车带再补充备选哪里、剩余几个即可。\n"
+            "2. 严禁播报任何具体车位编号或字母数字代码（例如绝对不要说 10LH2-02、5BV7-01、02号车位、Spot 02 等），开车时听编号费劲且无意义；只需要清楚告诉车主：目前剩余几个车位（若询问新能源充电、对外招租、宽体、无障碍等标签车位，务必明确播报该标签车位共几个、当前净余几个、推荐哪个停车带、步行约多少米，以及公开的充电功率或招租时段/月租说明）。\n"
             "3. 严格依据下方实时车位数据作答，宁少勿多，绝不编造空车位。\n"
-            "4. 若用户提问与本场所停车、车位、楼栋步行路线无关，请礼貌用一句话说明你仅提供实时寻位服务，并顺带播报当前总剩余车位数。\n\n"
+            "4. 若用户提问与本场所停车、车位、充电、招租、楼栋步行路线无关，请礼貌用一句话说明你仅提供实时寻位服务，并顺带播报当前总剩余车位数。\n\n"
             f"【实时态势数据】\n"
             f"- 车主目标目的地：{brief['unit_name']}\n"
-            f"- 全区实时统计：共 {brief['total_spots']} 个监测车位，当前剩余可停 {brief['total_effective_free']} 个\n"
-            f"- 系统推荐参考：{brief['single_text']}\n"
-            "- 可选停车带实时余位：\n" + "\n".join(zone_lines)
+            + (
+                f"- 车主当前指定查询标签：{brief['tag_label']}（净余 {brief['tag_effective_free']}/{brief['tag_total_spots']} 位）\n"
+                if detected_tag
+                else ""
+            )
+            + f"- 全区实时统计：共 {brief['total_spots']} 个监测车位，当前剩余可停 {brief['total_effective_free']} 个\n"
+            + f"- 系统推荐参考：{brief['single_text']}\n"
+            + "- 带标签特色车位实时空余明细：\n"
+            + "\n".join(tag_ctx_lines)
+            + "\n- 可选停车带实时余位：\n"
+            + "\n".join(zone_lines)
         )
 
         llm_ans, llm_err = self._call_custom_llm_text(
@@ -5506,6 +5671,13 @@ def make_voice_http_handler(root_ctx: Any):
                     geo_hint = self._geo_region_hint(qs, vg)
                     vg_cfg_st = config_manager.get().get("voice_gateway", {})
                     voice_langs = get_active_voice_languages(vg_cfg_st.get("enabled_voice_langs"), geo_hint)
+                    st_zones = ctx.recommender.get_zone_summaries()
+                    def_uid_st = metrics.get("default_unit_id", "8-1")
+                    tag_avail_st = ctx.recommender.build_tag_availability(
+                        zone_summaries=st_zones,
+                        units=units,
+                        selected_unit_id=def_uid_st,
+                    )
                     self._send_json(
                         {
                             "ok": True,
@@ -5516,6 +5688,8 @@ def make_voice_http_handler(root_ctx: Any):
                             "default_voice_lang": metrics.get("default_voice_lang", "zh-CN"),
                             "geo_region": geo_hint,
                             "voice_languages": voice_langs,
+                            "spot_tag_catalog": SPOT_TAG_CATALOG,
+                            "tag_availability": tag_avail_st,
                             "units": units,
                             "auth_required": bool(metrics.get("token_required")),
                             "authorized": bool(is_auth),
@@ -5552,6 +5726,7 @@ def make_voice_http_handler(root_ctx: Any):
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else None
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
                     vlang = (qs.get("lang") or qs.get("voice_lang") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     fmt = (qs.get("format") or ["json"])[0].lower()
                     d_ready = ((qs.get("dialect_ready") or ["0"])[0]).lower() in ("1", "true", "yes")
@@ -5572,6 +5747,7 @@ def make_voice_http_handler(root_ctx: Any):
                         channel="siri",
                         external_uid=uid,
                         voice_lang=eff_req_lang,
+                        tag_filter=tag_flt,
                     )
                     if fmt not in ("card", "display", "text", "txt", "plain", "speech"):
                         vg.prewarm_tts_async(res.get("unit_id"), res.get("voice_lang"), vtype or "sedan")
@@ -5589,6 +5765,7 @@ def make_voice_http_handler(root_ctx: Any):
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else 1
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
                     vlang = (qs.get("lang") or qs.get("voice_lang") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     direct_text = (qs.get("text") or [""])[0].strip()
 
@@ -5608,6 +5785,7 @@ def make_voice_http_handler(root_ctx: Any):
                             channel="siri",
                             external_uid=uid,
                             voice_lang=eff_t_lang,
+                            tag_filter=tag_flt,
                         )
                         tts_text = str(br_tts["speech_text"] if rep > 1 else br_tts["single_text"])
 
@@ -5625,6 +5803,7 @@ def make_voice_http_handler(root_ctx: Any):
                     rep = int(rep_raw) if rep_raw.strip().isdigit() else None
                     vtype = (qs.get("vehicle_type") or qs.get("vehicle") or [""])[0] or None
                     vlang = (qs.get("lang") or qs.get("voice_lang") or [""])[0] or None
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
                     uid = (qs.get("user") or qs.get("uid") or [""])[0].strip() or f"ip:{self._client_ip()}"
                     fmt = (qs.get("format") or ["json"])[0].lower()
                     d_ready = ((qs.get("dialect_ready") or ["0"])[0]).lower() in ("1", "true", "yes")
@@ -5644,6 +5823,7 @@ def make_voice_http_handler(root_ctx: Any):
                         external_uid=uid,
                         client_ip=self._client_ip(),
                         voice_lang=eff_ask_lang,
+                        tag_filter=tag_flt,
                     )
                     if fmt in ("text", "txt", "plain", "speech"):
                         self._send_text(res["speech_text"])
@@ -5656,7 +5836,12 @@ def make_voice_http_handler(root_ctx: Any):
 
                     unit_id = (qs.get("unit") or qs.get("unit_id") or [""])[0] or None
                     vtype = vg._normalize_vehicle_type((qs.get("vehicle_type") or qs.get("vehicle") or ["sedan"])[0])
-                    self._send_json(_build_mobile_overview_payload(ctx, unit_id=unit_id, vehicle_type=vtype))
+                    tag_flt = (qs.get("tag") or qs.get("tag_filter") or [""])[0] or None
+                    self._send_json(
+                        _build_mobile_overview_payload(
+                            ctx, unit_id=unit_id, vehicle_type=vtype, tag_filter=tag_flt
+                        )
+                    )
                     return
 
                 if path == "/api/voice/map-backdrop":
@@ -6015,6 +6200,11 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                     rep = int(rep_val) if rep_val is not None and str(rep_val).isdigit() else None
                     vtype = str(body.get("vehicle_type") or "") or None
                     vlang = str(body.get("voice_lang") or body.get("lang") or (qs.get("lang") or [""])[0]) or None
+                    tag_flt = str(
+                        body.get("tag_filter")
+                        or body.get("tag")
+                        or (qs.get("tag") or qs.get("tag_filter") or [""])[0]
+                    ) or None
                     uid = str(body.get("user") or body.get("uid") or "")
                     ch = str(body.get("channel") or "siri")
                     fmt = str(body.get("format") or (qs.get("format") or ["json"])[0]).lower()
@@ -6028,6 +6218,7 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                         external_uid=uid,
                         client_ip=self._client_ip(),
                         voice_lang=vlang,
+                        tag_filter=tag_flt,
                     )
                     if fmt in ("text", "txt", "plain", "speech"):
                         self._send_text(res["speech_text"])

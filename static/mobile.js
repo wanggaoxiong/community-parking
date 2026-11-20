@@ -35,6 +35,7 @@
     overview: null,
     unitId: "",
     vehicleType: "sedan", // "sedan" | "ev"
+    tagFilter: "",
     repeatCount: 2, // 1 | 2
     continuousBroadcast: true,
     sessionMutedByQuery: false,
@@ -83,6 +84,7 @@
     voiceSelect: document.getElementById("mobileVoiceSelect"),
     btnContinuousToggle: document.getElementById("btnContinuousToggle"),
     continuousLabel: document.getElementById("continuousLabel"),
+    tagFilterBar: document.getElementById("mobileTagFilterBar"),
     guidanceCard: document.getElementById("guidanceCard"),
     recBadgeTag: document.getElementById("recBadgeTag"),
     recZoneName: document.getElementById("recZoneName"),
@@ -165,6 +167,8 @@
       const qVeh = (urlParams.get("vehicle_type") || urlParams.get("vehicle") || "").trim();
       const savedVeh = (localStorage.getItem(STORAGE_KEYS.vehicleType) || "").trim();
       state.vehicleType = (qVeh || savedVeh) === "ev" ? "ev" : "sedan";
+      const qTag = (urlParams.get("tag") || urlParams.get("tag_filter") || "").trim();
+      if (qTag) state.tagFilter = qTag;
 
       const savedRepeat = localStorage.getItem(STORAGE_KEYS.repeatCount);
       const savedCont = localStorage.getItem(STORAGE_KEYS.continuous);
@@ -1123,6 +1127,11 @@
       const isPrivSpot = Boolean(sp.is_private_reserved || spTags.includes("private"));
       const isAccSpot = spTags.includes("accessible");
       const isWideSpot = spTags.includes("large_friendly");
+      const activeTag = state.tagFilter || "";
+      const tagMatched =
+        !activeTag ||
+        spTags.includes(activeTag) ||
+        (activeTag === "ev_charging" && isEvSpot);
 
       const pendTxt = sp.pending_status ? " · 双帧防抖确认中" : "";
       const hintTxt = sp.action_hint ? ` · ${sp.action_hint}` : "";
@@ -1143,10 +1152,11 @@
         : "rgba(15, 23, 42, 0.36)";
       const outerStrokeW = isUnassigned ? 0.26 : isEvSpot ? 0.28 : 0.2;
       const outerDash = isUnassigned ? 'stroke-dasharray="0.65,0.4"' : "";
+      const dimAttr = !tagMatched ? 'opacity="0.24"' : "";
 
       html += `<g transform="translate(${sx.toFixed(2)} ${sy.toFixed(
         2
-      )}) rotate(${angle.toFixed(1)})" data-spot-id="${escapeHtml(
+      )}) rotate(${angle.toFixed(1)})" ${dimAttr} data-spot-id="${escapeHtml(
         sp.spot_id || ""
       )}" data-spot-toast="${escapeHtml(spotToast)}">`;
 
@@ -1691,14 +1701,55 @@
     }
   }
 
+  function renderMobileTagFilterBar(ov) {
+    if (!els.tagFilterBar) return;
+    const tagList = Array.isArray(ov && ov.tag_availability) ? ov.tag_availability : [];
+    const activeItems = tagList.filter(
+      (t) => Number(t.total_spots || 0) > 0 || (state.tagFilter && t.code === state.tagFilter)
+    );
+    if (!activeItems.length && !state.tagFilter) {
+      els.tagFilterBar.hidden = true;
+      els.tagFilterBar.innerHTML = "";
+      return;
+    }
+    const iconMap = {
+      ev_charging: "⚡",
+      rentable: "🤝",
+      private: "🔒",
+      large_friendly: "🚙",
+      accessible: "♿",
+      visitor: "访",
+    };
+    const totFree = Number(ov.total_effective_free || 0);
+    let html = `<button type="button" class="m-tag-chip ${!state.tagFilter ? "is-active" : ""} ${totFree > 0 ? "has-free" : ""}" data-tag="">
+      <span>全部</span><em>余${totFree}</em>
+    </button>`;
+    activeItems.forEach((it) => {
+      const code = String(it.code || "");
+      const ic = iconMap[code] || it.short_badge || "#";
+      const freeN = Number(it.effective_free || 0);
+      const totN = Number(it.total_spots || 0);
+      const isOn = state.tagFilter === code;
+      html += `<button type="button" class="m-tag-chip ${isOn ? "is-active" : ""} ${freeN > 0 ? "has-free" : ""}" data-tag="${escapeHtml(code)}">
+        <span>${escapeHtml(ic)} ${escapeHtml(it.label || code)}</span>
+        <em>余${freeN}/${totN}</em>
+      </button>`;
+    });
+    els.tagFilterBar.innerHTML = html;
+    els.tagFilterBar.hidden = false;
+  }
+
   function renderGuidanceStrip(ov) {
     const rec = ov && ov.recommendation;
     if (!rec) return;
+    const tagLbl = String(rec.tag_label || "").trim();
 
     if (!rec.has_recommendation || !rec.primary) {
       els.guidanceCard.classList.add("is-full");
-      els.recBadgeTag.textContent = "车位暂满";
-      els.recZoneName.textContent = "小区地面公益车位暂满";
+      els.recBadgeTag.textContent = tagLbl ? `${tagLbl}暂满` : "车位暂满";
+      els.recZoneName.textContent = tagLbl
+        ? `当前「${tagLbl}」净余 0/${rec.tag_total_spots || 0} 位`
+        : "小区地面公益车位暂满";
       els.recFreePill.textContent = "净余 0";
       els.recFreePill.hidden = true;
 
@@ -1728,7 +1779,7 @@
         : primary.walk_distance_m;
     const walkM = walkVal != null ? `${walkVal}m` : "--m";
 
-    els.recBadgeTag.textContent = "首选推荐";
+    els.recBadgeTag.textContent = tagLbl ? tagLbl : "首选推荐";
     els.recZoneName.textContent =
       primary.broadcast_zone_name || primary.zone_name || primary.zone_id;
     els.recFreePill.hidden = false;
@@ -1764,6 +1815,9 @@
       if (state.unitId) ovParams.set("unit_id", state.unitId);
       if (state.vehicleType && state.vehicleType !== "sedan") {
         ovParams.set("vehicle_type", state.vehicleType);
+      }
+      if (state.tagFilter) {
+        ovParams.set("tag", state.tagFilter);
       }
       const baseOv = ovParams.toString()
         ? `/api/mobile/overview?${ovParams.toString()}`
@@ -1858,6 +1912,7 @@
         ensureBackdropLoaded();
       }
 
+      renderMobileTagFilterBar(data);
       renderGuidanceStrip(data);
       renderFloorPlanSvg();
 
@@ -2172,7 +2227,24 @@
     if (els.btnEvModeToggle) {
       els.btnEvModeToggle.addEventListener("click", () => {
         state.userInteracted = true;
-        state.vehicleType = state.vehicleType === "ev" ? "sedan" : "ev";
+        const turningOn = state.vehicleType !== "ev";
+        state.vehicleType = turningOn ? "ev" : "sedan";
+        if (turningOn) state.tagFilter = "ev_charging";
+        else if (state.tagFilter === "ev_charging") state.tagFilter = "";
+        persistSettings();
+        fetchOverview({ forceSpeak: state.continuousBroadcast });
+      });
+    }
+
+    if (els.tagFilterBar) {
+      els.tagFilterBar.addEventListener("click", (ev) => {
+        const chip = ev.target.closest(".m-tag-chip");
+        if (!chip) return;
+        state.userInteracted = true;
+        const nextTag = chip.getAttribute("data-tag") || "";
+        state.tagFilter = state.tagFilter === nextTag && nextTag ? "" : nextTag;
+        if (state.tagFilter === "ev_charging") state.vehicleType = "ev";
+        else if (!state.tagFilter && state.vehicleType === "ev") state.vehicleType = "sedan";
         persistSettings();
         fetchOverview({ forceSpeak: state.continuousBroadcast });
       });

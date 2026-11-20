@@ -162,6 +162,23 @@
 
               <div class="drv-ios-row">
                 <div class="drv-row-meta">
+                  <label for="drvTagFilterSelect">标签寻位</label>
+                  <span class="drv-row-sub">按新能源/招租/宽体筛选空位</span>
+                </div>
+                <div class="drv-row-ctrl">
+                  <select id="drvTagFilterSelect" class="drv-clean-select">
+                    <option value="">✨ 不限标签（全部公共车位）</option>
+                    <option value="ev_charging">⚡ 新能源充电位</option>
+                    <option value="rentable">🤝 对外招租/共享位</option>
+                    <option value="large_friendly">🚙 宽体大车位</option>
+                    <option value="accessible">♿ 无障碍车位</option>
+                    <option value="visitor">访 访客临停位</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="drv-ios-row">
+                <div class="drv-row-meta">
                   <span class="drv-row-title-text">语音播报</span>
                   <select
                     id="adminVoiceSelect"
@@ -326,7 +343,12 @@
                 🚙 宽体位 <em id="tagCountWide">0</em>
               </button>
             </div>
-            <span class="tag-filter-hint" id="spotTagQuickHint">轻触平面图车位即可打标/设招租 · Shift 多选批量改标</span>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <button type="button" id="btnRecommendActiveTag" class="btn-apple btn-apple-tinted btn-apple-xs hidden" title="按当前筛选标签立即寻位并播报最近空余车位">
+                🔊 播报此标签最近空位
+              </button>
+              <span class="tag-filter-hint" id="spotTagQuickHint">轻触平面图车位即可打标/设招租 · Shift 多选批量改标</span>
+            </div>
           </div>
 
           <!-- Unbound Calibrated Camera Quick-Bind Prompt (prevents phantom stalls & links camera to drawn group) -->

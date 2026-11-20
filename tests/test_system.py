@@ -7468,6 +7468,212 @@ class CommunityParkingSystemTests(unittest.TestCase):
                 s.shutdown()
                 s.server_close()
 
+    def test_ev_ground_stencil_immunity_and_3port_tag_availability_voice_search(self) -> None:
+        """
+        Verify:
+        1) Empty EV stall with central green car-with-plug ground stencil + green border stripes + rear white
+           charging pedestal inside upper 3D prism classifies FREE (never false OCCUPIED) in BOTH calibration & snapshot,
+           while automatically tagging `ev_charging`.
+        2) Tag availability & tag-filtered search across :8790, :18790, and :18791 (including spoken/typed
+           natural voice queries for EV, rentable, custom tags, and multi-dialect tag broadcasts).
+        """
+        from unittest.mock import patch
+        from app.server import create_http_server, create_mobile_http_server
+
+        ctx = ParkingAppContext(database=self.db)
+        adm_srv = create_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        mob_srv = create_mobile_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        voice_srv = create_voice_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        a_port = adm_srv.server_address[1]
+        m_port = mob_srv.server_address[1]
+        v_port = voice_srv.server_address[1]
+        for s in (adm_srv, mob_srv, voice_srv):
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+
+        try:
+            config_manager.update({"vlm": {"mode": "local_only"}})
+            cam_stencil = "CAM_EV_STENCIL_ROW"
+            self.db.upsert_camera(
+                camera_id=cam_stencil,
+                name="充电桩图标俯拍机位",
+                zone_id="Z_BLDG3_EAST",
+                image_width=900,
+                image_height=640,
+            )
+
+            # Synthesize a realistic top-down scene matching the user's 7-stall EV stencil test photo:
+            # - Stall 01 [80..320, 190..500]: Real blue sedan with dark windshield & chassis shadow -> OCCUPIED
+            # - Stall 02 [340..580, 190..500]: Empty grey asphalt + rear white EV charger pedestal (y=130..205)
+            #   + bilateral green EV lines + central green circle & car-with-plug stencil icon -> FREE + ev_charging!
+            # - Stall 03 [600..840, 190..500]: Plain empty grey asphalt stall -> FREE (non-EV)
+            scene = np.full((640, 900, 3), (96, 98, 100), dtype=np.uint8)
+            # Concrete rear wall & greenery behind the stalls (enters upper 3D vehicle prism!)
+            cv2.rectangle(scene, (20, 70), (880, 155), (175, 178, 182), -1)
+            cv2.rectangle(scene, (20, 155), (880, 188), (48, 86, 52), -1)
+
+            for bx0, bx1, num_lbl in ((80, 320, "1"), (340, 580, "2"), (600, 840, "3")):
+                cv2.rectangle(scene, (bx0, 190), (bx1, 500), (232, 234, 236), 5)
+                # Rear black-yellow wheel-stops
+                for wx in (bx0 + 42, bx1 - 88):
+                    cv2.rectangle(scene, (wx, 222), (wx + 46, 232), (32, 34, 36), -1)
+                    cv2.rectangle(scene, (wx + 6, 224), (wx + 40, 230), (35, 195, 235), -1)
+                cv2.putText(scene, num_lbl, (int((bx0 + bx1) / 2 - 8), 482), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 232, 235), 2)
+
+            # Stall 01: Parked blue car (`OCCUPIED`)
+            cv2.rectangle(scene, (108, 240), (292, 462), (178, 76, 32), -1)
+            cv2.rectangle(scene, (122, 295), (278, 355), (36, 40, 46), -1)  # dark windshield
+            cv2.rectangle(scene, (112, 456), (288, 474), (22, 24, 26), -1)  # dark chassis shadow
+
+            # Stall 02: Rear white EV charger pedestal + black coiled cable + green stripes + central green EV car icon (`FREE` + `is_ev`)
+            cv2.rectangle(scene, (436, 138), (476, 206), (236, 238, 240), -1)  # white charger box
+            cv2.rectangle(scene, (444, 150), (468, 184), (40, 46, 44), -1)  # charger screen
+            cv2.circle(scene, (488, 178), 16, (28, 30, 32), 4)  # black charging cable
+            grn_paint = (108, 186, 118)  # HSV H~63, S~107, V~186 (matches real EV stencil green)
+            cv2.rectangle(scene, (352, 222), (362, 486), grn_paint, -1)  # left green stripe
+            cv2.rectangle(scene, (558, 222), (568, 486), grn_paint, -1)  # right green stripe
+            cv2.circle(scene, (460, 350), 66, grn_paint, 4)  # central green stencil ring
+            cv2.rectangle(scene, (426, 338), (486, 368), grn_paint, -1)  # stencil car body
+            cv2.rectangle(scene, (436, 322), (476, 340), grn_paint, 3)  # stencil car roof
+            cv2.line(scene, (486, 360), (506, 344), grn_paint, 3)  # stencil plug cord
+
+            ok_sc, sc_buf = cv2.imencode(".jpg", scene)
+            self.assertTrue(ok_sc)
+
+            row_polys = [
+                {"label": "01", "spot_type": "standard", "polygon": [[80.0, 190.0], [320.0, 190.0], [320.0, 500.0], [80.0, 500.0]]},
+                {"label": "02", "spot_type": "standard", "polygon": [[340.0, 190.0], [580.0, 190.0], [580.0, 500.0], [340.0, 500.0]]},
+                {"label": "03", "spot_type": "standard", "polygon": [[600.0, 190.0], [840.0, 190.0], [840.0, 500.0], [600.0, 500.0]]},
+            ]
+            with patch.object(ctx.calibrator, "_calibrate_opencv_fallback", return_value=(row_polys, "3车位含充电图标")):
+                cal_res = ctx.calibrator.auto_calibrate_from_bytes(
+                    camera_id=cam_stencil,
+                    raw_image_bytes=sc_buf.tobytes(),
+                    zone_id="Z_BLDG3_EAST",
+                    auto_save=True,
+                )
+            self.assertEqual([s["status"] for s in cal_res["spots"]], ["OCCUPIED", "FREE", "FREE"])
+            self.assertEqual([s["is_ev"] for s in cal_res["spots"]], [False, True, False])
+            self.assertIn("ev_charging", cal_res["spots"][1]["tags"])
+
+            # Verify live snapshot processing ALSO classifies Stall 02 (EV stencil) as FREE!
+            ctx.vision.clear_frame_cache(cam_stencil)
+            snap_res = ctx.vision.process_snapshot_bytes(cam_stencil, sc_buf.tobytes())
+            rep_by_lbl = {r["label"]: r for r in snap_res["reports"]}
+            self.assertEqual(rep_by_lbl["01"]["observed_status"], "OCCUPIED")
+            self.assertEqual(rep_by_lbl["02"]["observed_status"], "FREE")
+            self.assertTrue(rep_by_lbl["02"]["metrics"]["ground_stencil_filtered"])
+            self.assertEqual(rep_by_lbl["03"]["observed_status"], "FREE")
+
+            # Tag Stall 03 as `rentable` + custom `"子母位"` so we can verify 3-port tag search & voice Q&A
+            sp3_id = cal_res["spots"][2]["spot_id"]
+            self.db.update_spots_tags(
+                [sp3_id],
+                tags=["rentable", "子母位"],
+                tag_meta={
+                    "rental_window": "工作日 09:00-18:00",
+                    "rental_price": "¥150/月",
+                    "rental_contact": "物业管家 13800138000",
+                },
+            )
+
+            # 2A) `:8790` Overview `tag_availability` + `POST /api/recommend` with `tag_filter`
+            with urllib.request.urlopen(
+                urllib.request.Request(f"http://127.0.0.1:{a_port}/api/overview", headers={"X-Parking-Client": "test"}),
+                timeout=5,
+            ) as r_ov8790:
+                ov8790 = json.loads(r_ov8790.read().decode("utf-8"))
+            ta_map = {t["code"]: t for t in ov8790["tag_availability"]}
+            self.assertGreaterEqual(ta_map["ev_charging"]["effective_free"], 1)
+            self.assertGreaterEqual(ta_map["rentable"]["effective_free"], 1)
+            self.assertGreaterEqual(ta_map["子母位"]["effective_free"], 1)
+
+            req_rec_rent = urllib.request.Request(
+                f"http://127.0.0.1:{a_port}/api/recommend",
+                data=json.dumps({"unit_id": "8-1", "tag_filter": "rentable", "acquire_lock": False}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_rec_rent, timeout=5) as r_rr:
+                rec_rent = json.loads(r_rr.read().decode("utf-8"))
+            self.assertTrue(rec_rent["has_recommendation"])
+            self.assertEqual(rec_rent["tag_filter"], "rentable")
+            self.assertEqual(rec_rent["primary"]["zone_id"], "Z_BLDG3_EAST")
+            self.assertIn("对外招租", rec_rent["voice_text"])
+            self.assertIn("¥150/月", rec_rent["voice_text"])
+
+            # 2B) `:18790` Mobile Viewer `/api/mobile/overview?tag=ev_charging`
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{m_port}/api/mobile/overview?unit_id=8-1&tag=ev_charging", timeout=5
+            ) as r_mob:
+                mob_ev = json.loads(r_mob.read().decode("utf-8"))
+            self.assertEqual(mob_ev["tag_filter"], "ev_charging")
+            self.assertEqual(mob_ev["recommendation"]["primary"]["zone_id"], "Z_BLDG3_EAST")
+            self.assertIn("新能源充电", mob_ev["recommendation"]["voice_text"])
+
+            # 2C) `:18791` Voice Gateway natural spoken queries (`POST /api/voice/ask`) & dialect tag brief
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/brief?unit=8-1&tag=ev_charging&lang=zh-NE", timeout=5
+            ) as r_vb_ne:
+                vb_ne = json.loads(r_vb_ne.read().decode("utf-8"))
+            self.assertEqual(vb_ne["tag_filter"], "ev_charging")
+            self.assertIn("妥妥滴", vb_ne["single_text"])
+            self.assertIn("新能源充电", vb_ne["single_text"])
+
+            # Deterministic (`llm_qa_enabled=False`) voice recognition of EV, Rental, Custom Tag, and All-Tags Summary!
+            config_manager.update({"voice_gateway": {"llm_qa_enabled": False}})
+            for spoken_q, exp_tag, exp_substr in (
+                ("现在新能源充电车位还有空位吗？", "ev_charging", "新能源充电"),
+                ("小区有没有对外招租的共享车位？", "rentable", "¥150/月"),
+                ("请问子母位现在还有空吗？", "子母位", "子母位"),
+                ("看看带标签车位的空余情况", "", "特色标签车位空余情况"),
+            ):
+                req_va = urllib.request.Request(
+                    f"http://127.0.0.1:{v_port}/api/voice/ask",
+                    data=json.dumps({"question": spoken_q, "unit": "8-1"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_va, timeout=5) as r_va:
+                    va_res = json.loads(r_va.read().decode("utf-8"))
+                self.assertEqual(va_res["tag_filter"], exp_tag)
+                self.assertIn(exp_substr, va_res["answer"])
+
+            # Also verify Custom LLM mode receives full `带标签特色车位实时空余明细` in `system_prompt`!
+            config_manager.update(
+                {
+                    "voice_gateway": {"llm_qa_enabled": True},
+                    "vlm": {
+                        "mode": "hybrid",
+                        "base_url": "https://mock-foundry.openai.azure.com/openai/v1",
+                        "model": "gpt-6.1-sol",
+                        "api_key": "dummy-key",
+                    },
+                }
+            )
+            with patch.object(
+                ctx.voice_gateway,
+                "_call_custom_llm_text",
+                return_value=("3号楼东侧停车带目前还有1个新能源充电空位，走回8号楼约65米。", None),
+            ) as mock_llm_tag:
+                req_llm_ev = urllib.request.Request(
+                    f"http://127.0.0.1:{v_port}/api/voice/ask",
+                    data=json.dumps({"question": "我开绿牌电车回家，哪里有空充电桩？", "unit": "8-1"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_llm_ev, timeout=5) as r_lev:
+                    lev_res = json.loads(r_lev.read().decode("utf-8"))
+                self.assertEqual(lev_res["engine"], "custom_llm")
+                self.assertEqual(lev_res["tag_filter"], "ev_charging")
+                injected_prompt = mock_llm_tag.call_args[1]["system_prompt"]
+                self.assertIn("带标签特色车位实时空余明细", injected_prompt)
+                self.assertIn("新能源充电", injected_prompt)
+                self.assertIn("¥150/月", injected_prompt)
+        finally:
+            for s in (adm_srv, mob_srv, voice_srv):
+                s.shutdown()
+                s.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

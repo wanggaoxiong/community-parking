@@ -98,6 +98,8 @@
     units: [],
     unitId: localStorage.getItem(LS_UNIT) || "",
     vehicle: localStorage.getItem(LS_VEHICLE) || "sedan",
+    tagFilter: "",
+    tagAvailability: [],
     repeat: parseInt(localStorage.getItem(LS_REPEAT) || "2", 10) === 1 ? 1 : 2,
     voiceUri: localStorage.getItem(LS_VOICE_URI) || "",
     shortcutName: localStorage.getItem(LS_SC_NAME) || "",
@@ -1088,6 +1090,17 @@
         effSt === "FREE" &&
         !isUnassigned;
 
+      const spTags = Array.isArray(sp.tags) ? sp.tags : [];
+      const spMeta = sp.tag_meta || {};
+      const isEvSpot = Boolean(sp.is_ev || spTags.includes("ev_charging"));
+      const isRentSpot = Boolean(sp.is_rentable || spTags.includes("rentable"));
+      const isPrivSpot = Boolean(sp.is_private_reserved || spTags.includes("private"));
+      const isAccSpot = spTags.includes("accessible");
+      const isWideSpot = spTags.includes("large_friendly");
+      const activeTag = state.tagFilter || "";
+      const tagMatched =
+        !activeTag || spTags.includes(activeTag) || (activeTag === "ev_charging" && isEvSpot);
+
       const statusCn = isUnassigned
         ? "待接入摄像头"
         : effSt === "FREE"
@@ -1097,15 +1110,18 @@
         : effSt === "BLOCKED"
         ? "占道禁停"
         : "待识别";
-      const spotToast = `${sp.group_name || sp.zone_name || sp.zone_id}：${statusCn}`;
-      const outerStroke = isUnassigned ? "#F59E0B" : "rgba(15, 23, 42, 0.36)";
+      const evToast = isEvSpot ? ` · ⚡新能源${spMeta.charger_power ? `(${spMeta.charger_power})` : ""}` : "";
+      const rentToast = isRentSpot ? ` · 🤝招租${spMeta.rental_price ? `(${spMeta.rental_price})` : ""}` : "";
+      const spotToast = `${sp.group_name || sp.zone_name || sp.zone_id} · ${sp.label || ""}号位：${statusCn}${evToast}${rentToast}`;
+      const outerStroke = isUnassigned ? "#F59E0B" : isEvSpot ? "#059669" : "rgba(15, 23, 42, 0.36)";
       const outerDash = isUnassigned ? 'stroke-dasharray="0.65,0.4"' : "";
+      const dimAttr = !tagMatched ? 'opacity="0.24"' : "";
 
-      html += `<g transform="translate(${sx.toFixed(2)} ${sy.toFixed(2)}) rotate(${angle.toFixed(1)})" data-spot-toast="${escapeSvgHtml(spotToast)}">`;
-      if (isRecZone) {
+      html += `<g transform="translate(${sx.toFixed(2)} ${sy.toFixed(2)}) rotate(${angle.toFixed(1)})" ${dimAttr} data-spot-toast="${escapeSvgHtml(spotToast)}">`;
+      if ((activeTag && tagMatched && effSt === "FREE" && !isUnassigned) || isRecZone) {
         html += `<rect x="${(-w / 2 - 0.45).toFixed(2)}" y="${(-h / 2 - 0.45).toFixed(2)}" width="${(w + 0.9).toFixed(2)}" height="${(h + 0.9).toFixed(2)}" rx="0.65" fill="rgba(40, 205, 65, 0.28)" stroke="#28CD41" stroke-width="0.30"/>`;
       }
-      html += `<rect x="${(-w / 2).toFixed(2)}" y="${(-h / 2).toFixed(2)}" width="${w.toFixed(2)}" height="${h.toFixed(2)}" rx="0.36" fill="${fill}" stroke="${outerStroke}" stroke-width="0.2" ${outerDash}/>
+      html += `<rect x="${(-w / 2).toFixed(2)}" y="${(-h / 2).toFixed(2)}" width="${w.toFixed(2)}" height="${h.toFixed(2)}" rx="0.36" fill="${fill}" stroke="${outerStroke}" stroke-width="${isEvSpot ? "0.28" : "0.2"}" ${outerDash}/>
         <rect x="${(-w / 2 + 0.14).toFixed(2)}" y="${(-h / 2 + 0.14).toFixed(2)}" width="${Math.max(0.2, w - 0.28).toFixed(2)}" height="${Math.max(0.2, h - 0.28).toFixed(2)}" rx="0.26" fill="none" stroke="rgba(255,255,255,0.72)" stroke-width="0.14"/>`;
 
       const minDim = Math.min(w, h);
@@ -1114,6 +1130,33 @@
         const shortLbl = mNum ? mNum[1].padStart(2, "0") : String(idx + 1).padStart(2, "0");
         const fontSz = Math.min(1.18, Math.max(0.82, minDim * 0.56)).toFixed(2);
         html += `<g transform="rotate(${(-angle).toFixed(1)})"><text x="0" y="${(Number(fontSz) * 0.35).toFixed(2)}" font-size="${fontSz}" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeSvgHtml(shortLbl)}</text></g>`;
+      }
+      const badgeR = Math.max(0.56, Math.min(0.82, minDim * 0.38));
+      if (isEvSpot) {
+        const bx = +(w * 0.38).toFixed(2);
+        const by = +(-h * 0.38).toFixed(2);
+        const bs = (badgeR / 0.68).toFixed(2);
+        html += `<g transform="translate(${bx} ${by}) rotate(${(-angle).toFixed(1)}) scale(${bs})" pointer-events="none">
+          <circle cx="0" cy="0" r="0.68" fill="#064E3B" stroke="#FACC15" stroke-width="0.16"/>
+          <polygon points="0.08,-0.44 -0.32,0.05 -0.02,0.05 -0.10,0.44 0.32,-0.05 0.02,-0.05" fill="#FACC15"/>
+        </g>`;
+      }
+      const secBadge = isRentSpot
+        ? { txt: "租", bg: "#0071E3" }
+        : isPrivSpot
+        ? { txt: "专", bg: "#4F46E5" }
+        : isAccSpot
+        ? { txt: "♿", bg: "#7C3AED" }
+        : isWideSpot
+        ? { txt: "宽", bg: "#0284C7" }
+        : null;
+      if (secBadge) {
+        const sbx = +(-w * 0.38).toFixed(2);
+        const sby = +(-h * 0.38).toFixed(2);
+        html += `<g transform="translate(${sbx} ${sby}) rotate(${(-angle).toFixed(1)})" pointer-events="none">
+          <circle cx="0" cy="0" r="${badgeR.toFixed(2)}" fill="${secBadge.bg}" stroke="#FFFFFF" stroke-width="0.15"/>
+          <text x="0" y="${(badgeR * 0.38).toFixed(2)}" font-size="${(badgeR * 1.08).toFixed(2)}" fill="#FFFFFF" font-weight="800" text-anchor="middle">${secBadge.txt}</text>
+        </g>`;
       }
       html += `</g>`;
     });
@@ -1241,15 +1284,58 @@
     svg.innerHTML = html;
   }
 
+  function renderVoiceTagAvailBar(tagAvailList, totalFreeAll) {
+    const bar = el("vgTagAvailBar");
+    if (!bar) return;
+    const activeItems = (Array.isArray(tagAvailList) ? tagAvailList : []).filter(
+      (t) => Number(t.total_spots || 0) > 0 || (state.tagFilter && t.code === state.tagFilter)
+    );
+    if (!activeItems.length && !state.tagFilter) {
+      bar.classList.add("hidden");
+      bar.innerHTML = "";
+      return;
+    }
+    const iconMap = {
+      ev_charging: "⚡",
+      rentable: "🤝",
+      private: "🔒",
+      large_friendly: "🚙",
+      accessible: "♿",
+      visitor: "访",
+    };
+    let html = `<button type="button" class="vg-tag-pill ${!state.tagFilter ? "is-active" : ""} ${Number(totalFreeAll || 0) > 0 ? "has-free" : ""}" data-tag="">
+      <span>全部车位</span>
+      <em>余${Number(totalFreeAll || 0)}</em>
+    </button>`;
+    activeItems.forEach((item) => {
+      const code = String(item.code || "");
+      const ic = iconMap[code] || item.short_badge || "#";
+      const freeN = Number(item.effective_free || 0);
+      const totN = Number(item.total_spots || 0);
+      const isOn = state.tagFilter === code;
+      html += `<button type="button" class="vg-tag-pill ${isOn ? "is-active" : ""} ${freeN > 0 ? "has-free" : ""}" data-tag="${escapeSvgHtml(code)}">
+        <span>${escapeSvgHtml(ic)} ${escapeSvgHtml(item.label || code)}</span>
+        <em>余${freeN}/${totN}</em>
+      </button>`;
+    });
+    bar.innerHTML = html;
+    bar.classList.remove("hidden");
+  }
+
   async function refreshVoiceMap() {
     try {
       const u = applyWsParam(new URL("/api/voice/map-overview", window.location.origin));
       if (state.unitId) u.searchParams.set("unit", state.unitId);
       u.searchParams.set("vehicle", state.vehicle || "sedan");
+      if (state.tagFilter) u.searchParams.set("tag", state.tagFilter);
       const res = await fetch(u.toString(), { headers: authHeaders(), cache: "no-store" });
       if (!res.ok) return;
       const data = await res.json();
       state.mapOverview = data;
+      if (Array.isArray(data.tag_availability)) {
+        state.tagAvailability = data.tag_availability;
+        renderVoiceTagAvailBar(data.tag_availability, data.total_effective_free);
+      }
       const hasBackdrop = Boolean(data.site_map && data.site_map.has_backdrop);
       if (hasBackdrop && !state.mapBackdropTouched) {
         state.mapShowBackdrop = true;
@@ -1852,6 +1938,9 @@
     u.searchParams.set("unit", state.unitId || "8-1");
     u.searchParams.set("repeat", String(state.repeat || 2));
     u.searchParams.set("vehicle", state.vehicle || "sedan");
+    if (state.tagFilter) {
+      u.searchParams.set("tag", state.tagFilter);
+    }
     if (state.voiceLang) {
       u.searchParams.set("lang", state.voiceLang);
     }
@@ -1870,18 +1959,24 @@
       const totFree = Number(data.total_effective_free || 0);
       el("vgFreeNum").textContent = String(totFree);
       el("vgFreeBadge").classList.toggle("is-full", totFree <= 0);
+      if (Array.isArray(data.tag_availability)) {
+        state.tagAvailability = data.tag_availability;
+        renderVoiceTagAvailBar(data.tag_availability, totFree);
+      }
 
       const recTag = el("vgRecTag");
       if (data.primary_zone) {
-        recTag.textContent = "推荐";
+        recTag.textContent = data.tag_label ? `${data.tag_label}` : "推荐";
         recTag.classList.remove("is-empty");
         el("vgBriefSummary").textContent =
           `${data.primary_zone.zone_name}（余 ${data.primary_zone.effective_free} 位）`;
         el("vgBriefWalk").textContent = `🚶 ${Math.round(data.primary_zone.distance_m)}m`;
       } else {
-        recTag.textContent = "已满";
+        recTag.textContent = data.tag_label ? `${data.tag_label}已满` : "已满";
         recTag.classList.add("is-empty");
-        el("vgBriefSummary").textContent = "院内车位已停满，请往周边车场";
+        el("vgBriefSummary").textContent = data.tag_label
+          ? `当前「${data.tag_label}」车位净余 0/${data.tag_total_spots || 0} 位`
+          : "院内车位已停满，请往周边车场";
         el("vgBriefWalk").textContent = data.unit_name || "";
       }
 
@@ -1925,6 +2020,7 @@
           question: q,
           unit_id: state.unitId,
           vehicle_type: state.vehicle,
+          tag_filter: state.tagFilter || undefined,
           voice_lang: state.voiceLang || "zh-CN",
         }),
       });
@@ -2531,9 +2627,34 @@
     el("vgVehicleSelect").addEventListener("change", (e) => {
       state.vehicle = e.target.value;
       localStorage.setItem(LS_VEHICLE, state.vehicle);
+      if (state.vehicle === "ev" && !state.tagFilter) {
+        state.tagFilter = "ev_charging";
+      } else if (state.vehicle !== "ev" && state.tagFilter === "ev_charging") {
+        state.tagFilter = "";
+      }
       syncShortcutBuilderUI();
-      refreshBrief(false);
+      refreshBrief(true);
     });
+
+    const tagBar = el("vgTagAvailBar");
+    if (tagBar) {
+      tagBar.addEventListener("click", (ev) => {
+        const pill = ev.target.closest(".vg-tag-pill");
+        if (!pill) return;
+        const nextTag = pill.getAttribute("data-tag") || "";
+        state.tagFilter = state.tagFilter === nextTag && nextTag ? "" : nextTag;
+        if (state.tagFilter === "ev_charging" && state.vehicle === "sedan") {
+          state.vehicle = "ev";
+          el("vgVehicleSelect").value = "ev";
+          localStorage.setItem(LS_VEHICLE, "ev");
+        } else if (!state.tagFilter && state.vehicle === "ev") {
+          state.vehicle = "sedan";
+          el("vgVehicleSelect").value = "sedan";
+          localStorage.setItem(LS_VEHICLE, "sedan");
+        }
+        refreshBrief(true);
+      });
+    }
 
     const handleWebVoiceLangChange = (requestedLang) => {
       const target = requestedLang || "zh-CN";

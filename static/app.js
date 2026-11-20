@@ -941,9 +941,25 @@ function bindDriverActions() {
     updateSiriHint();
     await refreshOverview();
   });
-  document.getElementById("vehicleTypeSelect").addEventListener("change", () => {
+  document.getElementById("vehicleTypeSelect").addEventListener("change", (e) => {
+    const vt = e.target.value;
+    const tagSel = document.getElementById("drvTagFilterSelect");
+    if (vt === "ev" && tagSel && !tagSel.value) {
+      tagSel.value = "ev_charging";
+      state.siteMap.tagFilter = "ev_charging";
+    } else if (vt !== "ev" && tagSel && tagSel.value === "ev_charging") {
+      tagSel.value = "";
+      state.siteMap.tagFilter = "all";
+    }
     updateSiriHint();
     refreshOverview();
+  });
+  document.getElementById("drvTagFilterSelect")?.addEventListener("change", (e) => {
+    const tv = e.target.value || "";
+    state.siteMap.tagFilter = tv || "all";
+    syncSpotTagFilterCounts(state.overview);
+    updateSiriHint();
+    if (state.overview) renderAbstractSvgMap(state.overview);
   });
   document.getElementById("entryGateSelect")?.addEventListener("change", () => {
     updateSiriHint();
@@ -1000,10 +1016,12 @@ function updateSiriHint() {
   const uid = document.getElementById("unitSelect").value || "3-1";
   const vt = document.getElementById("vehicleTypeSelect").value || "sedan";
   const eg = document.getElementById("entryGateSelect")?.value || "auto";
+  const tf = document.getElementById("drvTagFilterSelect")?.value || "";
   const egParam = eg && eg !== "auto" ? `&entry_gate_id=${encodeURIComponent(eg)}` : "";
+  const tfParam = tf ? `&tag=${encodeURIComponent(tf)}` : "";
   document.getElementById(
     "siriEndpointCode"
-  ).textContent = `GET ${location.origin}/api/recommend/voice?unit_id=${uid}&vehicle_type=${vt}${egParam}`;
+  ).textContent = `GET ${location.origin}/api/recommend/voice?unit_id=${uid}&vehicle_type=${vt}${egParam}${tfParam}`;
   const portalLink = document.getElementById("drvOpenVoicePortalLink");
   if (portalLink) {
     const wsSeg =
@@ -1018,14 +1036,16 @@ async function triggerRecommendation(driverTag) {
   const unit_id = document.getElementById("unitSelect").value;
   const vehicle_type = document.getElementById("vehicleTypeSelect").value;
   const entry_gate_id = document.getElementById("entryGateSelect")?.value || "auto";
+  const tag_filter = document.getElementById("drvTagFilterSelect")?.value || "";
   const res = await api("/api/recommend", {
     method: "POST",
     body: JSON.stringify({
       unit_id,
       vehicle_type,
       entry_gate_id,
+      tag_filter: tag_filter || undefined,
       driver_tag: driverTag,
-      acquire_lock: true,
+      acquire_lock: tag_filter !== "private",
     }),
   });
 
@@ -18108,42 +18128,115 @@ function getAllPlacedOverviewSpots(ovData) {
 }
 
 function syncSpotTagFilterCounts(ovData) {
-  const spots = getAllPlacedOverviewSpots(ovData);
-  let evTotal = 0;
-  let evFree = 0;
-  let rentCnt = 0;
-  let privCnt = 0;
-  let wideCnt = 0;
-
-  spots.forEach((sp) => {
-    const tags = Array.isArray(sp.tags) ? sp.tags : [];
-    const isEv = Boolean(sp.is_ev || tags.includes("ev_charging"));
-    if (isEv) {
-      evTotal += 1;
+  const data = ovData || state.overview;
+  const spots = getAllPlacedOverviewSpots(data);
+  const availByCode = new Map();
+  if (data && Array.isArray(data.tag_availability) && !state.siteMap?.editMode) {
+    data.tag_availability.forEach((it) => {
+      availByCode.set(String(it.code), {
+        label: it.label || it.code,
+        short_badge: it.short_badge || "#",
+        total: Number(it.total_spots || 0),
+        free: Number(it.effective_free || 0),
+        is_custom: Boolean(it.is_custom),
+      });
+    });
+  } else {
+    spots.forEach((sp) => {
+      const tags = Array.isArray(sp.tags) ? [...sp.tags] : [];
+      if (sp.is_ev && !tags.includes("ev_charging")) tags.unshift("ev_charging");
       const effSt = getEffectiveSpotStatusClient(sp);
-      if (effSt === "FREE" && !sp.is_private_reserved && sp.camera_id !== "UNASSIGNED") {
-        evFree += 1;
-      }
-    }
-    if (sp.is_rentable || tags.includes("rentable")) rentCnt += 1;
-    if (tags.includes("private")) privCnt += 1;
-    if (tags.includes("large_friendly")) wideCnt += 1;
-  });
+      const isBound = sp.camera_id && sp.camera_id !== "UNASSIGNED";
+      tags.forEach((code) => {
+        const prev = availByCode.get(code) || {
+          label: code,
+          short_badge: "#",
+          total: 0,
+          free: 0,
+          is_custom: !DEFAULT_SPOT_TAG_CATALOG_CLIENT.some((c) => c.code === code),
+        };
+        prev.total += 1;
+        if (effSt === "FREE" && isBound && (code === "private" || !sp.is_private_reserved)) {
+          prev.free += 1;
+        }
+        availByCode.set(code, prev);
+      });
+    });
+  }
 
-  const setTxt = (id, val) => {
-    const el = document.getElementById(id);
-    if (el) el.textContent = val;
+  const fmtTagStat = (code) => {
+    const rec = availByCode.get(code);
+    if (!rec || rec.total <= 0) return "0";
+    return `余${rec.free}/${rec.total}`;
   };
-  setTxt("tagCountAll", String(spots.length));
-  setTxt("tagCountEv", evTotal > 0 ? `余${evFree}/${evTotal}` : "0");
-  setTxt("tagCountRent", String(rentCnt));
-  setTxt("tagCountPriv", String(privCnt));
-  setTxt("tagCountWide", String(wideCnt));
 
   const activeFilter = state.siteMap?.tagFilter || "all";
-  document.querySelectorAll("#spotTagFilterPills .tag-filter-pill").forEach((btn) => {
-    btn.classList.toggle("is-active", btn.dataset.tagFilter === activeFilter);
-  });
+  const pillsWrap = document.getElementById("spotTagFilterPills");
+  if (pillsWrap) {
+    const totalFreeAll = Number(data?.total_effective_free ?? 0);
+    const fixedDefs = [
+      { code: "all", cls: "", icon: "", label: "全部车位", stat: spots.length ? `余${totalFreeAll}/${spots.length}` : "0" },
+      { code: "ev_charging", cls: "tag-ev", icon: "⚡ ", label: "新能源", stat: fmtTagStat("ev_charging") },
+      { code: "rentable", cls: "tag-rent", icon: "🤝 ", label: "对外招租", stat: fmtTagStat("rentable") },
+      { code: "private", cls: "tag-priv", icon: "🔒 ", label: "产权位", stat: fmtTagStat("private") },
+      { code: "large_friendly", cls: "tag-wide", icon: "🚙 ", label: "宽体位", stat: fmtTagStat("large_friendly") },
+    ];
+    for (const extraCode of ["accessible", "visitor"]) {
+      const recEx = availByCode.get(extraCode);
+      if (recEx && recEx.total > 0) {
+        const ic = extraCode === "accessible" ? "♿ " : "访 ";
+        const lb = extraCode === "accessible" ? "无障碍" : "访客位";
+        fixedDefs.push({ code: extraCode, cls: "", icon: ic, label: lb, stat: fmtTagStat(extraCode) });
+      }
+    }
+    availByCode.forEach((recC, cCode) => {
+      if (recC.is_custom && recC.total > 0) {
+        fixedDefs.push({
+          code: cCode,
+          cls: "",
+          icon: "# ",
+          label: cCode,
+          stat: `余${recC.free}/${recC.total}`,
+        });
+      }
+    });
+    pillsWrap.innerHTML = fixedDefs
+      .map(
+        (d) => `
+        <button type="button" class="tag-filter-pill ${d.cls} ${activeFilter === d.code ? "is-active" : ""}" data-tag-filter="${escapeHtml(d.code)}">
+          ${d.icon}${escapeHtml(d.label)} <em>${escapeHtml(d.stat)}</em>
+        </button>
+      `
+      )
+      .join("");
+  }
+
+  const drvTagSel = document.getElementById("drvTagFilterSelect");
+  if (drvTagSel) {
+    const baseOpts = [
+      ["", "✨ 不限标签（全部公共车位）"],
+      ["ev_charging", `⚡ 新能源充电位 (${fmtTagStat("ev_charging")})`],
+      ["rentable", `🤝 对外招租/共享位 (${fmtTagStat("rentable")})`],
+      ["large_friendly", `🚙 宽体大车位 (${fmtTagStat("large_friendly")})`],
+      ["accessible", `♿ 无障碍车位 (${fmtTagStat("accessible")})`],
+      ["visitor", `访 访客临停位 (${fmtTagStat("visitor")})`],
+      ["private", `🔒 产权固定位 (${fmtTagStat("private")})`],
+    ];
+    availByCode.forEach((recC, cCode) => {
+      if (recC.is_custom && recC.total > 0) {
+        baseOpts.push([cCode, `# ${cCode} (余${recC.free}/${recC.total})`]);
+      }
+    });
+    drvTagSel.innerHTML = baseOpts
+      .map(([v, t]) => `<option value="${escapeHtml(v)}">${escapeHtml(t)}</option>`)
+      .join("");
+    drvTagSel.value = activeFilter === "all" ? "" : activeFilter;
+  }
+
+  const recTagBtn = document.getElementById("btnRecommendActiveTag");
+  if (recTagBtn) {
+    recTagBtn.classList.toggle("hidden", activeFilter === "all");
+  }
 }
 
 function positionSpotTagPopover(clientX, clientY) {
@@ -18400,7 +18493,12 @@ function bindSpotTagPopoverAndFilters() {
     state.siteMap.tagFilter =
       state.siteMap.tagFilter === nextFilter && nextFilter !== "all" ? "all" : nextFilter;
     syncSpotTagFilterCounts(state.overview);
+    updateSiriHint();
     if (state.overview) renderAbstractSvgMap(state.overview);
+  });
+
+  document.getElementById("btnRecommendActiveTag")?.addEventListener("click", () => {
+    triggerRecommendation("标签筛选寻位");
   });
 
   document.getElementById("btnEditSelectedSpotTags")?.addEventListener("click", (ev) => {

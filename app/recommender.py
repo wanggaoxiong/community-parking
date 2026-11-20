@@ -14,7 +14,13 @@ from app.database import (
     extract_building_info,
     natural_unit_sort_key,
 )
-from app.spot_tags import is_spot_privately_reserved
+from app.spot_tags import (
+    SPOT_TAG_CATALOG,
+    get_tag_display_info,
+    is_spot_privately_reserved,
+    resolve_tag_filter_code,
+    sanitize_spot_tag_meta_for_public,
+)
 from app.workspaces import (
     render_workspace_broadcast_text,
     render_workspace_display_card_text,
@@ -859,25 +865,205 @@ class ParkingRecommender:
             key=lambda c: natural_unit_sort_key(c["units"][0]["unit_id"] if c["units"] else f"{c['building_id']}-1")
         )
 
+        tag_availability = self.build_tag_availability(
+            zone_summaries=zone_summaries,
+            units=units_list,
+            selected_unit_id=sel_uid,
+            site_map=smap,
+            road_graph=road_graph,
+            group_lock_counts=group_lock_counts,
+        )
+
         return {
             "selected_unit_id": sel_uid,
             "spot_groups": spot_groups,
             "unbound_cameras": unbound_cameras,
             "building_clusters": building_clusters,
+            "tag_availability": tag_availability,
         }
+
+    def build_tag_availability(
+        self,
+        zone_summaries: List[Dict[str, Any]],
+        units: Optional[List[Dict[str, Any]]] = None,
+        selected_unit_id: Optional[str] = None,
+        site_map: Optional[Dict[str, Any]] = None,
+        road_graph: Optional[Dict[str, Any]] = None,
+        group_lock_counts: Optional[Dict[str, int]] = None,
+        now: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Aggregate live availability (`total_spots`, `effective_free`, per-strip breakdown) for every built-in & custom spot tag."""
+        units_list = units if units is not None else self.db.list_units()
+        units_by_id = {u["unit_id"]: u for u in units_list}
+        sel_uid = (
+            selected_unit_id
+            if (selected_unit_id and selected_unit_id in units_by_id)
+            else (units_list[0]["unit_id"] if units_list else "")
+        )
+        sel_u = units_by_id.get(sel_uid)
+        smap = site_map if site_map is not None else self.db.get_site_map(include_backdrop=False)
+        if road_graph is None:
+            span_m = float(
+                (smap.get("meta") or {}).get("estimated_span_meters")
+                or smap.get("estimated_span_meters")
+                or 185.0
+            )
+            road_graph = build_road_walk_graph(smap, span_m)
+        if group_lock_counts is None:
+            group_lock_counts = {}
+            for lk in self.list_active_locks(now=now):
+                lk_gc = str(lk.get("group_code") or "").strip()
+                if lk_gc:
+                    group_lock_counts[lk_gc] = group_lock_counts.get(lk_gc, 0) + 1
+
+        u_door_x = float(sel_u.get("door_x") if (sel_u and sel_u.get("door_x") is not None) else (sel_u["map_x"] if sel_u else 50.0))
+        u_door_y = float(sel_u.get("door_y") if (sel_u and sel_u.get("door_y") is not None) else (sel_u["map_y"] if sel_u else 50.0))
+
+        builtin_codes = [c["code"] for c in SPOT_TAG_CATALOG]
+        discovered_custom: List[str] = []
+        all_placed: List[Dict[str, Any]] = []
+        zone_center_by_id: Dict[str, Tuple[float, float]] = {}
+        for zs in zone_summaries:
+            zone_center_by_id[zs["zone_id"]] = (
+                float(zs["map_x"]) + float(zs["map_w"]) * 0.5,
+                float(zs["map_y"]) + float(zs["map_h"]) * 0.5,
+            )
+            for sp in zs.get("spots") or []:
+                is_bound_cam = str(sp.get("camera_id") or "UNASSIGNED") != "UNASSIGNED"
+                if not sp.get("map_placed", True) and not is_bound_cam:
+                    continue
+                all_placed.append(sp)
+                for t in sp.get("tags") or []:
+                    if t not in builtin_codes and t not in discovered_custom:
+                        discovered_custom.append(t)
+
+        ordered_codes = builtin_codes + discovered_custom
+        results: List[Dict[str, Any]] = []
+        for code in ordered_codes:
+            info = get_tag_display_info(code)
+            tot_cap = 0
+            raw_free = 0
+            occ_cnt = 0
+            blk_cnt = 0
+            unk_cnt = 0
+            by_strip: Dict[str, Dict[str, Any]] = {}
+
+            for sp in all_placed:
+                sp_tags = sp.get("tags") or []
+                has_t = (code in sp_tags) or (code == "ev_charging" and bool(sp.get("is_ev")))
+                if not has_t:
+                    continue
+                cap = int(sp.get("capacity") or 1)
+                tot_cap += cap
+                is_assigned = str(sp.get("camera_id") or "UNASSIGNED") != "UNASSIGNED"
+                eff_st = sp.get("effective_status") or sp.get("status") or "UNKNOWN"
+                if not is_assigned or eff_st == "UNKNOWN":
+                    unk_cnt += cap
+                    fu = 0
+                elif eff_st == "FREE":
+                    if code == "private":
+                        fu = int(sp.get("visual_free_units") or sp.get("committed_free_units") or 0)
+                    elif sp.get("is_private_reserved"):
+                        fu = 0
+                    else:
+                        fu = int(sp.get("free_units") or 0)
+                    raw_free += fu
+                elif eff_st == "OCCUPIED":
+                    occ_cnt += max(1, int(sp.get("occupied_units") or 1))
+                    fu = 0
+                else:
+                    blk_cnt += 1
+                    fu = 0
+
+                gc = str(sp.get("group_code") or "").strip()
+                s_key = f"{sp['zone_id']}::{gc}"
+                bucket = by_strip.get(s_key)
+                if bucket is None:
+                    z_title = str(sp.get("group_name") or sp.get("zone_name") or gc or sp["zone_id"]).strip()
+                    pub_meta = sanitize_spot_tag_meta_for_public(sp_tags, sp.get("tag_meta"))
+                    bucket = {
+                        "zone_id": sp["zone_id"],
+                        "zone_name": z_title,
+                        "group_code": gc,
+                        "total_spots": 0,
+                        "raw_free": 0,
+                        "pts": [],
+                        "sample_meta": pub_meta,
+                    }
+                    by_strip[s_key] = bucket
+                elif not bucket["sample_meta"]:
+                    bucket["sample_meta"] = sanitize_spot_tag_meta_for_public(sp_tags, sp.get("tag_meta"))
+                bucket["total_spots"] += cap
+                bucket["raw_free"] += fu
+                if sp.get("map_x") is not None and sp.get("map_y") is not None:
+                    bucket["pts"].append((float(sp["map_x"]), float(sp["map_y"])))
+
+            strip_list: List[Dict[str, Any]] = []
+            eff_free_sum = 0
+            for b in by_strip.values():
+                gc = b["group_code"]
+                lk = group_lock_counts.get(gc, 0) if (gc and code != "private") else 0
+                b_eff_free = max(0, b["raw_free"] - lk) if b["raw_free"] > 0 else 0
+                eff_free_sum += b_eff_free
+                walk_m = 99
+                if sel_u:
+                    if b["pts"]:
+                        cx = sum(p[0] for p in b["pts"]) / len(b["pts"])
+                        cy = sum(p[1] for p in b["pts"]) / len(b["pts"])
+                    else:
+                        cx, cy = zone_center_by_id.get(b["zone_id"], (50.0, 50.0))
+                    walk_m = int(
+                        compute_walk_between_map_points(
+                            cx, cy, u_door_x, u_door_y, road_graph=road_graph
+                        )["walk_meters"]
+                    )
+                strip_list.append(
+                    {
+                        "zone_id": b["zone_id"],
+                        "zone_name": b["zone_name"],
+                        "group_code": gc,
+                        "total_spots": b["total_spots"],
+                        "effective_free": b_eff_free,
+                        "walk_meters": walk_m,
+                        "sample_meta": b["sample_meta"],
+                    }
+                )
+            strip_list.sort(key=lambda item: (0 if item["effective_free"] > 0 else 1, item["walk_meters"]))
+            results.append(
+                {
+                    "code": code,
+                    "label": info["label"],
+                    "short_badge": info["short_badge"],
+                    "color": info["color"],
+                    "is_custom": code not in builtin_codes,
+                    "total_spots": tot_cap,
+                    "effective_free": eff_free_sum,
+                    "occupied": occ_cnt,
+                    "blocked": blk_cnt,
+                    "unknown": unk_cnt,
+                    "zones": strip_list,
+                }
+            )
+        return results
 
     def recommend(
         self,
         unit_id: str,
-        vehicle_type: str = "sedan",  # sedan | suv
+        vehicle_type: str = "sedan",  # sedan | suv | compact | ev
         driver_tag: str = "业主车辆",
         acquire_lock: bool = True,
         entry_gate_id: Optional[str] = None,
+        tag_filter: Optional[str] = None,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
         ts = now if now is not None else time.time()
         cfg = config_manager.get()
         ttl = float(cfg.get("soft_lock_ttl_seconds", 40))
+
+        norm_tag = resolve_tag_filter_code(tag_filter)
+        tag_info = get_tag_display_info(norm_tag) if norm_tag else None
+        if norm_tag == "ev_charging" and vehicle_type == "sedan":
+            vehicle_type = "ev"
 
         units = {u["unit_id"]: u for u in self.db.list_units()}
         unit_info = units.get(unit_id) or next(iter(units.values()))
@@ -893,6 +1079,27 @@ class ParkingRecommender:
         road_graph = build_road_walk_graph(smap, span_m)
         u_door_x = float(unit_info.get("door_x") if unit_info.get("door_x") is not None else unit_info["map_x"])
         u_door_y = float(unit_info.get("door_y") if unit_info.get("door_y") is not None else unit_info["map_y"])
+
+        def _spot_matches_tag(sp_item: Dict[str, Any]) -> bool:
+            if not norm_tag:
+                return True
+            t_list = sp_item.get("tags") or []
+            return (norm_tag in t_list) or (norm_tag == "ev_charging" and bool(sp_item.get("is_ev")))
+
+        tag_total_spots = 0
+        tag_total_raw_free = 0
+        if norm_tag:
+            for zs_t in zone_summaries:
+                for sp_t in zs_t.get("spots", []):
+                    is_bound_t = str(sp_t.get("camera_id") or "UNASSIGNED") != "UNASSIGNED"
+                    if (not sp_t.get("map_placed", True) and not is_bound_t) or not _spot_matches_tag(sp_t):
+                        continue
+                    tag_total_spots += int(sp_t.get("capacity") or 1)
+                    if sp_t.get("effective_status") == "FREE" and is_bound_t:
+                        if norm_tag == "private":
+                            tag_total_raw_free += int(sp_t.get("visual_free_units") or sp_t.get("committed_free_units") or 0)
+                        elif not sp_t.get("is_private_reserved"):
+                            tag_total_raw_free += int(sp_t.get("free_units") or 0)
 
         # 核心选位准则：
         # 1) 无论车辆从哪个小区大门驶入（单门或前后多门），选位始终按「车位步行至楼栋单元门最近」排序，不受车行距离影响；
@@ -911,7 +1118,15 @@ class ParkingRecommender:
         candidates = []
         best_walk_by_cand: Dict[str, Dict[str, Any]] = {}
         for zs in zone_summaries:
-            placed_spots = [sp for sp in zs.get("spots", []) if sp.get("map_placed", True)]
+            placed_spots = [
+                sp
+                for sp in zs.get("spots", [])
+                if sp.get("map_placed", True)
+                or (
+                    (bool(norm_tag) or vehicle_type == "ev")
+                    and str(sp.get("camera_id") or "UNASSIGNED") != "UNASSIGNED"
+                )
+            ]
             has_explicit_groups = any(str(sp.get("group_code") or "").strip() for sp in placed_spots)
 
             if has_explicit_groups:
@@ -934,11 +1149,19 @@ class ParkingRecommender:
                     eligible_free_spots: List[Dict[str, Any]] = []
 
                     for sp in g_spots:
-                        if sp.get("is_private_reserved"):
+                        if not _spot_matches_tag(sp):
+                            continue
+                        if norm_tag != "private" and sp.get("is_private_reserved"):
                             continue
                         if sp.get("effective_status") != "FREE":
                             continue
-                        fu = int(sp.get("free_units") or 0)
+                        if str(sp.get("camera_id") or "UNASSIGNED") == "UNASSIGNED":
+                            continue
+                        fu = (
+                            int(sp.get("visual_free_units") or sp.get("committed_free_units") or 0)
+                            if norm_tag == "private"
+                            else int(sp.get("free_units") or 0)
+                        )
                         if fu <= 0:
                             continue
                         is_compact = (
@@ -1079,26 +1302,45 @@ class ParkingRecommender:
                     )
                 continue
 
-            eff = zs["effective_free"]
-            if eff <= 0:
-                continue
-            walk_m = float(dists.get(zs["zone_id"], 100.0))
-            placed_free_spots = [
+            countable_free_spots = [
                 sp
                 for sp in zs.get("spots", [])
-                if not sp.get("is_private_reserved")
+                if _spot_matches_tag(sp)
+                and (norm_tag == "private" or not sp.get("is_private_reserved"))
+                and str(sp.get("camera_id") or "UNASSIGNED") != "UNASSIGNED"
                 and sp.get("effective_status") == "FREE"
-                and int(sp.get("free_units") or 0) > 0
+                and (
+                    int(sp.get("visual_free_units") or sp.get("committed_free_units") or 0)
+                    if norm_tag == "private"
+                    else int(sp.get("free_units") or 0)
+                ) > 0
                 and (
                     vehicle_type != "suv"
                     or not bool(sp.get("compact_only"))
                     or "large_friendly" in (sp.get("tags") or [])
                     or sp.get("spot_type") == "elastic_strip"
                 )
-                and sp.get("map_placed", True)
+            ]
+            placed_free_spots = [
+                sp
+                for sp in countable_free_spots
+                if sp.get("map_placed", True)
                 and sp.get("map_x") is not None
                 and sp.get("map_y") is not None
             ]
+            if norm_tag:
+                z_tag_raw = sum(
+                    int(s.get("visual_free_units") or s.get("committed_free_units") or 0)
+                    if norm_tag == "private"
+                    else int(s.get("free_units") or 0)
+                    for s in countable_free_spots
+                )
+                eff = max(0, z_tag_raw - (0 if norm_tag == "private" else zs["soft_locked"]))
+            else:
+                eff = zs["effective_free"]
+            if eff <= 0:
+                continue
+            walk_m = float(dists.get(zs["zone_id"], 100.0))
             best_sp_walk = None
             best_sp_obj = None
             z_walk_pool = (
@@ -1117,6 +1359,18 @@ class ParkingRecommender:
                 if best_sp_walk is None or w_res["walk_meters"] < best_sp_walk["walk_meters"]:
                     best_sp_walk = w_res
                     best_sp_obj = sp
+            if best_sp_obj is None and countable_free_spots:
+                sample_unplaced = (
+                    next((s for s in countable_free_spots if s.get("is_ev")), None)
+                    if vehicle_type == "ev"
+                    else None
+                ) or countable_free_spots[0]
+                zcx_fb = float(zs["map_x"]) + float(zs["map_w"]) * 0.5
+                zcy_fb = float(zs["map_y"]) + float(zs["map_h"]) * 0.5
+                best_sp_walk = compute_walk_between_map_points(
+                    zcx_fb, zcy_fb, u_door_x, u_door_y, road_graph=road_graph
+                )
+                best_sp_obj = {**sample_unplaced, "map_x": zcx_fb, "map_y": zcy_fb}
             rec_gname = ""
             rec_gcode = ""
             rec_slabel = ""
@@ -1178,33 +1432,50 @@ class ParkingRecommender:
         total_cap = sum(int(z["total_capacity"]) for z in zone_summaries)
 
         u_label = str(unit_info.get("name") or unit_info["unit_id"])
+        tag_eff_free = sum(int(c["effective_free"]) for c in candidates) if norm_tag else total_eff
         if not candidates:
-            voice = render_workspace_broadcast_text(
-                ws_profile,
-                has_recommendation=False,
-                total_free=total_eff,
-                total_raw_free=total_raw,
-                total_spots=total_cap,
-                unit_name=u_label,
-                unit_id=str(unit_info["unit_id"]),
-            )
-            repeat_core = render_workspace_repeat_core_text(
-                ws_profile,
-                has_recommendation=False,
-                total_raw_free=total_raw,
-                unit_name=u_label,
-            )
-            display_card = render_workspace_display_card_text(
-                ws_profile,
-                has_recommendation=False,
-                total_free=total_eff,
-                total_raw_free=total_raw,
-                unit_name=u_label,
-            )
+            if norm_tag and tag_info:
+                t_lbl = tag_info["label"]
+                if tag_total_spots <= 0:
+                    voice = f"当前小区暂未配置「{t_lbl}」标签车位。"
+                    repeat_core = f"暂未配置{t_lbl}车位。"
+                else:
+                    voice = f"当前小区共 {tag_total_spots} 个「{t_lbl}」车位，目前全部占用（净余 0 位）。"
+                    repeat_core = f"{t_lbl}车位目前已满。"
+                if total_eff > 0:
+                    voice += f"全区普通车位尚余 {total_eff} 位，切回「全部车位」即可为您导引最近空位。"
+                display_card = f"🏷️ {t_lbl} · 净余 0/{tag_total_spots} 位\n{voice}"
+            else:
+                voice = render_workspace_broadcast_text(
+                    ws_profile,
+                    has_recommendation=False,
+                    total_free=total_eff,
+                    total_raw_free=total_raw,
+                    total_spots=total_cap,
+                    unit_name=u_label,
+                    unit_id=str(unit_info["unit_id"]),
+                )
+                repeat_core = render_workspace_repeat_core_text(
+                    ws_profile,
+                    has_recommendation=False,
+                    total_raw_free=total_raw,
+                    unit_name=u_label,
+                )
+                display_card = render_workspace_display_card_text(
+                    ws_profile,
+                    has_recommendation=False,
+                    total_free=total_eff,
+                    total_raw_free=total_raw,
+                    unit_name=u_label,
+                )
             return {
                 "has_recommendation": False,
                 "unit": unit_info,
                 "vehicle_type": vehicle_type,
+                "tag_filter": norm_tag,
+                "tag_label": tag_info["label"] if tag_info else "",
+                "tag_total_spots": tag_total_spots if norm_tag else total_cap,
+                "tag_effective_free": 0 if norm_tag else total_eff,
                 "primary": None,
                 "backup": None,
                 "voice_text": voice,
@@ -1256,42 +1527,79 @@ class ParkingRecommender:
                 else:
                     handling_note = f"另有空位{seen_hints[0]}。"
 
-        if vehicle_type == "ev" and int(primary.get("ev_free") or 0) > 0:
-            ev_prefix = f"含 {int(primary['ev_free'])} 个空闲新能源充电车位。"
-            handling_note = f"{ev_prefix}{handling_note}" if handling_note else ev_prefix
+        if norm_tag and tag_info:
+            t_lbl = tag_info["label"]
+            best_cand_meta = best_walk_by_cand.get(f"{primary['zone_id']}::{primary.get('group_code', '')}")
+            meta_extra = ""
+            if best_cand_meta and isinstance(best_cand_meta.get("spot"), dict):
+                pub_m = sanitize_spot_tag_meta_for_public(
+                    best_cand_meta["spot"].get("tags") or [],
+                    best_cand_meta["spot"].get("tag_meta"),
+                )
+                parts_m = [
+                    pub_m.get("charger_power", ""),
+                    pub_m.get("rental_window", ""),
+                    pub_m.get("rental_price", ""),
+                ]
+                parts_m = [p for p in parts_m if p]
+                if parts_m:
+                    meta_extra = f"（{' · '.join(parts_m)}）"
+            bkp_txt = (
+                f"备选可前往{backup['zone_name']}，尚余 {backup['effective_free']} 个{t_lbl}空位，步行约 {backup['walk_meters']} 米。"
+                if backup
+                else ""
+            )
+            voice = (
+                f"当前小区「{t_lbl}」车位共 {tag_total_spots} 位、净余 {tag_eff_free} 位，"
+                f"前往{u_label}优先推荐：{primary['zone_name']}{meta_extra}，"
+                f"当前净余 {primary['effective_free']} 个{t_lbl}空位，步行至单元门约 {primary['walk_meters']} 米。"
+                f"{handling_note}{bkp_txt}"
+            )
+            repeat_core = (
+                f"{t_lbl}车位优先推荐{primary['zone_name']}，净余 {primary['effective_free']} 位，步行约 {primary['walk_meters']} 米。"
+            )
+            display_card = (
+                f"📍 {u_label} · {tag_info['short_badge']}{t_lbl} 净余 {tag_eff_free}/{tag_total_spots} 位\n"
+                f"✅ 推荐：{primary['zone_name']}{meta_extra}（净余 {primary['effective_free']} 位 · 步行 {primary['walk_meters']}m）"
+                + (f"\n↪️ 备选：{backup['zone_name']}（余 {backup['effective_free']} 位 · {backup['walk_meters']}m）" if backup else "")
+            )
+        else:
+            if vehicle_type == "ev" and int(primary.get("ev_free") or 0) > 0:
+                ev_prefix = f"含 {int(primary['ev_free'])} 个空闲新能源充电车位。"
+                handling_note = f"{ev_prefix}{handling_note}" if handling_note else ev_prefix
 
-        voice = render_workspace_broadcast_text(
-            ws_profile,
-            has_recommendation=True,
-            total_free=total_eff,
-            total_raw_free=total_raw,
-            total_spots=total_cap,
-            unit_name=u_label,
-            unit_id=str(unit_info["unit_id"]),
-            primary=primary,
-            backup=backup,
-            compact_note=compact_note,
-            handling_note=handling_note,
-        )
-        repeat_core = render_workspace_repeat_core_text(
-            ws_profile,
-            has_recommendation=True,
-            total_raw_free=total_raw,
-            unit_name=u_label,
-            primary=primary,
-            backup=backup,
-            compact_note=compact_note,
-        )
-        display_card = render_workspace_display_card_text(
-            ws_profile,
-            has_recommendation=True,
-            total_free=total_eff,
-            total_raw_free=total_raw,
-            unit_name=u_label,
-            primary=primary,
-            backup=backup,
-            handling_note=handling_note,
-        )
+            voice = render_workspace_broadcast_text(
+                ws_profile,
+                has_recommendation=True,
+                total_free=total_eff,
+                total_raw_free=total_raw,
+                total_spots=total_cap,
+                unit_name=u_label,
+                unit_id=str(unit_info["unit_id"]),
+                primary=primary,
+                backup=backup,
+                compact_note=compact_note,
+                handling_note=handling_note,
+            )
+            repeat_core = render_workspace_repeat_core_text(
+                ws_profile,
+                has_recommendation=True,
+                total_raw_free=total_raw,
+                unit_name=u_label,
+                primary=primary,
+                backup=backup,
+                compact_note=compact_note,
+            )
+            display_card = render_workspace_display_card_text(
+                ws_profile,
+                has_recommendation=True,
+                total_free=total_eff,
+                total_raw_free=total_raw,
+                unit_name=u_label,
+                primary=primary,
+                backup=backup,
+                handling_note=handling_note,
+            )
 
         # Extract planned driving route polyline & exact unit-door walking path to the recommended stall
         primary_zs = next((z for z in zone_summaries if z["zone_id"] == primary["zone_id"]), None)
@@ -1374,6 +1682,10 @@ class ParkingRecommender:
             "has_recommendation": True,
             "unit": unit_info,
             "vehicle_type": vehicle_type,
+            "tag_filter": norm_tag,
+            "tag_label": tag_info["label"] if tag_info else "",
+            "tag_total_spots": tag_total_spots if norm_tag else total_cap,
+            "tag_effective_free": tag_eff_free if norm_tag else total_eff,
             "entry_gate_id": req_gate or "auto",
             "primary": primary,
             "backup": backup,

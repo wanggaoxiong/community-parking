@@ -277,7 +277,13 @@ class ReferenceAutoCalibrator:
             st = str(sp.get("initial_status") or "").upper()
             if st not in ("FREE", "OCCUPIED", "BLOCKED"):
                 st = fast_obs["status"]
-            elif st == "FREE" and fast_obs["status"] == "OCCUPIED" and fast_obs["confidence"] >= 0.86:
+            elif (
+                st == "FREE"
+                and fast_obs["status"] == "OCCUPIED"
+                and fast_obs["confidence"] >= 0.86
+                and sp.get("is_ev") is not True
+                and not fast_obs.get("metrics", {}).get("ground_stencil_filtered")
+            ):
                 st = "OCCUPIED"
             conf = float(sp.get("confidence") or fast_obs["confidence"])
             reason = str(sp.get("reason") or fast_obs["reason"])
@@ -1400,8 +1406,8 @@ class ReferenceAutoCalibrator:
             "   - 高层俯拍已停车辆时，车位框必须紧贴【每辆车轮胎接地的铺装地面底面】，一辆车对应一个车位，绝不可将框体画到绿色灌木丛上，也不可探入前方沥青行车道！\n"
             "4. 连续相邻车位必须严格共用同一条分隔线的两个端点（即第 k 位的 `[后右, 前右]` 等于第 k+1 位的 `[后左, 前左]`），严禁相邻车位框互相重叠交叉！\n"
             "5. 若存在不规则多边形车位填 \"irregular\"；若为无固定分格的超长路侧顺停带填 \"elastic_strip\" 并估算 `total_meters`。\n"
-            "6. 判断当前参考图中每个车位的初始状态 `initial_status`：停有汽车填 \"OCCUPIED\"，空车位填 \"FREE\"，锥桶/地锁占道填 \"BLOCKED\"。\n"
-            "7. 【新能源充电车位识别 `is_ev`】：仔细观察每个车位是否属于新能源/充电专用车位（特征包括：地面涂刷国标翠绿/蓝绿色新能源专位地漆或闪电/EV/新能源字样、车位后方路牙/墙面装有立柱或壁挂充电桩、盘绕黑色/橙色充电枪线，或停放车辆正在插枪充电）。若是填 `true` 并在 `ev_reason` 简述依据（如 \"后方立柱充电桩\" 或 \"绿色新能源专位地漆\"），普通车位填 `false`。\n"
+            "6. 判断当前参考图中每个车位的初始状态 `initial_status`：停有真实立体汽车填 \"OCCUPIED\"，空车位填 \"FREE\"（注意：车位地面喷涂的新能源小汽车充电图标、闪电/轮椅平面图案、绿色标线、地面编号以及后方充电桩立柱/防撞条均属于空车位地面设施，无真实立体车辆停放时务必填 \"FREE\"！），锥桶/地锁占道填 \"BLOCKED\"。\n"
+            "7. 【新能源充电车位识别 `is_ev`】：仔细观察每个车位是否属于新能源/充电专用车位（特征包括：地面涂刷国标翠绿/蓝绿色新能源专位地漆或绿色双侧边线、地面喷涂新能源小车/插头/闪电/EV字样、车位后方路牙/墙面装有立柱或壁挂充电桩、盘绕黑色/橙色充电枪线，或停放车辆正在插枪充电）。若是填 `true` 并在 `ev_reason` 简述依据（如 \"后方立柱充电桩与地面充电图标\" 或 \"绿色新能源专位地漆\"），普通车位填 `false`。\n"
             "仅输出严格 JSON（不要输出代码块以外的解释）：\n"
             "{\n"
             '  "scene_summary": "不超过28字中文场景总结",\n'
@@ -1682,15 +1688,36 @@ class ReferenceAutoCalibrator:
         val = hsv[:, :, 2]
         emerald_mask = m_core & (hue >= 75) & (hue <= 99) & (sat >= 82) & (val >= 88)
         emerald_ratio = float(np.count_nonzero(emerald_mask)) / float(valid_cnt)
-        if emerald_ratio < 0.34:
-            return False, ""
+        if emerald_ratio >= 0.34:
+            val_std = float(np.std(val[emerald_mask]))
+            if val_std <= 46.0:
+                return True, f"国标绿色新能源专位地漆({int(round(emerald_ratio * 100))}%)"
 
-        # Epoxy ground paint is smooth (unlike high-frequency tree foliage leaves)
-        val_std = float(np.std(val[emerald_mask]))
-        if val_std > 46.0:
-            return False, ""
+        # Also detect standard EV bay green border stripes + central green EV stencil icon on grey asphalt
+        hsv_all = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
+        grn_paint_all = (
+            (hsv_all[:, :, 0] >= 46)
+            & (hsv_all[:, :, 0] <= 99)
+            & (hsv_all[:, :, 1] >= 62)
+            & (hsv_all[:, :, 2] >= 88)
+        )
+        if valid_mask is not None and valid_mask.shape[:2] == (h, w):
+            grn_paint_all = grn_paint_all & (valid_mask > 127)
+        sy0, sy1 = int(h * 0.18), int(h * 0.86)
+        left_band = grn_paint_all[sy0:sy1, int(w * 0.03) : int(w * 0.17)]
+        right_band = grn_paint_all[sy0:sy1, int(w * 0.83) : int(w * 0.97)]
+        mid_band = grn_paint_all[int(h * 0.30) : int(h * 0.72), int(w * 0.22) : int(w * 0.78)]
+        left_r = float(np.mean(left_band)) if left_band.size else 0.0
+        right_r = float(np.mean(right_band)) if right_band.size else 0.0
+        mid_r = float(np.mean(mid_band)) if mid_band.size else 0.0
+        grn_cnt = int(np.count_nonzero(grn_paint_all))
+        grn_v_std = float(np.std(hsv_all[:, :, 2][grn_paint_all])) if grn_cnt >= 24 else 99.0
 
-        return True, f"国标绿色新能源专位地漆({int(round(emerald_ratio * 100))}%)"
+        # Bilateral vertical green EV lines (smooth flat paint, never tree canopy which only hangs from top)
+        if min(left_r, right_r) >= 0.18 and grn_v_std <= 26.0:
+            return True, "新能源绿框标线/地面充电标识"
+
+        return False, ""
 
     @classmethod
     def _normalize_quad_preserve_orientation(cls, pts: List[List[float]]) -> List[List[float]]:

@@ -25,7 +25,7 @@ permissions:
 jobs:
   unit-tests:
     name: Python 3.11 全量单元测试门禁
-    if: ${{ github.event.inputs.promote_rollback_tag == '' }}
+    if: ${{ (github.event.inputs.promote_rollback_tag || '') == '' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -87,7 +87,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build candidate image (Normal Release / PR Gate)
-        if: ${{ github.event.inputs.promote_rollback_tag == '' }}
+        if: ${{ (github.event.inputs.promote_rollback_tag || '') == '' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -103,7 +103,7 @@ jobs:
             org.opencontainers.image.description=Community Parking Smart Guidance (:8790 / :18790 / :18791)
 
       - name: Pull historical tag for remote rollback promotion
-        if: ${{ github.event.inputs.promote_rollback_tag != '' }}
+        if: ${{ (github.event.inputs.promote_rollback_tag || '') != '' }}
         env:
           PROMOTE_TAG: ${{ github.event.inputs.promote_rollback_tag }}
           IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}

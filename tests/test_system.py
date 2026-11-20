@@ -6935,21 +6935,30 @@ class CommunityParkingSystemTests(unittest.TestCase):
         self.assertIn("AEA1", wf_text)
         self.assertIn(":previous", wf_text)
 
-        # 2) Verify `docker-compose.yml` uses `nickfedor/watchtower`, label isolation, and `host-gateway` for Private SSH
+        # 2) Verify `docker-compose.yml` uses `nickfedor/watchtower`, HTTP/2 tunnel transport, label isolation, and `host-gateway`
         compose_text = (repo_root / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn("nickfedor/watchtower:latest", compose_text)
         self.assertNotIn("containrrr/watchtower", compose_text)
         self.assertIn("WATCHTOWER_LABEL_ENABLE=true", compose_text)
         self.assertIn("WATCHTOWER_CLEANUP=false", compose_text)
+        self.assertIn("--protocol http2", compose_text)
         self.assertIn("host.docker.internal:host-gateway", compose_text)
         self.assertIn("app.rollback_guard", compose_text)
 
-        # 3) Verify `parking-ctl.sh` syntax and autoupdate/rollback subcommands
+        # 2b) Verify all 3 HTTP servers configure deep TCP SYN backlog (`request_queue_size = 128`) & daemon_threads
+        from app.server import MobileThreadingHTTPServer, ReusableThreadingHTTPServer
+        from app.voice_gateway import VoiceThreadingHTTPServer
+
+        for srv_cls in (VoiceThreadingHTTPServer, MobileThreadingHTTPServer, ReusableThreadingHTTPServer):
+            self.assertGreaterEqual(srv_cls.request_queue_size, 128)
+            self.assertTrue(srv_cls.daemon_threads)
+
+        # 3) Verify `parking-ctl.sh` syntax, conflict-safe compose helper, and local-vs-GHCR tag isolation
         ctl_path = repo_root / "parking-ctl.sh"
         chk = subprocess.run(["bash", "-n", str(ctl_path)], capture_output=True, text=True)
         self.assertEqual(chk.returncode, 0, chk.stderr)
         ctl_text = ctl_path.read_text(encoding="utf-8")
-        for subcmd in ("docker-autoupdate)", "docker-rollback)", "docker-status)"):
+        for subcmd in ("docker-autoupdate)", "docker-rollback)", "docker-status)", "compose_up_conflict_safe", "community-parking:local"):
             self.assertIn(subcmd, ctl_text)
 
         # 4) Verify `parse_image_reference` handles custom ports, orgs, and implicit `:latest`

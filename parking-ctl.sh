@@ -403,6 +403,22 @@ read_dotenv_var() {
   echo "${val}"
 }
 
+compose_up_conflict_safe() {
+  if ! "$@" 2>/tmp/cp-compose-up.err; then
+    cat /tmp/cp-compose-up.err >&2 || true
+    if grep -qi 'already in use by container' /tmp/cp-compose-up.err 2>/dev/null; then
+      echo "🔧 检测到 Watchtower/守卫重建过的同名容器，正在自动对齐 Compose 状态..."
+      "${DOCKER_CMD[@]}" rm -f community-parking >/dev/null 2>&1 || true
+      rm -f /tmp/cp-compose-up.err
+      "$@"
+      return $?
+    fi
+    rm -f /tmp/cp-compose-up.err
+    return 1
+  fi
+  rm -f /tmp/cp-compose-up.err
+}
+
 case "${1:-status}" in
   start)             cmd_start ;;
   stop)              cmd_stop ;;
@@ -422,11 +438,18 @@ case "${1:-status}" in
       cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
       echo "📝 已自动从 .env.example 初始化 .env 配置文件"
     fi
+    # Stop autoupdate sidecars during manual local source builds so Watchtower never ping-pongs or overwrites GHCR tags
+    if "${DOCKER_CMD[@]}" ps --format '{{.Names}}' | grep -Eq '^community-parking-(watchtower|rollback-guard)$'; then
+      echo "⏸️ 检测到正在运行的 Watchtower 自动热更侧车，本地源码构建模式下自动暂停侧车以防镜像标签互抢..."
+      "${DOCKER_CMD[@]}" rm -f community-parking-watchtower community-parking-rollback-guard >/dev/null 2>&1 || true
+    fi
     CF_TOK="$(read_dotenv_var CLOUDFLARE_TUNNEL_TOKEN)"
     if [[ -n "${CF_TOK}" ]]; then
-      CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" "${DOCKER_CMD[@]}" compose --profile tunnel up -d --build
+      compose_up_conflict_safe env CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" PARKING_IMAGE="community-parking:local" WATCHTOWER_ENABLE="false" \
+        "${DOCKER_CMD[@]}" compose --profile tunnel up -d --build
     else
-      "${DOCKER_CMD[@]}" compose up -d --build
+      compose_up_conflict_safe env PARKING_IMAGE="community-parking:local" WATCHTOWER_ENABLE="false" \
+        "${DOCKER_CMD[@]}" compose up -d --build
     fi
     wait_healthy && cmd_health
     ;;
@@ -446,7 +469,7 @@ case "${1:-status}" in
     if [[ -n "${CF_TOK}" ]]; then
       PROFILES+=(--profile tunnel)
     fi
-    CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" PARKING_IMAGE="${IMG_REF}" WATCHTOWER_ENABLE=true \
+    compose_up_conflict_safe env CLOUDFLARE_TUNNEL_TOKEN="${CF_TOK}" PARKING_IMAGE="${IMG_REF}" WATCHTOWER_ENABLE="true" \
       "${DOCKER_CMD[@]}" compose "${PROFILES[@]}" up -d --remove-orphans
     wait_healthy && cmd_health
     echo "🛡️ 零端口无人值守热更(Watchtower) + 健康失败自动回滚守卫(RollbackGuard) 已激活！"
@@ -583,8 +606,15 @@ print(f\"   覆盖模式 : 仅文字(text) · 仅平面图(map) · 文字+平面
 
     rsync -avz -e "ssh ${SSH_OPTS[*]}" "${RSYNC_EXCLUDES[@]}" "${APP_DIR}/" "${REMOTE_HOST}:community-parking/"
 
-    echo "🐳 正在 Ubuntu 上重新构建并热更新 Docker 容器栈..."
-    ssh "${SSH_OPTS[@]}" "${REMOTE_HOST}" 'cd ~/community-parking && if sg docker -c "docker info" >/dev/null 2>&1; then sg docker -c "./parking-ctl.sh docker-up"; else ./parking-ctl.sh docker-up; fi'
+    REMOTE_SUBCMD="docker-up"
+    if [[ "${SYNC_DATA_FLAG}" != "--local-build" ]] && [[ -z "$(git -C "${APP_DIR}" status --porcelain 2>/dev/null || true)" ]]; then
+      if ssh "${SSH_OPTS[@]}" "${REMOTE_HOST}" 'docker ps --format "{{.Names}}" 2>/dev/null | grep -qx "community-parking-watchtower" || sudo docker ps --format "{{.Names}}" 2>/dev/null | grep -qx "community-parking-watchtower"'; then
+        REMOTE_SUBCMD="docker-autoupdate"
+      fi
+    fi
+
+    echo "🐳 正在 Ubuntu 上执行 ${REMOTE_SUBCMD} 热更新 Docker 容器栈..."
+    ssh "${SSH_OPTS[@]}" "${REMOTE_HOST}" "cd ~/community-parking && if sg docker -c 'docker info' >/dev/null 2>&1; then sg docker -c './parking-ctl.sh ${REMOTE_SUBCMD}'; else ./parking-ctl.sh ${REMOTE_SUBCMD}; fi"
     echo "🎉 Ubuntu 云端 (${REMOTE_HOST}) 与 Cloudflare 域名 (voice.listingworker.com / parking.listingworker.com) 已全部更新上线！"
     ;;
   sign-shortcut)

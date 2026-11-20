@@ -511,6 +511,7 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                 if extra_headers:
                     for hk, hv in extra_headers.items():
                         self.send_header(hk, hv)
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
@@ -522,6 +523,7 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                 self.send_response(status)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
@@ -2272,6 +2274,7 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
                 self.send_header("Pragma", "no-cache")
                 self.send_header("Expires", "0")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 if not head_only:
                     self.wfile.write(content)
@@ -2313,6 +2316,7 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
                 self.send_header("Pragma", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
@@ -2462,6 +2466,8 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
                 rel = "mobile.html"
             elif clean_path == "/favicon.ico":
                 self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 return
             else:
@@ -2506,6 +2512,7 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
                 self.send_header("Pragma", "no-cache")
                 self.send_header("Expires", "0")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 if not head_only:
                     self.wfile.write(content)
@@ -2518,6 +2525,7 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
 class MobileThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 128
 
 
 def create_mobile_http_server(
@@ -2529,6 +2537,8 @@ def create_mobile_http_server(
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 128
 
     def __init__(self, server_address, RequestHandlerClass, ctx_ref: Optional[ParkingAppContext] = None):
         self._ctx_ref = ctx_ref

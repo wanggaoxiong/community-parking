@@ -5425,12 +5425,14 @@ def make_voice_http_handler(root_ctx: Any):
 
         def do_OPTIONS(self) -> None:
             self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Content-Length", "0")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
             self.send_header(
                 "Access-Control-Allow-Headers",
                 "Content-Type, Authorization, X-Parking-Token, X-Parking-Workspace",
             )
+            self.send_header("Connection", "close")
             self.end_headers()
 
         def do_HEAD(self) -> None:
@@ -5441,11 +5443,13 @@ def make_voice_http_handler(root_ctx: Any):
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/x-apple-shortcut")
                 self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 return
             if path.startswith("/api/"):
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 return
             self._serve_voice_static(path, head_only=True)
@@ -6059,6 +6063,8 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                 rel = "voice.html"
             elif clean_path == "/favicon.ico":
                 self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 return
             else:
@@ -6094,6 +6100,7 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 if not head_only:
                     self.wfile.write(content)
@@ -6106,6 +6113,7 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
 class VoiceThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 128
 
 
 def create_voice_http_server(

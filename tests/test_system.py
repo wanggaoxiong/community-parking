@@ -7185,6 +7185,289 @@ class CommunityParkingSystemTests(unittest.TestCase):
             unix_srv.server_close()
             shutil.rmtree(sock_dir, ignore_errors=True)
 
+    def test_spot_multi_tags_ev_auto_detect_private_and_rental_workflow(self) -> None:
+        """
+        End-to-end verification of:
+        1) VLM `is_ev` + OpenCV emerald-green EV ground paint auto-detection during Spatial Calibration
+        2) Direct map click tagging API (`POST /api/spots/tags` single & batch) + custom tags + rental metadata
+        3) Public `:18790` / `:18791` viewer projection (lightning bolt SVG + public rental details, internal notes stripped, 403 on write)
+        4) Private spot exclusion (`private` vs `private`+`rentable`) & `vehicle_type="ev"` charger-first recommendation
+        5) Preservation of manual tags & operator `ev_user_override` across camera recalibrations
+        """
+        from unittest.mock import patch
+        import urllib.error
+        from app.server import create_http_server, create_mobile_http_server
+
+        ctx = ParkingAppContext(database=self.db)
+        adm_srv = create_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        mob_srv = create_mobile_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        voice_srv = create_voice_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        a_port = adm_srv.server_address[1]
+        m_port = mob_srv.server_address[1]
+        v_port = voice_srv.server_address[1]
+
+        for s in (adm_srv, mob_srv, voice_srv):
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+
+        try:
+            # 1) OpenCV emerald-green EV ground-paint auto-detection in `local_only` mode (and stays FREE!)
+            config_manager.update({"vlm": {"mode": "local_only"}})
+            cam_ev_local = "CAM_EV_OPENCV_GREEN"
+            self.db.upsert_camera(
+                camera_id=cam_ev_local,
+                name="充电区绿漆俯拍",
+                zone_id="Z_BLDG3_EAST",
+                image_width=800,
+                image_height=480,
+            )
+            img_ev = np.full((480, 800, 3), (114, 116, 120), dtype=np.uint8)
+            # Stall 1 [120..360, 140..380]: Chinese-standard emerald EV bay paint (BGR=(115, 178, 12) -> HSV H~82, S~238, V~178)
+            cv2.rectangle(img_ev, (128, 148), (352, 372), (115, 178, 12), -1)
+            cv2.rectangle(img_ev, (120, 140), (360, 380), (235, 238, 240), 4)
+            # Stall 2 [420..660, 140..380]: Ordinary grey asphalt stall
+            cv2.rectangle(img_ev, (420, 140), (660, 380), (235, 238, 240), 4)
+            ok_enc, buf_ev = cv2.imencode(".jpg", img_ev)
+            self.assertTrue(ok_enc)
+
+            fb_polys = [
+                {
+                    "label": "01",
+                    "spot_type": "standard",
+                    "polygon": [[120.0, 140.0], [360.0, 140.0], [360.0, 380.0], [120.0, 380.0]],
+                },
+                {
+                    "label": "02",
+                    "spot_type": "standard",
+                    "polygon": [[420.0, 140.0], [660.0, 140.0], [660.0, 380.0], [420.0, 380.0]],
+                },
+            ]
+            with patch.object(
+                ctx.calibrator,
+                "_calibrate_opencv_fallback",
+                return_value=(fb_polys, "绿漆充电位+普通位"),
+            ):
+                cal_local = ctx.calibrator.auto_calibrate_from_bytes(
+                    camera_id=cam_ev_local,
+                    raw_image_bytes=buf_ev.tobytes(),
+                    zone_id="Z_BLDG3_EAST",
+                    auto_save=True,
+                )
+            self.assertEqual(cal_local["template_meta"]["ev_spots_detected"], 1)
+            sp_loc_1, sp_loc_2 = cal_local["spots"][0], cal_local["spots"][1]
+            self.assertEqual(sp_loc_1["status"], "FREE")
+            self.assertTrue(sp_loc_1["is_ev"])
+            self.assertIn("ev_charging", sp_loc_1["tags"])
+            self.assertEqual(sp_loc_2["status"], "FREE")
+            self.assertFalse(sp_loc_2["is_ev"])
+            self.assertEqual(sp_loc_2["tags"], [])
+
+            # 2) VLM `is_ev` auto-detection during calibration + preservation of operator rental/custom tags across recalibration
+            config_manager.update(
+                {
+                    "vlm": {
+                        "mode": "hybrid",
+                        "base_url": "https://mock-foundry.openai.azure.com/openai/v1",
+                        "model": "gpt-6.1-sol",
+                        "api_key": "dummy-test-key",
+                    }
+                }
+            )
+            vlm_mock_json = json.dumps(
+                {
+                    "scene_summary": "双车位含1电桩",
+                    "building_hint": "3栋",
+                    "row_geometry": "straight_lined",
+                    "spots": [
+                        {
+                            "label": "01",
+                            "spot_type": "standard",
+                            "compact_only": False,
+                            "is_ev": True,
+                            "ev_reason": "后方立柱充电桩",
+                            "total_meters": 5.2,
+                            "polygon_1000": [[150, 290], [450, 290], [450, 790], [150, 790]],
+                            "initial_status": "FREE",
+                            "confidence": 0.96,
+                            "reason": "空车位，后方立柱式交流充电桩",
+                        },
+                        {
+                            "label": "02",
+                            "spot_type": "standard",
+                            "compact_only": False,
+                            "is_ev": False,
+                            "ev_reason": "",
+                            "total_meters": 5.2,
+                            "polygon_1000": [[525, 290], [825, 290], [825, 790], [525, 790]],
+                            "initial_status": "FREE",
+                            "confidence": 0.96,
+                            "reason": "普通空车位",
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            gray_img = np.full((480, 800, 3), (118, 120, 124), dtype=np.uint8)
+            _, gray_buf = cv2.imencode(".jpg", gray_img)
+
+            # Tag spot 01 with `rentable` + custom tag via `POST /api/spots/tags`
+            req_tag = urllib.request.Request(
+                f"http://127.0.0.1:{a_port}/api/spots/tags",
+                data=json.dumps(
+                    {
+                        "spot_ids": [sp_loc_1["spot_id"]],
+                        "tags": ["ev_charging", "rentable", "子母位"],
+                        "tag_meta": {
+                            "charger_power": "7kW交流慢充",
+                            "rental_window": "工作日 08:30-18:30",
+                            "rental_price": "¥160/月",
+                            "rental_contact": "物业中心 027-88886666",
+                            "note": "内部合同编号A-809",
+                        },
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_tag, timeout=5) as r_tag:
+                tag_res = json.loads(r_tag.read().decode("utf-8"))
+            self.assertTrue(tag_res["ok"])
+            self.assertEqual(tag_res["updated_count"], 1)
+            self.assertEqual(tag_res["spots"][0]["tags"], ["ev_charging", "rentable", "子母位"])
+
+            # Verify recalibrating `cam_ev_local` via VLM parses `is_ev` AND preserves `rentable` + `"子母位"` + `rental_price`!
+            with patch.object(
+                ctx.vision,
+                "_post_vlm_completions",
+                return_value=(vlm_mock_json, None, 200),
+            ):
+                recal = ctx.calibrator.auto_calibrate_from_bytes(
+                    camera_id=cam_ev_local,
+                    raw_image_bytes=gray_buf.tobytes(),
+                    zone_id="Z_BLDG3_EAST",
+                    auto_save=True,
+                )
+            re_sp1 = recal["spots"][0]
+            self.assertIn("ev_charging", re_sp1["tags"])
+            self.assertIn("rentable", re_sp1["tags"])
+            self.assertIn("子母位", re_sp1["tags"])
+            self.assertEqual(re_sp1["tag_meta"]["rental_price"], "¥160/月")
+            self.assertEqual(re_sp1["tag_meta"]["ev_reason"], "后方立柱充电桩")
+
+            # Operator explicitly removes `ev_charging` -> `ev_user_override == False` prevents VLM from re-adding it!
+            req_optout = urllib.request.Request(
+                f"http://127.0.0.1:{a_port}/api/spots/tags",
+                data=json.dumps({"spot_ids": [re_sp1["spot_id"]], "tags": ["rentable"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_optout, timeout=5):
+                pass
+            with patch.object(
+                ctx.vision,
+                "_post_vlm_completions",
+                return_value=(vlm_mock_json, None, 200),
+            ):
+                recal_after_optout = ctx.calibrator.auto_calibrate_from_bytes(
+                    camera_id=cam_ev_local,
+                    raw_image_bytes=gray_buf.tobytes(),
+                    zone_id="Z_BLDG3_EAST",
+                    auto_save=True,
+                )
+            self.assertNotIn("ev_charging", recal_after_optout["spots"][0]["tags"])
+            self.assertIn("rentable", recal_after_optout["spots"][0]["tags"])
+
+            # Restore `ev_charging` + `rentable` on spot 01 so we can test `:8790` / `:18790` / `:18791` & EV recommender
+            self.db.update_spots_tags(
+                [recal_after_optout["spots"][0]["spot_id"]],
+                tags=["ev_charging", "rentable"],
+                tag_meta={
+                    "charger_power": "60kW快充",
+                    "rental_window": "全天包月",
+                    "rental_price": "¥180/月",
+                    "rental_contact": "物业中心 027-88886666",
+                    "note": "内部机密备注勿外泄",
+                },
+            )
+
+            # 3) Verify `:8790` overview vs `:18790` mobile sanitization & 403 guard vs `:18791` HUD lightning bolt
+            with urllib.request.urlopen(
+                urllib.request.Request(
+                    f"http://127.0.0.1:{a_port}/api/overview",
+                    headers={"X-Parking-Client": "test"},
+                ),
+                timeout=5,
+            ) as r_adm_ov:
+                adm_ov = json.loads(r_adm_ov.read().decode("utf-8"))
+            self.assertGreaterEqual(adm_ov["total_ev_spots"], 1)
+            self.assertGreaterEqual(adm_ov["total_ev_free"], 1)
+            self.assertGreaterEqual(adm_ov["total_rentable_spots"], 1)
+            self.assertTrue(len(adm_ov["spot_tag_catalog"]) >= 6)
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{m_port}/api/mobile/overview?unit_id=3-1", timeout=5) as r_mob_ov:
+                mob_raw = r_mob_ov.read().decode("utf-8")
+                mob_ov = json.loads(mob_raw)
+            self.assertGreaterEqual(mob_ov["total_ev_spots"], 1)
+            self.assertIn("¥180/月", mob_raw)
+            self.assertIn("60kW快充", mob_raw)
+            self.assertNotIn("内部机密备注勿外泄", mob_raw)
+
+            # Mobile `:18790` strictly blocks `POST /api/spots/tags` with 403
+            with self.assertRaises(urllib.error.HTTPError) as cm_forbid:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{m_port}/api/spots/tags",
+                        data=b'{"spot_ids":["x"],"tags":["ev_charging"]}',
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    ),
+                    timeout=5,
+                )
+            self.assertEqual(cm_forbid.exception.code, 403)
+
+            # `:18791` HUD SVG renders golden lightning bolt (`#FACC15`) & `⚡新能源`
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/hud/map.html?unit=3-1&view=map", timeout=5
+            ) as r_vhud:
+                vhud_txt = r_vhud.read().decode("utf-8")
+            self.assertIn("#FACC15", vhud_txt)
+            self.assertIn("⚡新能源", vhud_txt)
+
+            # 4) Private spot exclusion (`private` vs `private`+`rentable`) & `vehicle_type="ev"` charger-first routing
+            sp2_id = recal_after_optout["spots"][1]["spot_id"]
+            free_before_priv = next(
+                z["effective_free"]
+                for z in ctx.recommender.get_zone_summaries()
+                if z["zone_id"] == "Z_BLDG3_EAST"
+            )
+            self.db.update_spots_tags([sp2_id], tags=["private"])
+            free_after_priv = next(
+                z["effective_free"]
+                for z in ctx.recommender.get_zone_summaries()
+                if z["zone_id"] == "Z_BLDG3_EAST"
+            )
+            self.assertEqual(free_after_priv, free_before_priv - 1)
+
+            # Opening the private spot for time-share rental (`["private", "rentable"]`) immediately restores public availability!
+            self.db.update_spots_tags([sp2_id], tags=["private", "rentable"])
+            free_after_shared = next(
+                z["effective_free"]
+                for z in ctx.recommender.get_zone_summaries()
+                if z["zone_id"] == "Z_BLDG3_EAST"
+            )
+            self.assertEqual(free_after_shared, free_before_priv)
+
+            # Unit `8-1` is closer to its own non-EV zone, so `sedan` picks a closer non-EV zone,
+            # whereas `vehicle_type="ev"` prioritizes `Z_BLDG3_EAST` (which has an available EV charger!)
+            rec_ev = ctx.recommender.recommend(unit_id="8-1", vehicle_type="ev", acquire_lock=False)
+            self.assertTrue(rec_ev["has_recommendation"])
+            self.assertEqual(rec_ev["primary"]["zone_id"], "Z_BLDG3_EAST")
+            self.assertGreaterEqual(rec_ev["primary"]["ev_free"], 1)
+            self.assertIn("空闲新能源充电车位", rec_ev["voice_text"])
+        finally:
+            for s in (adm_srv, mob_srv, voice_srv):
+                s.shutdown()
+                s.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

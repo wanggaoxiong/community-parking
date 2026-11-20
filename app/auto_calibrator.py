@@ -15,6 +15,7 @@ from app.homography import (
     extract_spot_patch,
     subdivide_perspective_row,
 )
+from app.spot_tags import merge_spot_tags_on_recalibration
 from app.vision_pipeline import VisionPipeline, apply_camera_crop_roi
 
 
@@ -220,6 +221,7 @@ class ReferenceAutoCalibrator:
         primed_sigs: Dict[str, np.ndarray] = {}
         free_cnt = 0
         occ_cnt = 0
+        ev_cnt = 0
 
         for idx, sp in enumerate(raw_spots):
             bound_custom = custom_existing[idx] if idx < len(custom_existing) else None
@@ -265,6 +267,7 @@ class ReferenceAutoCalibrator:
                 veh_valid_mask=veh_mask,
                 enable_dual_layer=True,
             )
+            opencv_ev_paint, opencv_ev_reason = self._detect_ev_ground_paint_opencv(patch, mask)
             del patch, mask
             if veh_patch is not None:
                 del veh_patch
@@ -278,6 +281,21 @@ class ReferenceAutoCalibrator:
                 st = "OCCUPIED"
             conf = float(sp.get("confidence") or fast_obs["confidence"])
             reason = str(sp.get("reason") or fast_obs["reason"])
+
+            vlm_is_ev = sp.get("is_ev") if "is_ev" in sp else None
+            vlm_ev_reason = str(sp.get("ev_reason") or "").strip()
+            auto_is_ev: Optional[bool]
+            auto_ev_reason = ""
+            if vlm_is_ev is True:
+                auto_is_ev = True
+                auto_ev_reason = vlm_ev_reason or "AI视觉识别新能源充电车位"
+            elif st == "FREE" and opencv_ev_paint:
+                auto_is_ev = True
+                auto_ev_reason = opencv_ev_reason
+            elif vlm_is_ev is False:
+                auto_is_ev = False
+            else:
+                auto_is_ev = None
 
             if spot_type == "elastic_strip":
                 free_u = int(sp.get("free_units", fast_obs["free_units"] if st == "FREE" else 0))
@@ -302,6 +320,20 @@ class ReferenceAutoCalibrator:
                 if bound_custom and (bound_custom.get("group_code") or str(bound_custom.get("spot_id") or "").startswith("SP_"))
                 else str(sp.get("label") or f"{idx+1:02d}")
             )
+            prev_for_tags = bound_custom or (
+                existing_spots[idx] if idx < len(existing_spots) else None
+            )
+            merged_tags, merged_tag_meta = merge_spot_tags_on_recalibration(
+                prev_tags_raw=(prev_for_tags.get("tags") if prev_for_tags else None),
+                prev_meta_raw=(prev_for_tags.get("tag_meta") if prev_for_tags else None),
+                incoming_tags_raw=sp.get("tags") if "tags" in sp else None,
+                incoming_meta_raw=sp.get("tag_meta") if "tag_meta" in sp else None,
+                auto_is_ev=auto_is_ev,
+                auto_ev_reason=auto_ev_reason,
+            )
+            is_ev_final = "ev_charging" in merged_tags
+            if is_ev_final:
+                ev_cnt += 1
             enriched_entry: Dict[str, Any] = {
                 "spot_id": spot_id,
                 "label": resolved_label,
@@ -324,6 +356,10 @@ class ReferenceAutoCalibrator:
                 "reason": f"参考图基准：{reason}" if not reason.startswith("参考图") else reason,
                 "engine": engine_used,
                 "ref_free_sig_b64": ref_free_sig_b64,
+                "is_ev": is_ev_final,
+                "ev_reason": auto_ev_reason,
+                "tags": merged_tags,
+                "tag_meta": merged_tag_meta,
             }
             if bound_custom:
                 if bound_sid:
@@ -351,6 +387,7 @@ class ReferenceAutoCalibrator:
             "scene_summary": scene_summary,
             "building_hint": building_hint,
             "spots_count": len(enriched_spots),
+            "ev_spots_detected": ev_cnt,
             "initial_free": free_cnt,
             "initial_occupied": occ_cnt,
             "plates_redacted": plates_redacted,
@@ -1364,6 +1401,7 @@ class ReferenceAutoCalibrator:
             "4. 连续相邻车位必须严格共用同一条分隔线的两个端点（即第 k 位的 `[后右, 前右]` 等于第 k+1 位的 `[后左, 前左]`），严禁相邻车位框互相重叠交叉！\n"
             "5. 若存在不规则多边形车位填 \"irregular\"；若为无固定分格的超长路侧顺停带填 \"elastic_strip\" 并估算 `total_meters`。\n"
             "6. 判断当前参考图中每个车位的初始状态 `initial_status`：停有汽车填 \"OCCUPIED\"，空车位填 \"FREE\"，锥桶/地锁占道填 \"BLOCKED\"。\n"
+            "7. 【新能源充电车位识别 `is_ev`】：仔细观察每个车位是否属于新能源/充电专用车位（特征包括：地面涂刷国标翠绿/蓝绿色新能源专位地漆或闪电/EV/新能源字样、车位后方路牙/墙面装有立柱或壁挂充电桩、盘绕黑色/橙色充电枪线，或停放车辆正在插枪充电）。若是填 `true` 并在 `ev_reason` 简述依据（如 \"后方立柱充电桩\" 或 \"绿色新能源专位地漆\"），普通车位填 `false`。\n"
             "仅输出严格 JSON（不要输出代码块以外的解释）：\n"
             "{\n"
             '  "scene_summary": "不超过28字中文场景总结",\n'
@@ -1374,6 +1412,8 @@ class ReferenceAutoCalibrator:
             '      "label": "01",\n'
             '      "spot_type": "standard",\n'
             '      "compact_only": false,\n'
+            '      "is_ev": false,\n'
+            '      "ev_reason": "",\n'
             '      "total_meters": 5.2,\n'
             '      "polygon_1000": [[83,602],[158,605],[122,712],[26,706]],\n'
             '      "initial_status": "OCCUPIED",\n'
@@ -1437,20 +1477,35 @@ class ReferenceAutoCalibrator:
                 if area < (w_img * h_img * 0.0015):
                     continue
 
-                converted.append(
-                    {
-                        "label": str(item.get("label") or f"{idx+1:02d}").strip(),
-                        "spot_type": spot_type,
-                        "compact_only": bool(item.get("compact_only", False)),
-                        "total_meters": float(
-                            item.get("total_meters", 16.0 if spot_type == "elastic_strip" else 5.2)
-                        ),
-                        "polygon": px_poly,
-                        "initial_status": str(item.get("initial_status", "")).upper(),
-                        "confidence": float(item.get("confidence", 0.94)),
-                        "reason": str(item.get("reason", "AI 参考图自动标定")),
-                    }
-                )
+                raw_ev = item.get("is_ev")
+                if raw_ev is None and isinstance(item.get("tags"), list):
+                    raw_ev = any(
+                        str(t).lower() in ("ev", "ev_charging", "新能源", "充电桩")
+                        for t in item["tags"]
+                    )
+                ev_reason = str(item.get("ev_reason") or "").strip()
+                item_reason = str(item.get("reason", "AI 参考图自动标定"))
+                if raw_ev is None and re.search(r"充电桩|充电枪|新能源专|新能源车位|绿漆专位", item_reason):
+                    raw_ev = True
+                    ev_reason = item_reason[:32]
+
+                converted_entry: Dict[str, Any] = {
+                    "label": str(item.get("label") or f"{idx+1:02d}").strip(),
+                    "spot_type": spot_type,
+                    "compact_only": bool(item.get("compact_only", False)),
+                    "total_meters": float(
+                        item.get("total_meters", 16.0 if spot_type == "elastic_strip" else 5.2)
+                    ),
+                    "polygon": px_poly,
+                    "initial_status": str(item.get("initial_status", "")).upper(),
+                    "confidence": float(item.get("confidence", 0.94)),
+                    "reason": item_reason,
+                }
+                if raw_ev is not None:
+                    converted_entry["is_ev"] = bool(raw_ev)
+                    if ev_reason:
+                        converted_entry["ev_reason"] = ev_reason
+                converted.append(converted_entry)
 
             if not converted:
                 return [], {}, "未解析出有效面积的车位多边形"
@@ -1539,7 +1594,8 @@ class ReferenceAutoCalibrator:
             "1. 空车位（FREE）必须精确贴合地面白色分隔线、T字角标、限位器后缘，或红砖/植草砖与黑色沥青车道的分界线及砖缝列线！\n"
             "2. 有车车位（OCCUPIED）紧贴轮胎接地的铺装底面，绝不画到绿化灌木或行车道上。\n"
             "3. 相邻车位严格共用同一条分隔线端点 `[[后左x,后左y], [后右x,后右y], [前右x,前右y], [前左x,前左y]]`。\n"
-            "仅输出严格 JSON：`{\"spots\": [{\"label\":\"01\",\"spot_type\":\"standard\",\"polygon_1000\":[[x,y],...],\"initial_status\":\"FREE或OCCUPIED\",\"confidence\":0.97,\"reason\":\"...\"}]}`"
+            "4. 若特写可见后方充电桩、充电枪线或绿色新能源专位地漆，将 `is_ev` 设为 true 并填 `ev_reason`。\n"
+            "仅输出严格 JSON：`{\"spots\": [{\"label\":\"01\",\"spot_type\":\"standard\",\"is_ev\":false,\"ev_reason\":\"\",\"polygon_1000\":[[x,y],...],\"initial_status\":\"FREE或OCCUPIED\",\"confidence\":0.97,\"reason\":\"...\"}]}`"
         )
 
         content, err, _ = self.vision._post_vlm_completions(
@@ -1582,10 +1638,59 @@ class ReferenceAutoCalibrator:
                 merged["polygon"] = px_poly
                 if z_item.get("initial_status") in ("FREE", "OCCUPIED", "BLOCKED"):
                     merged["initial_status"] = str(z_item["initial_status"]).upper()
+                if z_item.get("is_ev") is True:
+                    merged["is_ev"] = True
+                    if z_item.get("ev_reason"):
+                        merged["ev_reason"] = str(z_item["ev_reason"]).strip()
                 refined_out.append(merged)
             return refined_out
         except Exception:
             return None
+
+    @staticmethod
+    def _detect_ev_ground_paint_opencv(
+        patch_bgr: Optional[np.ndarray],
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[bool, str]:
+        """Detect Chinese-standard emerald/teal EV bay epoxy ground paint on an empty stall patch.
+
+        Distinguishes cool emerald EV bay paint (`HSV H in 75..99`, saturated & uniform)
+        from warm yellow-green tree foliage (`H ~ 42..68`) and grey/terracotta brick.
+        """
+        if patch_bgr is None or patch_bgr.size == 0:
+            return False, ""
+        h, w = patch_bgr.shape[:2]
+        if h < 32 or w < 32:
+            return False, ""
+
+        # Focus on the central 68% interior of the stall ground so white border lines & curb edges don't skew stats
+        y0, y1 = int(h * 0.16), int(h * 0.84)
+        x0, x1 = int(w * 0.16), int(w * 0.84)
+        core = patch_bgr[y0:y1, x0:x1]
+        hsv = cv2.cvtColor(core, cv2.COLOR_BGR2HSV)
+        if valid_mask is not None and valid_mask.shape[:2] == (h, w):
+            m_core = valid_mask[y0:y1, x0:x1] > 127
+        else:
+            m_core = np.ones(core.shape[:2], dtype=bool)
+
+        valid_cnt = int(np.count_nonzero(m_core))
+        if valid_cnt < 120:
+            return False, ""
+
+        hue = hsv[:, :, 0]
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        emerald_mask = m_core & (hue >= 75) & (hue <= 99) & (sat >= 82) & (val >= 88)
+        emerald_ratio = float(np.count_nonzero(emerald_mask)) / float(valid_cnt)
+        if emerald_ratio < 0.34:
+            return False, ""
+
+        # Epoxy ground paint is smooth (unlike high-frequency tree foliage leaves)
+        val_std = float(np.std(val[emerald_mask]))
+        if val_std > 46.0:
+            return False, ""
+
+        return True, f"国标绿色新能源专位地漆({int(round(emerald_ratio * 100))}%)"
 
     @classmethod
     def _normalize_quad_preserve_orientation(cls, pts: List[List[float]]) -> List[List[float]]:

@@ -38,6 +38,7 @@ from app.homography import (
 )
 from app.recommender import ParkingRecommender
 from app.sitemap_generator import SiteMapGenerator
+from app.spot_tags import SPOT_TAG_CATALOG, sanitize_spot_tag_meta_for_public
 from app.state_machine import SpotStateMachine
 from app.vision_pipeline import VisionPipeline
 from app.voice_gateway import VoiceGatewayService, create_voice_http_server
@@ -82,7 +83,7 @@ def _build_mobile_overview_payload(
     Build a lightweight, privacy-sanitized read-only payload exclusively for the mobile owner viewer (:18790).
     Never exposes camera IPs/URLs/credentials/VLM keys, and never creates soft locks during passive viewing.
     """
-    vtype = vehicle_type if vehicle_type in ("sedan", "suv", "compact") else "sedan"
+    vtype = vehicle_type if vehicle_type in ("sedan", "suv", "compact", "ev") else "sedan"
     cfg = config_manager.get_public()
     ctx.fsm.check_offline_timeouts(float(cfg.get("offline_timeout_seconds", 900)))
     zones_raw = ctx.recommender.get_zone_summaries(vehicle_type=vtype)
@@ -112,6 +113,8 @@ def _build_mobile_overview_payload(
             if not sp.get("map_placed", True) or sp.get("map_x") is None or sp.get("map_y") is None:
                 continue
             is_assigned = str(sp.get("camera_id") or "UNASSIGNED") != "UNASSIGNED"
+            sp_tags = list(sp.get("tags") or [])
+            pub_tag_meta = sanitize_spot_tag_meta_for_public(sp_tags, sp.get("tag_meta"))
             placed_spots.append(
                 {
                     "spot_id": sp.get("spot_id"),
@@ -129,6 +132,11 @@ def _build_mobile_overview_payload(
                     "pending_status": sp.get("pending_status"),
                     "obstacle_type": sp.get("obstacle_type", "NONE"),
                     "action_hint": sp.get("action_hint", ""),
+                    "tags": sp_tags,
+                    "tag_meta": pub_tag_meta,
+                    "is_ev": bool(sp.get("is_ev")),
+                    "is_rentable": bool(sp.get("is_rentable")),
+                    "is_private_reserved": bool(sp.get("is_private_reserved")),
                     "map_x": sp.get("map_x"),
                     "map_y": sp.get("map_y"),
                     "map_w": sp.get("map_w"),
@@ -150,6 +158,9 @@ def _build_mobile_overview_payload(
                 "raw_free": z["raw_free"],
                 "soft_locked": z["soft_locked"],
                 "effective_free": z["effective_free"],
+                "ev_total": z.get("ev_total", 0),
+                "ev_free": z.get("ev_free", 0),
+                "rentable_count": z.get("rentable_count", 0),
                 "occupied": z["occupied"],
                 "blocked": z["blocked"],
                 "unknown": z["unknown"],
@@ -171,6 +182,9 @@ def _build_mobile_overview_payload(
             "raw_free": g["raw_free"],
             "soft_locked": g["soft_locked"],
             "effective_free": g["effective_free"],
+            "ev_total": g.get("ev_total", 0),
+            "ev_free": g.get("ev_free", 0),
+            "rentable_count": g.get("rentable_count", 0),
             "occupied": g["occupied"],
             "blocked": g["blocked"],
             "unknown": g["unknown"],
@@ -209,6 +223,9 @@ def _build_mobile_overview_payload(
 
     total_free = sum(z["effective_free"] for z in zones_raw)
     total_cap = sum(z["total_capacity"] for z in zones_raw)
+    total_ev = sum(int(z.get("ev_total") or 0) for z in zones_raw)
+    total_ev_free = sum(int(z.get("ev_free") or 0) for z in zones_raw)
+    total_rentable = sum(int(z.get("rentable_count") or 0) for z in zones_raw)
     ws_pub = ctx.get_public_workspace_profile(include_templates=False)
 
     return {
@@ -220,6 +237,10 @@ def _build_mobile_overview_payload(
         "vehicle_type": vtype,
         "total_capacity": total_cap,
         "total_effective_free": total_free,
+        "total_ev_spots": total_ev,
+        "total_ev_free": total_ev_free,
+        "total_rentable_spots": total_rentable,
+        "spot_tag_catalog": SPOT_TAG_CATALOG,
         "units": units_list,
         "zones": sanitized_zones,
         "spot_groups": sanitized_groups,
@@ -641,6 +662,10 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     )
                     return
 
+                if path == "/api/spot-tags/catalog":
+                    self._send_json({"ok": True, "catalog": SPOT_TAG_CATALOG})
+                    return
+
                 if path == "/api/overview":
                     vtype = qs.get("vehicle_type", ["sedan"])[0]
                     sel_uid = (qs.get("unit_id") or qs.get("unit") or [""])[0] or None
@@ -659,6 +684,9 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     )
                     total_free = sum(z["effective_free"] for z in zones)
                     total_cap = sum(z["total_capacity"] for z in zones)
+                    total_ev = sum(int(z.get("ev_total") or 0) for z in zones)
+                    total_ev_free = sum(int(z.get("ev_free") or 0) for z in zones)
+                    total_rentable = sum(int(z.get("rentable_count") or 0) for z in zones)
                     fe_ver = _compute_frontend_version()
                     client_ver = (self.headers.get("X-Parking-Client") or "").strip()
                     ua = self.headers.get("User-Agent") or ""
@@ -686,6 +714,10 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                             "frontend_version": fe_ver,
                             "total_capacity": total_cap,
                             "total_effective_free": total_free,
+                            "total_ev_spots": total_ev,
+                            "total_ev_free": total_ev_free,
+                            "total_rentable_spots": total_rentable,
+                            "spot_tag_catalog": SPOT_TAG_CATALOG,
                             "units": units_list,
                             "zones": zones,
                             "cameras": cams_list,
@@ -735,7 +767,7 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
                     res = ctx.recommender.recommend(
                         unit_id=unit_id,
-                        vehicle_type=vtype if vtype in ("sedan", "suv", "compact") else "sedan",
+                        vehicle_type=vtype if vtype in ("sedan", "suv", "compact", "ev") else "sedan",
                         driver_tag="手机端查看",
                         acquire_lock=False,
                         entry_gate_id=entry_gate_id,
@@ -1186,6 +1218,39 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                                 },
                             )
                     self._send_json(test_res, 200 if test_res.get("ok") else 400)
+                    return
+
+                if path == "/api/spots/tags":
+                    body = self._read_json()
+                    raw_ids = body.get("spot_ids")
+                    if raw_ids is None and body.get("spot_id"):
+                        raw_ids = [body["spot_id"]]
+                    if not isinstance(raw_ids, list) or not raw_ids:
+                        raise ValueError("请提供至少一个车位 ID (spot_id 或 spot_ids)")
+                    updated_spots = ctx.db.update_spots_tags(
+                        spot_ids=[str(x) for x in raw_ids],
+                        tags=body.get("tags") if "tags" in body else None,
+                        add_tags=body.get("add_tags") if "add_tags" in body else None,
+                        remove_tags=body.get("remove_tags") if "remove_tags" in body else None,
+                        tag_meta=body.get("tag_meta") if isinstance(body.get("tag_meta"), dict) else None,
+                        replace_meta=bool(body.get("replace_meta", False)),
+                    )
+                    ctx.push_event(
+                        {
+                            "ts": time.time(),
+                            "source": "平面图车位标签管理",
+                            "camera_id": updated_spots[0]["camera_id"] if updated_spots else "",
+                            "elapsed_ms": 0.0,
+                            "processed_spots": len(updated_spots),
+                        }
+                    )
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "updated_count": len(updated_spots),
+                            "spots": updated_spots,
+                        }
+                    )
                     return
 
                 if path == "/api/cameras":
@@ -2433,7 +2498,7 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     entry_gate_id = (qs.get("entry_gate_id") or qs.get("gate_id") or [""])[0] or None
                     res = ctx.recommender.recommend(
                         unit_id=unit_id,
-                        vehicle_type=vtype if vtype in ("sedan", "suv", "compact") else "sedan",
+                        vehicle_type=vtype if vtype in ("sedan", "suv", "compact", "ev") else "sedan",
                         driver_tag="手机端查看",
                         acquire_lock=False,
                         entry_gate_id=entry_gate_id,

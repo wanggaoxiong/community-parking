@@ -60,6 +60,18 @@
             </span>
           </div>
 
+          <button
+            type="button"
+            id="btnEvModeToggle"
+            class="m-ev-mode-btn"
+            hidden
+            aria-pressed="false"
+            title="开启新能源寻桩优先模式（优先推荐空闲充电桩车位）"
+          >
+            <span class="m-ev-bolt" aria-hidden="true">⚡</span>
+            <span id="evModeLabel">寻桩</span>
+          </button>
+
           <button type="button" id="btnSpeakAction" class="m-speak-btn" aria-live="polite">
             <svg class="m-icon-svg" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M2.5 6.2h2.3L8.2 3.4v9.2L4.8 9.8H2.5a.7.7 0 0 1-.7-.7V6.9c0-.4.3-.7.7-.7Z"/>
@@ -163,11 +175,29 @@
       <!-- 轻触车位/停车带时的浮动微提示 -->
       <div class="m-map-toast" id="mapSpotToast" hidden></div>
 
+      <!-- 轻触 ⚡新能源 / 🤝对外招租 车位时的 Apple Maps 浮动详情卡 -->
+      <div class="m-spot-sheet" id="mobileSpotSheet" hidden role="dialog" aria-label="车位标签与共享招租详情">
+        <div class="m-ss-head">
+          <div class="m-ss-titles">
+            <span class="m-ss-zone" id="mobSheetZone">小区车位</span>
+            <div class="m-ss-title-row">
+              <strong id="mobSheetTitle">01号位</strong>
+              <span class="m-ss-status" id="mobSheetStatus">空闲可停</span>
+            </div>
+          </div>
+          <button type="button" id="btnCloseMobSpotSheet" class="m-ss-close" aria-label="关闭详情">✕</button>
+        </div>
+        <div class="m-ss-tags" id="mobSheetTags"></div>
+        <div class="m-ss-details" id="mobSheetDetails"></div>
+      </div>
+
       <!-- 底部悬浮胶囊图例 -->
       <footer class="m-map-legend" aria-label="图例说明">
         <span class="lg-item"><i class="lg-dot lg-free"></i>空闲</span>
         <span class="lg-item"><i class="lg-dot lg-occ"></i>已停</span>
         <span class="lg-item"><i class="lg-dot lg-blk"></i>禁停</span>
+        <span class="lg-item" id="mobLegendEv" hidden><i class="lg-ev-bolt">⚡</i>充电</span>
+        <span class="lg-item" id="mobLegendRent" hidden><i class="lg-dot lg-rent"></i>招租</span>
         <span class="lg-sep" aria-hidden="true"></span>
         <span class="lg-item"><i class="lg-line lg-walk"></i>步行</span>
         <span class="lg-item"><i class="lg-line lg-drive"></i>行车</span>

@@ -154,6 +154,7 @@
                 <div class="drv-row-ctrl">
                   <select id="vehicleTypeSelect" class="drv-clean-select">
                     <option value="sedan">🚗 标准轿车</option>
+                    <option value="ev">⚡ 新能源寻桩</option>
                     <option value="suv">🚙 中大型 SUV</option>
                   </select>
                 </div>
@@ -298,10 +299,34 @@
             <span><i class="swatch sw-occupied"></i>已停</span>
             <span><i class="swatch sw-blocked"></i>禁停障碍</span>
             <span><i class="swatch sw-unknown"></i>待绑/待抓拍</span>
+            <span><i class="swatch sw-ev"></i>⚡ 新能源桩</span>
+            <span><i class="swatch sw-rent"></i>租 对外招租</span>
             <span><i class="swatch sw-route"></i>🚗 2F车行道与引导</span>
             <span><i class="swatch sw-walkway"></i>🚶 2F人行步道</span>
             <span><i class="swatch sw-door"></i>🚪 单元门测距</span>
             <span><i class="swatch sw-pending"></i>防抖复核</span>
+          </div>
+
+          <!-- Spot Tag Filter Pills & Direct-Click Tagging Bar -->
+          <div id="spotTagFilterBar" class="spot-tag-filter-bar" role="region" aria-label="车位标签筛选与快捷打标">
+            <div class="tag-filter-pills" id="spotTagFilterPills">
+              <button type="button" class="tag-filter-pill is-active" data-tag-filter="all">
+                全部车位 <em id="tagCountAll">0</em>
+              </button>
+              <button type="button" class="tag-filter-pill tag-ev" data-tag-filter="ev_charging" title="筛选高亮所有新能源充电车位">
+                <span class="tf-bolt">⚡</span> 新能源 <em id="tagCountEv">0</em>
+              </button>
+              <button type="button" class="tag-filter-pill tag-rent" data-tag-filter="rentable" title="筛选高亮对外出租/错峰共享车位">
+                🤝 对外招租 <em id="tagCountRent">0</em>
+              </button>
+              <button type="button" class="tag-filter-pill tag-priv" data-tag-filter="private" title="筛选高亮业主专属固定产权车位">
+                🔒 产权位 <em id="tagCountPriv">0</em>
+              </button>
+              <button type="button" class="tag-filter-pill tag-wide" data-tag-filter="large_friendly" title="筛选高亮 SUV 友好的宽体大车位">
+                🚙 宽体位 <em id="tagCountWide">0</em>
+              </button>
+            </div>
+            <span class="tag-filter-hint" id="spotTagQuickHint">轻触平面图车位即可打标/设招租 · Shift 多选批量改标</span>
           </div>
 
           <!-- Unbound Calibrated Camera Quick-Bind Prompt (prevents phantom stalls & links camera to drawn group) -->
@@ -427,6 +452,7 @@
                   <div class="multi-select-bar">
                     <span id="multiSelectCountBadge" class="multi-sel-badge">未选中 · 拖框或 Shift 点选多车</span>
                     <div class="multi-select-actions">
+                      <button id="btnEditSelectedSpotTags" class="btn-apple btn-apple-tinted btn-apple-xs" type="button" title="为当前选中的 1 个或多个车位批量设置 ⚡新能源 / 🤝对外招租 / 🔒产权位 标签">🏷️ 车位标签</button>
                       <button id="btnSelectGroupSpots" class="btn-apple btn-apple-secondary btn-apple-xs" type="button" title="一键选中当前分组内的全部车位">全选本组</button>
                       <button id="btnSelectAllSpots" class="btn-apple btn-apple-secondary btn-apple-xs" type="button" title="一键选中全图所有车位 (快捷键 ⌘A / Ctrl+A)">全选全图</button>
                       <button id="btnClearSpotSelection" class="btn-apple btn-apple-secondary btn-apple-xs" type="button" title="清空当前多选状态 (快捷键 Esc)">清空</button>
@@ -2455,6 +2481,80 @@
           <button id="btnCancelWorkspaceModal" class="btn-apple btn-apple-ghost" type="button">取消</button>
           <button id="btnSaveWorkspaceModal" class="btn-apple btn-apple-primary" type="button">保存工作空间设置</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== FIGMA-STYLE FLOATING POPOVER: SPOT TAGS & RENTAL INSPECTOR ==================== -->
+  <div id="spotTagPopover" class="spot-tag-popover hidden" role="dialog" aria-modal="false" aria-labelledby="spotTagPopoverTitle">
+    <div class="stp-head">
+      <div class="stp-title-wrap">
+        <span class="stp-eyebrow" id="spotTagPopoverEyebrow">车位精细化标签管理</span>
+        <div class="stp-title-row">
+          <strong id="spotTagPopoverTitle">车位 01</strong>
+          <span id="spotTagPopoverStatusPill" class="stp-status-pill">空闲</span>
+        </div>
+      </div>
+      <div class="stp-head-actions">
+        <button type="button" id="btnSelectSameGroupInTagPopover" class="stp-mini-action" title="一键选中同排车位组批量同步标签">同组全选</button>
+        <button type="button" id="btnCloseSpotTagPopover" class="stp-close-btn" aria-label="关闭标签面板">✕</button>
+      </div>
+    </div>
+
+    <div class="stp-body">
+      <div class="stp-sec-label">点选启用或移除标签（可多选叠加）</div>
+      <div class="stp-tag-grid" id="spotTagBuiltinGrid"></div>
+
+      <div class="stp-custom-row">
+        <input type="text" id="spotTagCustomInput" class="stp-input stp-custom-input" placeholder="+ 输入自定义标签（如 子母位 / 企业专享）按回车添加" maxlength="16" />
+        <button type="button" id="btnAddCustomSpotTag" class="btn-apple btn-apple-secondary btn-apple-xs">添加</button>
+      </div>
+      <div id="spotTagCustomChips" class="stp-custom-chips"></div>
+
+      <!-- EV Charger Spec Drawer (shown when ev_charging is active) -->
+      <div id="spotTagEvDrawer" class="stp-context-drawer stp-ev-drawer hidden">
+        <div class="stp-drawer-head">
+          <span>⚡ 新能源充电桩规格备注</span>
+          <em id="spotTagEvAutoBadge" class="stp-auto-badge hidden">AI 标定自动识别</em>
+        </div>
+        <div class="stp-preset-chips" data-target-input="spotTagChargerInput">
+          <button type="button" class="stp-preset-chip" data-val="7kW交流慢充">7kW慢充</button>
+          <button type="button" class="stp-preset-chip" data-val="21kW直流充">21kW直流</button>
+          <button type="button" class="stp-preset-chip" data-val="60kW直流快充">60kW快充</button>
+          <button type="button" class="stp-preset-chip" data-val="120kW超充">120kW超充</button>
+        </div>
+        <input type="text" id="spotTagChargerInput" class="stp-input" placeholder="选填功率说明，如 7kW慢充 / 扫码即充" maxlength="32" />
+      </div>
+
+      <!-- Rental / Time-Share Drawer (shown when rentable is active) -->
+      <div id="spotTagRentalDrawer" class="stp-context-drawer stp-rental-drawer hidden">
+        <div class="stp-drawer-head">
+          <span>🤝 对外招租 / 错峰共享详情（同步展示于 :18790 车主端）</span>
+        </div>
+        <div class="stp-preset-chips" data-target-input="spotTagRentalWindowInput">
+          <button type="button" class="stp-preset-chip" data-val="全天包月长租">全天包月</button>
+          <button type="button" class="stp-preset-chip" data-val="工作日 08:30-18:30">工作日白天</button>
+          <button type="button" class="stp-preset-chip" data-val="夜间 19:00-次日07:30">夜间错峰</button>
+        </div>
+        <div class="stp-rental-fields">
+          <input type="text" id="spotTagRentalWindowInput" class="stp-input" placeholder="可租时段，如 全天包月 / 工作日 08:30-18:30" maxlength="48" />
+          <div class="stp-grid-2">
+            <input type="text" id="spotTagRentalPriceInput" class="stp-input" placeholder="租金，如 ¥180/月" maxlength="32" />
+            <input type="text" id="spotTagRentalContactInput" class="stp-input" placeholder="联系办理，如 物业管家电话/微信" maxlength="64" />
+          </div>
+        </div>
+      </div>
+
+      <div class="stp-note-wrap">
+        <input type="text" id="spotTagNoteInput" class="stp-input" placeholder="内部管理备注（仅管理后台可见，选填）" maxlength="80" />
+      </div>
+    </div>
+
+    <div class="stp-foot">
+      <button type="button" id="btnClearSpotTags" class="btn-apple btn-apple-ghost btn-apple-xs map-danger-btn">清空标签</button>
+      <div class="stp-foot-right">
+        <button type="button" id="btnCancelSpotTagPopover" class="btn-apple btn-apple-ghost btn-apple-sm">取消</button>
+        <button type="button" id="btnSaveSpotTags" class="btn-apple btn-apple-primary btn-apple-sm">保存标签</button>
       </div>
     </div>
   </div>

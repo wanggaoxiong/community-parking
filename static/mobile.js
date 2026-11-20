@@ -17,6 +17,7 @@
 
   const STORAGE_KEYS = {
     unitId: `parking_mobile_${WS_KEY_PREFIX}unit_id`,
+    vehicleType: `parking_mobile_${WS_KEY_PREFIX}vehicle_type`,
     repeatCount: `parking_mobile_${WS_KEY_PREFIX}repeat_count`,
     continuous: `parking_mobile_${WS_KEY_PREFIX}continuous`,
     showBackdrop: `parking_mobile_${WS_KEY_PREFIX}show_backdrop`,
@@ -33,7 +34,8 @@
     preferredVoiceLang: "",
     overview: null,
     unitId: "",
-    repeatCount: 2, // 1 | 2 | 0 (mute)
+    vehicleType: "sedan", // "sedan" | "ev"
+    repeatCount: 2, // 1 | 2
     continuousBroadcast: true,
     sessionMutedByQuery: false,
     embedMode: false,
@@ -74,6 +76,8 @@
     totalFreePill: document.getElementById("totalFreePill"),
     totalFreeNum: document.getElementById("totalFreeNum"),
     unitSelect: document.getElementById("mobileUnitSelect"),
+    btnEvModeToggle: document.getElementById("btnEvModeToggle"),
+    evModeLabel: document.getElementById("evModeLabel"),
     btnSpeakAction: document.getElementById("btnSpeakAction"),
     repeatModeGroup: document.getElementById("repeatModeGroup"),
     voiceSelect: document.getElementById("mobileVoiceSelect"),
@@ -93,6 +97,15 @@
     btnZoomReset: document.getElementById("btnZoomReset"),
     btnBackdropToggle: document.getElementById("btnBackdropToggle"),
     mapSpotToast: document.getElementById("mapSpotToast"),
+    spotSheet: document.getElementById("mobileSpotSheet"),
+    mobSheetZone: document.getElementById("mobSheetZone"),
+    mobSheetTitle: document.getElementById("mobSheetTitle"),
+    mobSheetStatus: document.getElementById("mobSheetStatus"),
+    mobSheetTags: document.getElementById("mobSheetTags"),
+    mobSheetDetails: document.getElementById("mobSheetDetails"),
+    btnCloseMobSpotSheet: document.getElementById("btnCloseMobSpotSheet"),
+    mobLegendEv: document.getElementById("mobLegendEv"),
+    mobLegendRent: document.getElementById("mobLegendRent"),
     authCard: document.getElementById("mobileAuthCard"),
     authTitle: document.getElementById("mobileAuthTitle"),
     tokenInput: document.getElementById("mobileTokenInput"),
@@ -149,6 +162,10 @@
       const savedUnit = (localStorage.getItem(STORAGE_KEYS.unitId) || "").trim();
       state.unitId = queryUnit || savedUnit || "";
 
+      const qVeh = (urlParams.get("vehicle_type") || urlParams.get("vehicle") || "").trim();
+      const savedVeh = (localStorage.getItem(STORAGE_KEYS.vehicleType) || "").trim();
+      state.vehicleType = (qVeh || savedVeh) === "ev" ? "ev" : "sedan";
+
       const savedRepeat = localStorage.getItem(STORAGE_KEYS.repeatCount);
       const savedCont = localStorage.getItem(STORAGE_KEYS.continuous);
       if (savedRepeat === "1" || savedRepeat === "2") {
@@ -200,6 +217,7 @@
       if (state.unitId) {
         localStorage.setItem(STORAGE_KEYS.unitId, state.unitId);
       }
+      localStorage.setItem(STORAGE_KEYS.vehicleType, state.vehicleType || "sedan");
       localStorage.setItem(STORAGE_KEYS.repeatCount, String(state.repeatCount));
       localStorage.setItem(
         STORAGE_KEYS.continuous,
@@ -1098,21 +1116,39 @@
         ? "占道禁停"
         : "待识别/离线";
 
+      const spTags = Array.isArray(sp.tags) ? sp.tags : [];
+      const spMeta = sp.tag_meta || {};
+      const isEvSpot = Boolean(sp.is_ev || spTags.includes("ev_charging"));
+      const isRentSpot = Boolean(sp.is_rentable || spTags.includes("rentable"));
+      const isPrivSpot = Boolean(sp.is_private_reserved || spTags.includes("private"));
+      const isAccSpot = spTags.includes("accessible");
+      const isWideSpot = spTags.includes("large_friendly");
+
       const pendTxt = sp.pending_status ? " · 双帧防抖确认中" : "";
       const hintTxt = sp.action_hint ? ` · ${sp.action_hint}` : "";
+      const evTxt = isEvSpot ? ` · ⚡新能源充电位` : "";
+      const rentTxt = isRentSpot
+        ? ` · 🤝对外招租${spMeta.rental_price ? `(${spMeta.rental_price})` : ""}`
+        : isPrivSpot
+        ? " · 🔒业主专属位"
+        : "";
       const spotToast = `${sp.group_name || sp.zone_name || sp.zone_id} · ${
         sp.label
-      }号位：${statusCn}${pendTxt}${hintTxt}`;
+      }号位：${statusCn}${evTxt}${rentTxt}${pendTxt}${hintTxt}`;
 
-      const outerStroke = isUnassigned ? "#F59E0B" : "rgba(15, 23, 42, 0.36)";
-      const outerStrokeW = isUnassigned ? 0.26 : 0.2;
+      const outerStroke = isUnassigned
+        ? "#F59E0B"
+        : isEvSpot
+        ? "#059669"
+        : "rgba(15, 23, 42, 0.36)";
+      const outerStrokeW = isUnassigned ? 0.26 : isEvSpot ? 0.28 : 0.2;
       const outerDash = isUnassigned ? 'stroke-dasharray="0.65,0.4"' : "";
 
       html += `<g transform="translate(${sx.toFixed(2)} ${sy.toFixed(
         2
-      )}) rotate(${angle.toFixed(1)})" data-spot-toast="${escapeHtml(
-        spotToast
-      )}">`;
+      )}) rotate(${angle.toFixed(1)})" data-spot-id="${escapeHtml(
+        sp.spot_id || ""
+      )}" data-spot-toast="${escapeHtml(spotToast)}">`;
 
       if (isRecZone) {
         html += `<rect x="${(-w / 2 - 0.45).toFixed(2)}" y="${(
@@ -1227,6 +1263,42 @@
           )}" font-size="${fontSz}" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeHtml(
             shortLbl
           )}</text>
+        </g>`;
+      }
+
+      const badgeR = Math.max(0.56, Math.min(0.82, minDim * 0.38));
+      if (isEvSpot) {
+        const bx = +(w * 0.38).toFixed(2);
+        const by = +(-h * 0.38).toFixed(2);
+        const bs = (badgeR / 0.68).toFixed(2);
+        html += `<g transform="translate(${bx} ${by}) rotate(${(-angle).toFixed(
+          1
+        )}) scale(${bs})" pointer-events="none">
+          <circle cx="0" cy="0" r="0.68" fill="#064E3B" stroke="#FACC15" stroke-width="0.16"/>
+          <polygon points="0.08,-0.44 -0.32,0.05 -0.02,0.05 -0.10,0.44 0.32,-0.05 0.02,-0.05" fill="#FACC15"/>
+        </g>`;
+      }
+      const secBadge = isRentSpot
+        ? { txt: "租", bg: "#0071E3" }
+        : isPrivSpot
+        ? { txt: "专", bg: "#4F46E5" }
+        : isAccSpot
+        ? { txt: "♿", bg: "#7C3AED" }
+        : isWideSpot
+        ? { txt: "宽", bg: "#0284C7" }
+        : null;
+      if (secBadge) {
+        const sbx = +(-w * 0.38).toFixed(2);
+        const sby = +(-h * 0.38).toFixed(2);
+        html += `<g transform="translate(${sbx} ${sby}) rotate(${(-angle).toFixed(
+          1
+        )})" pointer-events="none">
+          <circle cx="0" cy="0" r="${badgeR.toFixed(2)}" fill="${secBadge.bg}" stroke="#FFFFFF" stroke-width="0.15"/>
+          <text x="0" y="${(badgeR * 0.38).toFixed(2)}" font-size="${(
+          badgeR * 1.08
+        ).toFixed(2)}" fill="#FFFFFF" font-weight="800" text-anchor="middle">${
+          secBadge.txt
+        }</text>
         </g>`;
       }
 
@@ -1688,8 +1760,13 @@
     state.fetchAbortCtrl = ctrl;
     state.fetching = true;
     try {
-      const baseOv = state.unitId
-        ? `/api/mobile/overview?unit_id=${encodeURIComponent(state.unitId)}`
+      const ovParams = new URLSearchParams();
+      if (state.unitId) ovParams.set("unit_id", state.unitId);
+      if (state.vehicleType && state.vehicleType !== "sedan") {
+        ovParams.set("vehicle_type", state.vehicleType);
+      }
+      const baseOv = ovParams.toString()
+        ? `/api/mobile/overview?${ovParams.toString()}`
         : "/api/mobile/overview";
       const resp = await fetch(appendWorkspaceQuery(baseOv), {
         cache: "no-store",
@@ -1742,6 +1819,23 @@
       );
       els.totalFreeNum.textContent = String(totalFree);
       els.totalFreePill.classList.toggle("is-full", totalFree <= 0);
+
+      const totalEvSpots = Number(data.total_ev_spots || 0);
+      const totalEvFree = Number(data.total_ev_free || 0);
+      const totalRentable = Number(data.total_rentable_spots || 0);
+      if (els.btnEvModeToggle) {
+        const showEvBtn = totalEvSpots > 0 || state.vehicleType === "ev";
+        els.btnEvModeToggle.hidden = !showEvBtn;
+        const evOn = state.vehicleType === "ev";
+        els.btnEvModeToggle.classList.toggle("is-active", evOn);
+        els.btnEvModeToggle.setAttribute("aria-pressed", evOn ? "true" : "false");
+        if (els.evModeLabel) {
+          els.evModeLabel.textContent =
+            totalEvSpots > 0 ? `充电(${totalEvFree})` : "寻桩";
+        }
+      }
+      if (els.mobLegendEv) els.mobLegendEv.hidden = totalEvSpots <= 0;
+      if (els.mobLegendRent) els.mobLegendRent.hidden = totalRentable <= 0;
 
       const resolvedUnit = data.selected_unit_id || state.unitId;
       if (resolvedUnit && resolvedUnit !== state.unitId) {
@@ -1912,8 +2006,17 @@
           tapStartPt = null;
           return;
         }
+        const spotNode = tapOriginTarget.closest("[data-spot-id]");
+        if (spotNode) {
+          const sid = spotNode.getAttribute("data-spot-id");
+          if (sid && openMobileSpotSheetIfRich(sid)) {
+            tapStartPt = null;
+            return;
+          }
+        }
         const toastNode = tapOriginTarget.closest("[data-spot-toast]");
         if (toastNode) {
+          if (els.spotSheet) els.spotSheet.hidden = true;
           showMapToast(toastNode.getAttribute("data-spot-toast"));
         }
       }
@@ -1948,6 +2051,92 @@
   // Control Events & Lifecycle
   // ---------------------------------------------------------------------------
 
+  function openMobileSpotSheetIfRich(spotId) {
+    if (!els.spotSheet || !state.overview) return false;
+    let found = null;
+    for (const z of state.overview.zones || []) {
+      for (const sp of z.spots || []) {
+        if (sp.spot_id === spotId) {
+          found = { ...sp, zone_name: sp.zone_name || z.name };
+          break;
+        }
+      }
+      if (found) break;
+    }
+    if (!found) return false;
+    const tags = Array.isArray(found.tags) ? found.tags : [];
+    const meta = found.tag_meta || {};
+    const hasRichTags =
+      Boolean(found.is_ev || found.is_rentable || found.is_private_reserved) ||
+      tags.length > 0;
+    if (!hasRichTags) return false;
+
+    const effSt = found.effective_status || found.status || "FREE";
+    const stCn =
+      found.camera_id === "UNASSIGNED"
+        ? "待接入"
+        : effSt === "FREE"
+        ? "空闲可停"
+        : effSt === "OCCUPIED"
+        ? "已停车辆"
+        : effSt === "BLOCKED"
+        ? "占道禁停"
+        : "待刷新";
+
+    if (els.mobSheetZone) {
+      els.mobSheetZone.textContent = found.group_name || found.zone_name || "小区地面车位";
+    }
+    if (els.mobSheetTitle) {
+      els.mobSheetTitle.textContent = `${found.label} 号车位`;
+    }
+    if (els.mobSheetStatus) {
+      els.mobSheetStatus.textContent = stCn;
+      els.mobSheetStatus.className = `m-ss-status${effSt !== "FREE" ? " is-occ" : ""}`;
+    }
+
+    const catMap = {
+      ev_charging: { label: "⚡ 新能源充电", cls: "is-ev" },
+      rentable: { label: "🤝 对外招租/共享", cls: "is-rent" },
+      private: { label: "🔒 产权专属位", cls: "" },
+      large_friendly: { label: "🚙 宽体大车位", cls: "" },
+      accessible: { label: "♿ 无障碍车位", cls: "" },
+      visitor: { label: "访客临停", cls: "" },
+    };
+    const pillList = tags.length ? tags : found.is_ev ? ["ev_charging"] : [];
+    if (els.mobSheetTags) {
+      els.mobSheetTags.innerHTML = pillList
+        .map((t) => {
+          const info = catMap[t] || { label: `#${t}`, cls: "" };
+          return `<span class="m-ss-tag-pill ${info.cls}">${escapeHtml(info.label)}</span>`;
+        })
+        .join("");
+    }
+
+    const detailLines = [];
+    if (meta.charger_power) {
+      detailLines.push(`<div>⚡ 充电规格：<strong>${escapeHtml(meta.charger_power)}</strong></div>`);
+    }
+    if (meta.rental_window || meta.rental_price) {
+      const rp = [meta.rental_window, meta.rental_price].filter(Boolean).join(" · ");
+      detailLines.push(`<div>🤝 共享招租：<strong>${escapeHtml(rp)}</strong></div>`);
+    }
+    if (meta.rental_contact) {
+      const telMatch = String(meta.rental_contact).match(/(\+?\d[\d-]{6,14}\d)/);
+      const actionHtml = telMatch
+        ? `<a class="m-ss-action-btn" href="tel:${escapeHtml(telMatch[1].replace(/-/g, ""))}">拨号咨询</a>`
+        : `<button type="button" class="m-ss-action-btn" data-copy-contact="${escapeHtml(meta.rental_contact)}">复制联系</button>`;
+      detailLines.push(
+        `<div class="m-ss-contact-row"><span>联系办理：${escapeHtml(meta.rental_contact)}</span>${actionHtml}</div>`
+      );
+    }
+    if (els.mobSheetDetails) {
+      els.mobSheetDetails.innerHTML = detailLines.join("");
+    }
+    if (els.mapSpotToast) els.mapSpotToast.hidden = true;
+    els.spotSheet.hidden = false;
+    return true;
+  }
+
   function markUserGesture(ev) {
     const wasBlocked = state.speechBlockedByAutoplay;
     state.userInteracted = true;
@@ -1955,7 +2144,7 @@
     // Do not auto-trigger on pointerdown if the user is clicking a broadcast/unit control
     // whose own click/change handler will immediately speak (prevents start-then-cancel race!).
     const targetEl = ev && ev.target && ev.target.closest
-      ? ev.target.closest("#btnSpeakAction, #mobileUnitSelect, #repeatModeGroup, #btnContinuousToggle, #mobileVoiceSelect")
+      ? ev.target.closest("#btnSpeakAction, #btnEvModeToggle, #mobileUnitSelect, #repeatModeGroup, #btnContinuousToggle, #mobileVoiceSelect")
       : null;
     if (
       !targetEl &&
@@ -1979,6 +2168,32 @@
       state.userInteracted = true;
       changeDestination(els.unitSelect.value, true);
     });
+
+    if (els.btnEvModeToggle) {
+      els.btnEvModeToggle.addEventListener("click", () => {
+        state.userInteracted = true;
+        state.vehicleType = state.vehicleType === "ev" ? "sedan" : "ev";
+        persistSettings();
+        fetchOverview({ forceSpeak: state.continuousBroadcast });
+      });
+    }
+
+    if (els.btnCloseMobSpotSheet) {
+      els.btnCloseMobSpotSheet.addEventListener("click", () => {
+        if (els.spotSheet) els.spotSheet.hidden = true;
+      });
+    }
+    if (els.spotSheet) {
+      els.spotSheet.addEventListener("click", (ev) => {
+        const copyBtn = ev.target.closest("[data-copy-contact]");
+        if (!copyBtn) return;
+        const txt = copyBtn.getAttribute("data-copy-contact") || "";
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(txt).catch(() => {});
+        }
+        copyBtn.textContent = "已复制";
+      });
+    }
 
     if (els.voiceSelect) {
       els.voiceSelect.addEventListener("change", () => {

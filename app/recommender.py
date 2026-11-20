@@ -14,6 +14,7 @@ from app.database import (
     extract_building_info,
     natural_unit_sort_key,
 )
+from app.spot_tags import is_spot_privately_reserved
 from app.workspaces import (
     render_workspace_broadcast_text,
     render_workspace_display_card_text,
@@ -111,6 +112,10 @@ class ParkingRecommender:
             movable_free = 0
             pedestrian_free = 0
             compact_free = 0
+            ev_total = 0
+            ev_free = 0
+            rentable_count = 0
+            private_count = 0
             occupied = 0
             blocked = 0
             pending_confirming = 0
@@ -122,7 +127,20 @@ class ParkingRecommender:
             enriched_zone_spots: List[Dict[str, Any]] = []
             for sp in z_spots:
                 cap = int(sp["capacity"])
-                total_capacity += cap
+                sp_tags = list(sp.get("tags") or [])
+                sp_tag_meta = dict(sp.get("tag_meta") or {})
+                is_ev_spot = "ev_charging" in sp_tags
+                is_rentable_spot = "rentable" in sp_tags
+                is_private_spot = "private" in sp_tags
+                private_reserved = is_spot_privately_reserved(sp_tags, sp_tag_meta)
+                if is_ev_spot:
+                    ev_total += cap
+                if is_rentable_spot:
+                    rentable_count += 1
+                if is_private_spot:
+                    private_count += 1
+                if not private_reserved:
+                    total_capacity += cap
                 is_spot_calibrated = sp.get("last_engine") != "seed" or bool(
                     cams_by_id.get(sp["camera_id"], {}).get("has_template")
                 )
@@ -141,6 +159,7 @@ class ParkingRecommender:
                 # - If an OCCUPIED/BLOCKED spot detects FREE in Frame-1, wait for debounce before releasing.
                 effective_status = st
                 eff_free_u = 0
+                visual_free_u = 0
                 eff_occ_u = int(sp["occupied_units"])
 
                 if st == "FREE":
@@ -154,67 +173,84 @@ class ParkingRecommender:
                             pending_confirming += max(1, eff_free_u)
                             eff_free_u = 0
                             effective_status = "BLOCKED"
-                            blocked += 1
+                            if not private_reserved:
+                                blocked += 1
                         elif eff_free_u <= 0 and pend == "OCCUPIED":
                             effective_status = "OCCUPIED"
-                        raw_free += eff_free_u
-                        clean_free += eff_free_u
-                        eff_occ_u = max(eff_occ_u, cap - eff_free_u) if eff_free_u < cap else eff_occ_u
-                        occupied += eff_occ_u
+                        visual_free_u = eff_free_u
+                        if private_reserved:
+                            eff_free_u = 0
+                        else:
+                            raw_free += eff_free_u
+                            clean_free += eff_free_u
+                            if is_ev_spot:
+                                ev_free += eff_free_u
+                            eff_occ_u = max(eff_occ_u, cap - eff_free_u) if eff_free_u < cap else eff_occ_u
+                            occupied += eff_occ_u
                     else:
                         if pend == "OCCUPIED":
                             effective_status = "OCCUPIED"
                             eff_free_u = 0
                             eff_occ_u = 1
-                            occupied += 1
+                            if not private_reserved:
+                                occupied += 1
                             pending_confirming += 1
                         elif pend == "BLOCKED":
                             effective_status = "BLOCKED"
                             eff_free_u = 0
                             eff_occ_u = 0
-                            blocked += 1
+                            if not private_reserved:
+                                blocked += 1
                             pending_confirming += 1
                         else:
-                            eff_free_u = int(sp["free_units"])
-                            counted = False
-                            if sp["compact_only"]:
-                                compact_free += eff_free_u
-                                if vehicle_type != "suv":
+                            visual_free_u = int(sp["free_units"])
+                            if private_reserved:
+                                eff_free_u = 0
+                            else:
+                                eff_free_u = visual_free_u
+                                counted = False
+                                if sp["compact_only"] and "large_friendly" not in sp_tags:
+                                    compact_free += eff_free_u
+                                    if vehicle_type != "suv":
+                                        raw_free += eff_free_u
+                                        counted = True
+                                else:
                                     raw_free += eff_free_u
                                     counted = True
-                            else:
-                                raw_free += eff_free_u
-                                counted = True
-                            if counted and eff_free_u > 0:
-                                if obs_type == "movable":
-                                    movable_free += eff_free_u
-                                    actionable_hints.append(
-                                        {
-                                            "label": sp["label"],
-                                            "obstacle_type": "movable",
-                                            "hint": act_hint or sp["last_reason"] or "有可移轻物，移开即可停入",
-                                        }
-                                    )
-                                elif obs_type == "pedestrian":
-                                    pedestrian_free += eff_free_u
-                                    actionable_hints.append(
-                                        {
-                                            "label": sp["label"],
-                                            "obstacle_type": "pedestrian",
-                                            "hint": act_hint or "临时有人驻留，车辆靠近会自动让开",
-                                        }
-                                    )
-                                else:
-                                    clean_free += eff_free_u
-                            occupied += eff_occ_u
+                                if counted and eff_free_u > 0:
+                                    if is_ev_spot:
+                                        ev_free += eff_free_u
+                                    if obs_type == "movable":
+                                        movable_free += eff_free_u
+                                        actionable_hints.append(
+                                            {
+                                                "label": sp["label"],
+                                                "obstacle_type": "movable",
+                                                "hint": act_hint or sp["last_reason"] or "有可移轻物，移开即可停入",
+                                            }
+                                        )
+                                    elif obs_type == "pedestrian":
+                                        pedestrian_free += eff_free_u
+                                        actionable_hints.append(
+                                            {
+                                                "label": sp["label"],
+                                                "obstacle_type": "pedestrian",
+                                                "hint": act_hint or "临时有人驻留，车辆靠近会自动让开",
+                                            }
+                                        )
+                                    else:
+                                        clean_free += eff_free_u
+                                occupied += eff_occ_u
                 elif st == "OCCUPIED":
                     eff_occ_u = max(1, int(sp["occupied_units"]))
-                    occupied += eff_occ_u
+                    if not private_reserved:
+                        occupied += eff_occ_u
                     if pend in ("FREE", "BLOCKED"):
                         pending_confirming += 1
                 elif st == "BLOCKED":
-                    blocked += 1
-                    if act_hint:
+                    if not private_reserved:
+                        blocked += 1
+                    if act_hint and not private_reserved:
                         actionable_hints.append(
                             {
                                 "label": sp["label"],
@@ -225,7 +261,8 @@ class ParkingRecommender:
                     if pend in ("FREE", "OCCUPIED"):
                         pending_confirming += 1
                 else:
-                    unknown += cap
+                    if not private_reserved:
+                        unknown += cap
 
                 cam_obj = cams_by_id.get(sp["camera_id"])
                 cam_display_name = (
@@ -255,11 +292,17 @@ class ParkingRecommender:
                         "obstacle_type": obs_type,
                         "action_hint": act_hint,
                         "free_units": eff_free_u,
+                        "visual_free_units": visual_free_u,
                         "committed_free_units": sp["free_units"],
                         "occupied_units": eff_occ_u,
                         "total_meters": sp["total_meters"],
                         "last_reason": sp["last_reason"],
                         "is_calibrated": is_spot_calibrated,
+                        "tags": sp_tags,
+                        "tag_meta": sp_tag_meta,
+                        "is_ev": is_ev_spot,
+                        "is_rentable": is_rentable_spot,
+                        "is_private_reserved": private_reserved,
                         "map_x": sp.get("map_x"),
                         "map_y": sp.get("map_y"),
                         "map_w": sp.get("map_w"),
@@ -311,6 +354,10 @@ class ParkingRecommender:
                     "movable_free": movable_free,
                     "pedestrian_free": pedestrian_free,
                     "compact_free": compact_free,
+                    "ev_total": ev_total,
+                    "ev_free": max(0, min(ev_free, effective_free)),
+                    "rentable_count": rentable_count,
+                    "private_count": private_count,
                     "soft_locked": soft_locked,
                     "effective_free": effective_free,
                     "occupied": occupied,
@@ -553,20 +600,37 @@ class ParkingRecommender:
             )
             gname = next((str(s.get("group_name") or "").strip() for s in g_spots if str(s.get("group_name") or "").strip()), "") or gc
 
-            total_cap = sum(int(s.get("capacity") or 1) for s in g_spots)
+            total_cap = sum(
+                int(s.get("capacity") or 1)
+                for s in g_spots
+                if not bool(s.get("is_private_reserved"))
+            )
             raw_free_grp = 0
             clean_free = 0
             movable_free = 0
             ped_free = 0
+            ev_total_grp = 0
+            ev_free_grp = 0
+            rentable_grp = 0
             occ_cnt = 0
             blk_cnt = 0
             unk_cnt = 0
             pend_cnt = 0
             for s in g_spots:
+                if s.get("is_ev"):
+                    ev_total_grp += int(s.get("capacity") or 1)
+                if s.get("is_rentable"):
+                    rentable_grp += 1
+                if s.get("is_private_reserved"):
+                    if s.get("pending_status"):
+                        pend_cnt += 1
+                    continue
                 est = s.get("effective_status") or s.get("status")
                 fu = int(s.get("free_units") or 0)
                 if est == "FREE":
                     raw_free_grp += fu
+                    if s.get("is_ev"):
+                        ev_free_grp += fu
                     obs = str(s.get("obstacle_type") or "none")
                     if obs == "movable":
                         movable_free += fu
@@ -634,6 +698,9 @@ class ParkingRecommender:
                     "clean_free": clean_free,
                     "movable_free": movable_free,
                     "pedestrian_free": ped_free,
+                    "ev_total": ev_total_grp,
+                    "ev_free": max(0, min(ev_free_grp, eff_free)),
+                    "rentable_count": rentable_grp,
                     "occupied": occ_cnt,
                     "blocked": blk_cnt,
                     "unknown": unk_cnt,
@@ -862,16 +929,23 @@ class ParkingRecommender:
                     b_movable_free = 0
                     b_ped_free = 0
                     b_compact_free = 0
+                    b_ev_free = 0
                     b_free_hints: List[Dict[str, Any]] = []
                     eligible_free_spots: List[Dict[str, Any]] = []
 
                     for sp in g_spots:
+                        if sp.get("is_private_reserved"):
+                            continue
                         if sp.get("effective_status") != "FREE":
                             continue
                         fu = int(sp.get("free_units") or 0)
                         if fu <= 0:
                             continue
-                        is_compact = bool(sp.get("compact_only")) and sp.get("spot_type") != "elastic_strip"
+                        is_compact = (
+                            bool(sp.get("compact_only"))
+                            and sp.get("spot_type") != "elastic_strip"
+                            and "large_friendly" not in (sp.get("tags") or [])
+                        )
                         if is_compact:
                             b_compact_free += fu
                             counted = vehicle_type != "suv"
@@ -880,6 +954,8 @@ class ParkingRecommender:
                         if not counted:
                             continue
                         b_raw_free += fu
+                        if sp.get("is_ev"):
+                            b_ev_free += fu
                         if sp.get("map_x") is not None and sp.get("map_y") is not None:
                             eligible_free_spots.append(sp)
                         obs = str(sp.get("obstacle_type") or "none")
@@ -919,7 +995,12 @@ class ParkingRecommender:
                     walk_m = float(dists.get(zs["zone_id"], 100.0))
                     best_sp_walk: Optional[Dict[str, Any]] = None
                     best_sp_obj: Optional[Dict[str, Any]] = None
-                    for sp in eligible_free_spots:
+                    walk_pool = (
+                        [s for s in eligible_free_spots if s.get("is_ev")]
+                        if (vehicle_type == "ev" and any(s.get("is_ev") for s in eligible_free_spots))
+                        else eligible_free_spots
+                    )
+                    for sp in walk_pool:
                         w_res = compute_walk_between_map_points(
                             float(sp["map_x"]),
                             float(sp["map_y"]),
@@ -947,7 +1028,9 @@ class ParkingRecommender:
                         elif b_movable_free > 0:
                             clearable_penalty = 12.0
                     abundance_bonus = 14.0 * min(eff, 3)
-                    score = round(walk_m + dead_end + clearable_penalty - abundance_bonus, 1)
+                    eff_ev_free = max(0, min(b_ev_free, eff))
+                    ev_delta = -65.0 if (vehicle_type == "ev" and eff_ev_free > 0) else 0.0
+                    score = round(walk_m + dead_end + clearable_penalty - abundance_bonus + ev_delta, 1)
 
                     cam_fallback = next(
                         (
@@ -986,6 +1069,7 @@ class ParkingRecommender:
                             "pedestrian_free": b_ped_free,
                             "soft_locked": b_soft_locked,
                             "effective_free": eff,
+                            "ev_free": eff_ev_free,
                             "compact_free": b_compact_free,
                             "dead_end_penalty": round(dead_end, 1),
                             "score": score,
@@ -1002,11 +1086,13 @@ class ParkingRecommender:
             placed_free_spots = [
                 sp
                 for sp in zs.get("spots", [])
-                if sp.get("effective_status") == "FREE"
+                if not sp.get("is_private_reserved")
+                and sp.get("effective_status") == "FREE"
                 and int(sp.get("free_units") or 0) > 0
                 and (
                     vehicle_type != "suv"
                     or not bool(sp.get("compact_only"))
+                    or "large_friendly" in (sp.get("tags") or [])
                     or sp.get("spot_type") == "elastic_strip"
                 )
                 and sp.get("map_placed", True)
@@ -1015,7 +1101,12 @@ class ParkingRecommender:
             ]
             best_sp_walk = None
             best_sp_obj = None
-            for sp in placed_free_spots:
+            z_walk_pool = (
+                [s for s in placed_free_spots if s.get("is_ev")]
+                if (vehicle_type == "ev" and any(s.get("is_ev") for s in placed_free_spots))
+                else placed_free_spots
+            )
+            for sp in z_walk_pool:
                 w_res = compute_walk_between_map_points(
                     float(sp["map_x"]),
                     float(sp["map_y"]),
@@ -1048,7 +1139,9 @@ class ParkingRecommender:
                 elif zs.get("movable_free", 0) > 0:
                     clearable_penalty = 12.0
             abundance_bonus = 14.0 * min(eff, 3)
-            score = round(walk_m + dead_end + clearable_penalty - abundance_bonus, 1)
+            z_ev_free = int(zs.get("ev_free") or 0)
+            z_ev_delta = -65.0 if (vehicle_type == "ev" and z_ev_free > 0) else 0.0
+            score = round(walk_m + dead_end + clearable_penalty - abundance_bonus + z_ev_delta, 1)
             free_hints = [
                 h for h in zs.get("actionable_hints", [])
                 if h.get("obstacle_type") in ("movable", "pedestrian")
@@ -1069,6 +1162,7 @@ class ParkingRecommender:
                     "pedestrian_free": zs.get("pedestrian_free", 0),
                     "soft_locked": zs["soft_locked"],
                     "effective_free": eff,
+                    "ev_free": z_ev_free,
                     "compact_free": zs["compact_free"],
                     "dead_end_penalty": round(dead_end, 1),
                     "score": score,
@@ -1161,6 +1255,10 @@ class ParkingRecommender:
                     handling_note = f"提示：空位处{'；'.join(seen_hints)}。"
                 else:
                     handling_note = f"另有空位{seen_hints[0]}。"
+
+        if vehicle_type == "ev" and int(primary.get("ev_free") or 0) > 0:
+            ev_prefix = f"含 {int(primary['ev_free'])} 个空闲新能源充电车位。"
+            handling_note = f"{ev_prefix}{handling_note}" if handling_note else ev_prefix
 
         voice = render_workspace_broadcast_text(
             ws_profile,

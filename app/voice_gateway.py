@@ -1535,6 +1535,8 @@ class VoiceGatewayService:
     @staticmethod
     def _normalize_vehicle_type(vtype: Optional[str]) -> str:
         v = str(vtype or "sedan").strip().lower()
+        if v in ("ev", "new_energy", "electric", "新能源", "充电", "电车"):
+            return "ev"
         if v in ("compact", "mini", "小型车", "紧凑"):
             return "compact"
         if v in ("suv", "mpv", "大型车", "商务车"):
@@ -4700,7 +4702,13 @@ class VoiceGatewayService:
                 stroke_c = "#FFFFFF"
                 st_txt = "待刷新"
 
-            info_attr = f"{zname} · {lbl}号位：{st_txt}"
+            sp_tags_hud = sp.get("tags") or []
+            is_ev_hud = bool(sp.get("is_ev")) or ("ev_charging" in sp_tags_hud)
+            is_rent_hud = bool(sp.get("is_rentable")) or ("rentable" in sp_tags_hud)
+            tag_suffix_hud = (
+                f"{' · ⚡新能源' if is_ev_hud else ''}{' · 租/共享' if is_rent_hud else ''}"
+            )
+            info_attr = f"{zname} · {lbl}号位：{st_txt}{tag_suffix_hud}"
             parts.append(f'<g class="sp" data-info="{info_attr}" transform="translate({cx},{cy}) rotate({ang:.1f})">')
             if is_rec_spot:
                 parts.append(
@@ -4719,6 +4727,15 @@ class VoiceGatewayService:
                 f'<text x="0" y="{round(fsize * 0.34, 2)}" text-anchor="middle" fill="#FFFFFF" '
                 f'font-size="{fsize}" font-weight="700" font-family="-apple-system,sans-serif">{lbl[:4]}</text>'
             )
+            if is_ev_hud:
+                bx_ev = round(sw * 0.34, 2)
+                by_ev = round(-sh * 0.36, 2)
+                parts.append(
+                    f'<g transform="translate({bx_ev},{by_ev}) rotate({-ang:.1f})">'
+                    f'<circle r="0.72" fill="#0F172A" stroke="#FACC15" stroke-width="0.16"/>'
+                    f'<polygon points="0.08,-0.46 -0.34,0.06 -0.02,0.06 -0.10,0.46 0.34,-0.06 0.02,-0.06" fill="#FACC15"/>'
+                    f'</g>'
+                )
             parts.append("</g>")
 
         # Entrance gates

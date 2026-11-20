@@ -9,6 +9,13 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import DB_PATH
+from app.spot_tags import (
+    merge_spot_tags_on_recalibration,
+    normalize_spot_tag_meta,
+    normalize_spot_tags,
+    parse_tag_meta_json,
+    parse_tags_json,
+)
 
 
 DEFAULT_CALIB_SCHEDULE: Dict[str, Any] = {
@@ -897,7 +904,9 @@ class Database:
                     map_angle REAL,
                     map_custom INTEGER NOT NULL DEFAULT 0,
                     vehicle_polygon_json TEXT,
-                    vehicle_poly_custom INTEGER NOT NULL DEFAULT 0
+                    vehicle_poly_custom INTEGER NOT NULL DEFAULT 0,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    tag_meta_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS site_map (
@@ -1083,6 +1092,8 @@ class Database:
             ("group_name", "TEXT NOT NULL DEFAULT ''"),
             ("near_unit_id", "TEXT NOT NULL DEFAULT ''"),
             ("near_unit_custom", "INTEGER NOT NULL DEFAULT 0"),
+            ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("tag_meta_json", "TEXT NOT NULL DEFAULT '{}'"),
         ):
             if col_name not in spot_cols:
                 conn.execute(f"ALTER TABLE spots ADD COLUMN {col_name} {col_def}")
@@ -3508,6 +3519,9 @@ class Database:
                 d["near_unit_id"] = str(d.get("near_unit_id") or "")
                 d["near_unit_custom"] = int(d.get("near_unit_custom") or 0)
                 d["vehicle_model"] = str(d.get("vehicle_model") or "sedan")
+                d["tags"] = parse_tags_json(d.pop("tags_json", "[]"))
+                d["tag_meta"] = parse_tag_meta_json(d.pop("tag_meta_json", "{}"))
+                d["is_ev"] = "ev_charging" in d["tags"]
                 d["has_ref_signature"] = bool(d.get("ref_free_sig_b64"))
                 if not include_signatures:
                     d.pop("ref_free_sig_b64", None)
@@ -3922,6 +3936,19 @@ class Database:
                     else (any_prev.get("vehicle_model") if any_prev else "sedan")
                 ).strip() or "sedan"
 
+                auto_ev_flag = sp.get("is_ev") if "is_ev" in sp else None
+                auto_ev_reason = str(sp.get("ev_reason") or "").strip()
+                merged_tags, merged_tag_meta = merge_spot_tags_on_recalibration(
+                    prev_tags_raw=(any_prev.get("tags_json") if any_prev else "[]"),
+                    prev_meta_raw=(any_prev.get("tag_meta_json") if any_prev else "{}"),
+                    incoming_tags_raw=sp.get("tags") if "tags" in sp else None,
+                    incoming_meta_raw=sp.get("tag_meta") if "tag_meta" in sp else None,
+                    auto_is_ev=bool(auto_ev_flag) if auto_ev_flag is not None else None,
+                    auto_ev_reason=auto_ev_reason,
+                )
+                final_tags_json = json.dumps(merged_tags, ensure_ascii=False)
+                final_tag_meta_json = json.dumps(merged_tag_meta, ensure_ascii=False)
+
                 map_x = sp.get("map_x")
                 map_y = sp.get("map_y")
                 map_w = sp.get("map_w")
@@ -3974,10 +4001,10 @@ class Database:
                         ref_free_sig_b64, obstacle_type, action_hint,
                         map_x, map_y, map_w, map_h, map_angle, map_custom,
                         vehicle_polygon_json, vehicle_poly_custom, group_code, group_name,
-                        near_unit_id, near_unit_custom, vehicle_model
+                        near_unit_id, near_unit_custom, vehicle_model, tags_json, tag_meta_json
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -4014,10 +4041,84 @@ class Database:
                         near_uid,
                         near_ucust,
                         veh_model,
+                        final_tags_json,
+                        final_tag_meta_json,
                     ),
                 )
             self._snapshot_active_slot_calibration_conn(conn, camera_id)
         return self.list_spots(camera_id=camera_id)
+
+    def update_spots_tags(
+        self,
+        spot_ids: List[str],
+        tags: Optional[Any] = None,
+        add_tags: Optional[Any] = None,
+        remove_tags: Optional[Any] = None,
+        tag_meta: Optional[Dict[str, Any]] = None,
+        replace_meta: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Update tags and structured EV/rental metadata on one or multiple parking spots."""
+        clean_ids = [str(sid or "").strip() for sid in (spot_ids or []) if str(sid or "").strip()]
+        if not clean_ids:
+            raise ValueError("请至少选择一个车位 (spot_ids 不能为空)")
+
+        placeholders = ", ".join("?" for _ in clean_ids)
+        with self._lock, self._connect() as conn:
+            rows = [
+                dict(r)
+                for r in conn.execute(
+                    f"SELECT * FROM spots WHERE spot_id IN ({placeholders})",
+                    clean_ids,
+                ).fetchall()
+            ]
+            if not rows:
+                raise ValueError("未找到对应的车位记录")
+
+            add_norm = normalize_spot_tags(add_tags) if add_tags is not None else []
+            rem_norm = set(normalize_spot_tags(remove_tags)) if remove_tags is not None else set()
+
+            for cur in rows:
+                sid = str(cur["spot_id"])
+                prev_tags = parse_tags_json(cur.get("tags_json"))
+                prev_meta = parse_tag_meta_json(cur.get("tag_meta_json"))
+
+                if tags is not None:
+                    next_tags = normalize_spot_tags(tags)
+                else:
+                    merged_list = list(prev_tags)
+                    for t_add in add_norm:
+                        if t_add not in merged_list:
+                            merged_list.append(t_add)
+                    if rem_norm:
+                        merged_list = [t for t in merged_list if t not in rem_norm]
+                    next_tags = normalize_spot_tags(merged_list)
+
+                # Track explicit operator EV override so future recalibrations respect user intent
+                meta_patch = dict(tag_meta) if isinstance(tag_meta, dict) else {}
+                if "ev_user_override" not in meta_patch:
+                    had_ev = "ev_charging" in prev_tags
+                    has_ev = "ev_charging" in next_tags
+                    if has_ev and not had_ev:
+                        meta_patch["ev_user_override"] = True
+                    elif had_ev and not has_ev:
+                        meta_patch["ev_user_override"] = False
+
+                next_meta = normalize_spot_tag_meta(
+                    meta_patch,
+                    existing_meta=None if replace_meta else prev_meta,
+                )
+
+                conn.execute(
+                    "UPDATE spots SET tags_json = ?, tag_meta_json = ? WHERE spot_id = ?",
+                    (
+                        json.dumps(next_tags, ensure_ascii=False),
+                        json.dumps(next_meta, ensure_ascii=False),
+                        sid,
+                    ),
+                )
+
+        id_set = set(clean_ids)
+        return [sp for sp in self.list_spots() if sp["spot_id"] in id_set]
 
     def update_spot_state(self, spot_id: str, updates: Dict[str, Any]) -> None:
         if not updates:
@@ -4714,11 +4815,12 @@ class Database:
                         polygon_json, status, free_units, occupied_units, pending_status, pending_free_units,
                         pending_since, confidence, last_reason, last_engine, last_changed_at, last_seen_at,
                         obstacle_type, action_hint, map_x, map_y, map_w, map_h, map_angle, map_custom,
-                        group_code, group_name, near_unit_id, near_unit_custom, vehicle_model
+                        group_code, group_name, near_unit_id, near_unit_custom, vehicle_model,
+                        tags_json, tag_meta_json
                     ) VALUES (
                         ?, 'UNASSIGNED', ?, ?, ?, ?, ?, ?, ?, 'UNKNOWN', 0, 0, NULL, NULL, NULL, 1.0,
                         '平面图预设车位（待接入摄像头）', 'map_editor', ?, NULL, 'none', '',
-                        ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -4741,6 +4843,8 @@ class Database:
                         str(sp.get("near_unit_id") or ""),
                         int(sp.get("near_unit_custom") or 0),
                         str(sp.get("vehicle_model") or "sedan"),
+                        str(sp.get("tags_json") or "[]"),
+                        str(sp.get("tag_meta_json") or "{}"),
                     ),
                 )
                 conn.execute(
@@ -5005,6 +5109,13 @@ class Database:
                     mh = src.get("map_h") or 3.25
                     mang = src.get("map_angle") or 0.0
                     vmod = str(src.get("vehicle_model") or cal_sp.get("vehicle_model") or "sedan").strip() or "sedan"
+                    src_tags = parse_tags_json(src.get("tags_json"))
+                    cal_tags = parse_tags_json(cal_sp.get("tags_json"))
+                    merged_b_tags = normalize_spot_tags([*cal_tags, *src_tags])
+                    merged_b_meta = normalize_spot_tag_meta(
+                        parse_tag_meta_json(src.get("tag_meta_json")),
+                        existing_meta=parse_tag_meta_json(cal_sp.get("tag_meta_json")),
+                    )
                 else:
                     last_src = slot_sources[-1]
                     extra_k = idx - len(slot_sources) + 1
@@ -5014,13 +5125,15 @@ class Database:
                     mh = last_src.get("map_h") or 3.25
                     mang = last_src.get("map_angle") or 0.0
                     vmod = str(last_src.get("vehicle_model") or cal_sp.get("vehicle_model") or "sedan").strip() or "sedan"
+                    merged_b_tags = parse_tags_json(cal_sp.get("tags_json"))
+                    merged_b_meta = parse_tag_meta_json(cal_sp.get("tag_meta_json"))
 
                 conn.execute(
                     """
                     UPDATE spots
                     SET zone_id = ?, map_x = ?, map_y = ?, map_w = ?, map_h = ?, map_angle = ?,
                         map_custom = 1, group_code = ?, group_name = ?, near_unit_id = ?, near_unit_custom = ?,
-                        vehicle_model = ?
+                        vehicle_model = ?, tags_json = ?, tag_meta_json = ?
                     WHERE spot_id = ?
                     """,
                     (
@@ -5035,6 +5148,8 @@ class Database:
                         final_near_uid,
                         final_near_custom,
                         vmod,
+                        json.dumps(merged_b_tags, ensure_ascii=False),
+                        json.dumps(merged_b_meta, ensure_ascii=False),
                         cal_sp["spot_id"],
                     ),
                 )
@@ -6032,6 +6147,22 @@ class Database:
                         elif cid == "UNASSIGNED" and cur_sp["camera_id"] != "UNASSIGNED":
                             next_status = "UNKNOWN"
                             next_free = 0
+                        next_tags_json = (
+                            json.dumps(normalize_spot_tags(sp["tags"]), ensure_ascii=False)
+                            if "tags" in sp
+                            else str(cur_sp.get("tags_json") or "[]")
+                        )
+                        next_tmeta_json = (
+                            json.dumps(
+                                normalize_spot_tag_meta(
+                                    sp["tag_meta"],
+                                    existing_meta=parse_tag_meta_json(cur_sp.get("tag_meta_json")),
+                                ),
+                                ensure_ascii=False,
+                            )
+                            if "tag_meta" in sp and isinstance(sp["tag_meta"], dict)
+                            else str(cur_sp.get("tag_meta_json") or "{}")
+                        )
                         conn.execute(
                             """
                             UPDATE spots
@@ -6039,7 +6170,7 @@ class Database:
                                 status = ?, free_units = ?,
                                 map_x = ?, map_y = ?, map_w = ?, map_h = ?, map_angle = ?, map_custom = ?,
                                 group_code = ?, group_name = ?, near_unit_id = ?, near_unit_custom = ?,
-                                vehicle_model = ?
+                                vehicle_model = ?, tags_json = ?, tag_meta_json = ?
                             WHERE spot_id = ?
                             """,
                             (
@@ -6062,6 +6193,8 @@ class Database:
                                 near_u,
                                 near_ucust,
                                 v_mod,
+                                next_tags_json,
+                                next_tmeta_json,
                                 sid,
                             ),
                         )
@@ -6157,6 +6290,15 @@ class Database:
                             [250 + (idx % 6) * 160, 440],
                             [120 + (idx % 6) * 160, 440],
                         ]
+                        new_tags_json = json.dumps(
+                            normalize_spot_tags(sp.get("tags") or []), ensure_ascii=False
+                        )
+                        new_tmeta_json = json.dumps(
+                            normalize_spot_tag_meta(
+                                sp.get("tag_meta") if isinstance(sp.get("tag_meta"), dict) else None
+                            ),
+                            ensure_ascii=False,
+                        )
                         conn.execute(
                             """
                             INSERT INTO spots (
@@ -6164,11 +6306,12 @@ class Database:
                                 polygon_json, status, free_units, occupied_units, pending_status, pending_free_units,
                                 pending_since, confidence, last_reason, last_engine, last_changed_at, last_seen_at,
                                 obstacle_type, action_hint, map_x, map_y, map_w, map_h, map_angle, map_custom,
-                                group_code, group_name, near_unit_id, near_unit_custom, vehicle_model
+                                group_code, group_name, near_unit_id, near_unit_custom, vehicle_model,
+                                tags_json, tag_meta_json
                             ) VALUES (
                                 ?, ?, ?, ?, ?, ?, 5.2, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1.0,
                                 ?, 'map_editor', ?, ?, 'none', '', ?, ?, ?, ?, ?, 1,
-                                ?, ?, ?, ?, ?
+                                ?, ?, ?, ?, ?, ?, ?
                             )
                             """,
                             (
@@ -6196,6 +6339,8 @@ class Database:
                                 near_u,
                                 near_ucust,
                                 v_mod,
+                                new_tags_json,
+                                new_tmeta_json,
                             ),
                         )
                         touched_zone_ids.add(req_zone)

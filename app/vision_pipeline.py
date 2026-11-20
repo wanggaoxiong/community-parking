@@ -3614,15 +3614,38 @@ class VisionPipeline:
             else 0.0
         )
         core_warm_ratio = float(np.mean(warm_paver_full[cy0:cy1, cx0:cx1][center_mask]))
-        colored_paving_filtered = (
-            apron_warm_ratio >= 0.14
-            and lateral_warm_ratio >= 0.12
-            and core_warm_ratio >= 0.18
+        ev_green_paver_full = (
+            (hsv_full[:, :, 0] >= 75)
+            & (hsv_full[:, :, 0] <= 99)
+            & (hsv_full[:, :, 1] >= 80)
+            & (hsv_full[:, :, 2] >= 85)
+            & (valid_mask > 127)
+        )
+        apron_ev_green_ratio = (
+            float(np.mean(ev_green_paver_full[apy0:apy1, apx0:apx1][ap_valid]))
+            if int(np.sum(ap_valid)) >= 24
+            else 0.0
+        )
+        core_ev_green_ratio = float(np.mean(ev_green_paver_full[cy0:cy1, cx0:cx1][center_mask]))
+        ev_green_paving_filtered = (
+            apron_ev_green_ratio >= 0.25
+            and core_ev_green_ratio >= 0.35
             and not has_chassis_shadow_bar
-            and center_spread < 0.38
+            and center_spread < 0.32
+        )
+        colored_paving_filtered = (
+            (
+                apron_warm_ratio >= 0.14
+                and lateral_warm_ratio >= 0.12
+                and core_warm_ratio >= 0.18
+                and not has_chassis_shadow_bar
+                and center_spread < 0.38
+            )
+            or ev_green_paving_filtered
         )
         if colored_paving_filtered:
-            floor_brick_mask = warm_paver_full[int(h * 0.34) : int(h * 0.86), int(w * 0.20) : int(w * 0.80)]
+            paver_src_full = ev_green_paver_full if ev_green_paving_filtered else warm_paver_full
+            floor_brick_mask = paver_src_full[int(h * 0.34) : int(h * 0.86), int(w * 0.20) : int(w * 0.80)]
             if int(np.sum(floor_brick_mask)) >= 24:
                 sub_lab = lab_full[int(h * 0.34) : int(h * 0.86), int(w * 0.20) : int(w * 0.80)]
                 pave_l = float(np.median(sub_lab[:, :, 0][floor_brick_mask]))
@@ -3643,11 +3666,11 @@ class VisionPipeline:
             (lab_full[:, :, 1] - pave_a) ** 2 + (lab_full[:, :, 2] - pave_b) ** 2
         )
         if colored_paving_filtered:
-            # Zero out terracotta brick floor AND low-saturation gray shadows / white lines (`S < 45`)
-            # so empty brick stalls never trigger chromatic anomalies, while non-brick colored vehicle
-            # bodies (e.g. dark forest-green, blue, cyan) stand out strongly against brick Lab!
+            # Zero out colored floor paint/brick AND low-saturation gray shadows / white lines (`S < 45`)
+            # so empty colored stalls never trigger chromatic anomalies, while vehicle bodies stand out!
             brick_or_neutral_mask = (
                 warm_paver_full
+                | (ev_green_paver_full if ev_green_paving_filtered else False)
                 | (hsv_full[:, :, 1] < 45)
                 | (hsv_full[:, :, 2] < 34)
             )
@@ -3797,17 +3820,22 @@ class VisionPipeline:
         # Smooth painted green vehicle body (e.g. dark forest-green sedan/SUV on brick or asphalt)
         # vs jagged overhanging tree leaves (which either stay in upper rear band or have dense leaf micro-edges):
         painted_green_vehicle_body = (
-            ground_foliage_ratio >= 0.18
+            not ev_green_paving_filtered
+            and ground_foliage_ratio >= 0.18
             and lower_foliage_ratio >= 0.15
             and foliage_smooth_ratio >= 0.55
             and min(left_edge_r, right_edge_r) >= 0.032
         )
         mask_out_rear_foliage = upper_foliage_map if lower_foliage_ratio < 0.12 else np.zeros_like(m_mask, dtype=bool)
 
-        # Exclude flat white ground paint, terracotta floor bricks (when `colored_paving_filtered`), and rear hedge leaves
+        # Exclude flat white ground paint, colored/EV floor paint (when `colored_paving_filtered`), and rear hedge leaves
         obj_grad_thr = 56.0 if colored_paving_filtered else 46.0
         obj_sat_thr = 115 if colored_paving_filtered else 95
-        warm_floor_mid = warm_paver_full[my0:my1, mx0:mx1] if colored_paving_filtered else np.zeros_like(m_mask, dtype=bool)
+        warm_floor_mid = (
+            (ev_green_paver_full[my0:my1, mx0:mx1] if ev_green_paving_filtered else warm_paver_full[my0:my1, mx0:mx1])
+            if colored_paving_filtered
+            else np.zeros_like(m_mask, dtype=bool)
+        )
         non_paint_obj_map = (
             ((m_grad > obj_grad_thr) | (((m_sat > obj_sat_thr) & (m_val > 60)) & ~warm_floor_mid))
             & ~((m_sat < 35) & (m_val > 185))

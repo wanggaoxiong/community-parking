@@ -179,8 +179,17 @@ const state = {
     newRoadPts: [],
     cursorWorld: null,
     dragging: null,
+    tagFilter: "all",
+    pendingSpotTagClick: null,
     undoStack: [],
     redoStack: [],
+  },
+  tagPopover: {
+    open: false,
+    spotIds: [],
+    draftTags: [],
+    anchorX: 0,
+    anchorY: 0,
   },
   calib: {
     cameraId: "CAM_3F_WIN",
@@ -350,6 +359,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindDriverActions();
   bindSpatialGovernanceAndModals();
   bindSiteMapControls();
+  bindSpotTagPopoverAndFilters();
   bindCalibrationConsole();
   bindTestLab();
   bindCameraManagementHub();
@@ -482,6 +492,7 @@ async function refreshOverview() {
 
   await syncSiteMapBackdropIfNeeded(data.site_map);
   updateSiteMapHeaderUI(data.site_map);
+  syncSpotTagFilterCounts(data);
   populateSelectors(data);
   renderUnboundCamerasBanner(data);
   renderSoftLocks(data.active_locks);
@@ -7866,7 +7877,7 @@ function bindSiteMapControls() {
       return;
     }
 
-    // Browse Mode: click group badge to name/bind camera, click building/door to set destination, or pan if zoomed
+    // Browse Mode: click stall to edit tags/rental, click group badge to name/bind camera, click building/door to set destination
     if (!state.siteMap.editMode) {
       const grpTarget = evt.target.closest("[data-group-badge]");
       if (grpTarget) {
@@ -7885,6 +7896,27 @@ function bindSiteMapControls() {
           refreshOverview();
         }
         return;
+      }
+      const spotTarget = evt.target.closest("[data-spot-click]");
+      if (spotTarget) {
+        const sid = spotTarget.dataset.spotClick;
+        const additive = Boolean(evt.shiftKey || evt.metaKey || evt.ctrlKey);
+        if ((state.siteMap.zoom || 1) > 1.01) {
+          state.siteMap.pendingSpotTagClick = {
+            spotId: sid,
+            additive,
+            clientX: evt.clientX,
+            clientY: evt.clientY,
+          };
+          startPanDrag();
+        } else {
+          evt.preventDefault();
+          handleBrowseSpotTagClick(sid, additive, evt.clientX, evt.clientY);
+        }
+        return;
+      }
+      if (state.tagPopover?.open) {
+        closeSpotTagPopover();
       }
       if ((state.siteMap.zoom || 1) > 1.01) {
         startPanDrag();
@@ -8735,6 +8767,24 @@ function bindSiteMapControls() {
         anchorWorld: d.anchorWorld,
         endWorld,
       });
+      return;
+    }
+
+    const pendingTagClick = state.siteMap.pendingSpotTagClick;
+    state.siteMap.pendingSpotTagClick = null;
+    if (
+      d.kind === "pan" &&
+      d.button === 0 &&
+      (d.movedPx || 0) < 5 &&
+      !state.siteMap.editMode &&
+      pendingTagClick
+    ) {
+      handleBrowseSpotTagClick(
+        pendingTagClick.spotId,
+        pendingTagClick.additive,
+        pendingTagClick.clientX,
+        pendingTagClick.clientY
+      );
       return;
     }
 
@@ -9696,34 +9746,76 @@ function renderAbstractSvgMap(data) {
       fill = "#475569";
     }
 
+    const spTags = Array.isArray(sp.tags) ? sp.tags : [];
+    const spMeta = sp.tag_meta || {};
+    const isEvSpot = Boolean(sp.is_ev || spTags.includes("ev_charging"));
+    const isRentSpot = Boolean(sp.is_rentable || spTags.includes("rentable"));
+    const isPrivSpot = spTags.includes("private");
+    const isWideSpot = spTags.includes("large_friendly");
+    const isAccSpot = spTags.includes("accessible");
+    const activeFilter = state.siteMap.tagFilter || "all";
+    const filterMatched =
+      activeFilter === "all" || spTags.includes(activeFilter) || (activeFilter === "ev_charging" && isEvSpot);
+    const isTagPopSel = Boolean(
+      state.tagPopover?.open && state.tagPopover.spotIds?.includes(sp.spot_id)
+    );
+
     const pendTxt = sp.pending_status ? ` · 防抖复核中(${sp.pending_status})` : "";
     const hintTxt = sp.action_hint ? ` · ${sp.action_hint}` : "";
+    const evTip = isEvSpot
+      ? ` · ⚡新能源充电位${spMeta.charger_power ? `(${spMeta.charger_power})` : ""}`
+      : "";
+    const rentTip = isRentSpot
+      ? ` · 🤝对外招租${
+          [spMeta.rental_price, spMeta.rental_window].filter(Boolean).length
+            ? `(${[spMeta.rental_price, spMeta.rental_window].filter(Boolean).join(" / ")})`
+            : ""
+        }`
+      : "";
+    const privTip = isPrivSpot && !isRentSpot ? " · 🔒产权专属位" : "";
     const grpTag = sp.group_code ? `[${sp.group_code}] ` : "";
     const camTag = isUnassigned ? " · ⏳待绑定相机" : ` · 📷${sp.camera_id}`;
-    const tipStr = `${grpTag}车位 ${sp.label}（${sp.zone_name || sp.zone_id}）· ${statusCn}${camTag}${pendTxt}${hintTxt}`;
+    const tipStr = `${grpTag}车位 ${sp.label}（${sp.zone_name || sp.zone_id}）· ${statusCn}${evTip}${rentTip}${privTip}${camTag}${pendTxt}${hintTxt}（点击管理标签）`;
 
     const dragAttrs =
       isEditing && subTool === "spots"
         ? `class="draggable-node" data-drag-kind="spot" data-spot-id="${escapeHtml(
             sp.spot_id
           )}"`
+        : !isEditing
+        ? `class="map-spot-clickable" data-spot-click="${escapeHtml(sp.spot_id)}"`
         : "";
 
-    const outerStroke = isSelSpot
+    const outerStroke = isSelSpot || isTagPopSel
       ? "#0071E3"
       : isSelGroup
       ? "rgba(0, 113, 227, 0.85)"
+      : isEvSpot
+      ? "#059669"
       : isUnassigned
       ? "#F59E0B"
       : "rgba(15, 23, 42, 0.36)";
-    const outerStrokeW = isSelSpot ? 0.38 : isSelGroup ? 0.28 : isUnassigned ? 0.26 : 0.20;
-    const outerDash = isUnassigned && !isSelSpot ? `stroke-dasharray="0.65,0.4"` : "";
+    const outerStrokeW = isSelSpot || isTagPopSel ? 0.38 : isSelGroup ? 0.28 : isEvSpot ? 0.28 : isUnassigned ? 0.26 : 0.20;
+    const outerDash = isUnassigned && !isSelSpot && !isTagPopSel ? `stroke-dasharray="0.65,0.4"` : "";
+    const dimOpacityAttr = !filterMatched ? `opacity="0.22"` : "";
 
     html += `<g transform="translate(${sx.toFixed(2)} ${sy.toFixed(2)}) rotate(${angle.toFixed(
       1
-    )})" ${dragAttrs} data-spot-tip="${escapeHtml(tipStr)}">`;
+    )})" ${dragAttrs} ${dimOpacityAttr} data-spot-tip="${escapeHtml(tipStr)}">`;
 
-    if (isRecZone) {
+    if (isTagPopSel) {
+      html += `<rect x="${(-w / 2 - 0.48).toFixed(2)}" y="${(-h / 2 - 0.48).toFixed(
+        2
+      )}" width="${(w + 0.96).toFixed(2)}" height="${(h + 0.96).toFixed(
+        2
+      )}" rx="0.68" fill="rgba(0, 113, 227, 0.22)" stroke="#0071E3" stroke-width="0.34"/>`;
+    } else if (activeFilter !== "all" && filterMatched) {
+      html += `<rect x="${(-w / 2 - 0.44).toFixed(2)}" y="${(-h / 2 - 0.44).toFixed(
+        2
+      )}" width="${(w + 0.88).toFixed(2)}" height="${(h + 0.88).toFixed(
+        2
+      )}" rx="0.64" fill="rgba(16, 185, 129, 0.22)" stroke="#10B981" stroke-width="0.30"/>`;
+    } else if (isRecZone) {
       html += `<rect x="${(-w / 2 - 0.45).toFixed(2)}" y="${(-h / 2 - 0.45).toFixed(
         2
       )}" width="${(w + 0.9).toFixed(2)}" height="${(h + 0.9).toFixed(
@@ -9827,6 +9919,35 @@ function renderAbstractSvgMap(data) {
         )}" font-size="${fontSz}" fill="#FFFFFF" font-weight="700" text-anchor="middle">${escapeHtml(
         shortLbl
       )}</text>
+      </g>`;
+    }
+
+    // Upright EV Lightning Badge (⚡) & Secondary Operational Badge (租 / 专 / 宽 / ♿)
+    const badgeR = Math.max(0.56, Math.min(0.82, minDim * 0.38));
+    if (isEvSpot) {
+      const bx = +(w * 0.38).toFixed(2);
+      const by = +(-h * 0.38).toFixed(2);
+      const bs = (badgeR / 0.68).toFixed(2);
+      html += `<g transform="translate(${bx} ${by}) rotate(${(-angle).toFixed(1)}) scale(${bs})" pointer-events="none">
+        <circle cx="0" cy="0" r="0.68" fill="#064E3B" stroke="#FACC15" stroke-width="0.16"/>
+        <polygon points="0.08,-0.44 -0.32,0.05 -0.02,0.05 -0.10,0.44 0.32,-0.05 0.02,-0.05" fill="#FACC15"/>
+      </g>`;
+    }
+    const secBadge = isRentSpot
+      ? { txt: "租", bg: "#0071E3" }
+      : isPrivSpot
+      ? { txt: "专", bg: "#4F46E5" }
+      : isAccSpot
+      ? { txt: "♿", bg: "#7C3AED" }
+      : isWideSpot
+      ? { txt: "宽", bg: "#0284C7" }
+      : null;
+    if (secBadge) {
+      const sbx = +(-w * 0.38).toFixed(2);
+      const sby = +(-h * 0.38).toFixed(2);
+      html += `<g transform="translate(${sbx} ${sby}) rotate(${(-angle).toFixed(1)})" pointer-events="none">
+        <circle cx="0" cy="0" r="${badgeR.toFixed(2)}" fill="${secBadge.bg}" stroke="#FFFFFF" stroke-width="0.15"/>
+        <text x="0" y="${(badgeR * 0.38).toFixed(2)}" font-size="${(badgeR * 1.08).toFixed(2)}" fill="#FFFFFF" font-weight="800" text-anchor="middle">${secBadge.txt}</text>
       </g>`;
     }
 
@@ -14176,14 +14297,18 @@ async function runAutoCalibrationWithDataUrl(cameraId, zoneId, dataUrl, fromTest
     const cropSummary = res.crop_roi?.enabled
       ? ` · 已智能裁剪至 ${res.image_width}×${res.image_height}`
       : "";
+    const evDetectedCnt = (res.spots || []).filter(
+      (s) => s.is_ev || (Array.isArray(s.tags) && s.tags.includes("ev_charging"))
+    ).length;
+    const evSummary = evDetectedCnt > 0 ? ` · ⚡自动识别 ${evDetectedCnt} 个新能源车位` : "";
     if (res.vlm_fallback_error) {
       saveMsg.style.color = "#B45309";
-      saveMsg.textContent = `⚠️ 多模态接口不可用（${res.vlm_fallback_error}），已回退本地 OpenCV 几何识别 ${res.spots.length} 个车位（耗时 ${(
+      saveMsg.textContent = `⚠️ 多模态接口不可用（${res.vlm_fallback_error}），已回退本地 OpenCV 几何识别 ${res.spots.length} 个车位${evSummary}（耗时 ${(
         res.elapsed_ms / 1000
       ).toFixed(1)}s）。请检查顶部模型 Endpoint 配置后重新标定以获得最佳异形贴合度。`;
     } else {
       saveMsg.style.color = "#1D9E31";
-      saveMsg.textContent = `✅ 自动标定完成（含 3D 空间车体层${cropSummary}）：识别 ${res.spots.length} 个车位（耗时 ${(
+      saveMsg.textContent = `✅ 自动标定完成（含 3D 空间车体层${cropSummary}${evSummary}）：识别 ${res.spots.length} 个车位（耗时 ${(
         res.elapsed_ms / 1000
       ).toFixed(1)}s）`;
     }
@@ -14450,19 +14575,44 @@ function renderSpotListSidebar() {
           : sp.status || sp.initial_status || "FREE");
       const isSel = i === state.calib.selectedSpotIdx;
       const custom3dTag = sp.vehicle_poly_custom ? " · 3D微调" : "";
+      const isEv = Boolean(sp.is_ev || (Array.isArray(sp.tags) && sp.tags.includes("ev_charging")));
       return `
         <div class="calib-spot-item ${isSel ? "selected" : ""}" onclick="selectCalibSpot(${i})">
           <div>
-            <strong>${escapeHtml(sp.label)}</strong>
+            <strong>${escapeHtml(sp.label)}${isEv ? " ⚡" : ""}</strong>
             <small>${badge}${custom3dTag}</small>
             <span class="spot-chip chip-${st}" style="margin-left:6px">${stLabels[st] || st}${pend ? "(复核)" : ""}</span>
           </div>
-          <button class="link-btn danger-link" type="button" onclick="event.stopPropagation(); removeCalibSpot(${i})">移除</button>
+          <div style="display:flex;align-items:center;">
+            <button class="calib-ev-toggle-btn ${isEv ? "is-ev" : ""}" type="button" title="切换是否为新能源充电车位（保存标定时自动同步至平面图闪电符号）" onclick="event.stopPropagation(); toggleCalibSpotEv(${i})">⚡${isEv ? "新能源" : "设为电桩"}</button>
+            <button class="link-btn danger-link" type="button" onclick="event.stopPropagation(); removeCalibSpot(${i})">移除</button>
+          </div>
         </div>
       `;
     })
     .join("");
 }
+
+window.toggleCalibSpotEv = function (idx) {
+  const sp = state.calib.spots[idx];
+  if (!sp) return;
+  pushCalibUndoSnapshot();
+  const curTags = Array.isArray(sp.tags) ? [...sp.tags] : [];
+  const wasEv = Boolean(sp.is_ev || curTags.includes("ev_charging"));
+  const nextEv = !wasEv;
+  sp.is_ev = nextEv;
+  if (nextEv) {
+    if (!curTags.includes("ev_charging")) curTags.unshift("ev_charging");
+  } else {
+    const k = curTags.indexOf("ev_charging");
+    if (k >= 0) curTags.splice(k, 1);
+  }
+  sp.tags = curTags;
+  sp.tag_meta = { ...(sp.tag_meta || {}), ev_user_override: nextEv };
+  markCalibDirty(true);
+  renderSpotListSidebar();
+  renderCalibCanvas();
+};
 
 window.selectCalibSpot = function (idx) {
   state.calib.selectedSpotIdx = idx;
@@ -14775,6 +14925,8 @@ function renderCalibCanvas() {
     }
 
     const [cx, cy] = getPolyCentroid(activePoly);
+    const isCalEv = Boolean(sp.is_ev || (Array.isArray(sp.tags) && sp.tags.includes("ev_charging")));
+    const evMark = isCalEv ? " ⚡" : "";
     const suffix = pend
       ? " · 复核中"
       : st === "OCCUPIED"
@@ -14782,7 +14934,7 @@ function renderCalibCanvas() {
       : st === "BLOCKED"
       ? " · 占道"
       : "";
-    drawPillLabel(ctx, cx, cy, `${sp.label}${suffix}`);
+    drawPillLabel(ctx, cx, cy, `${sp.label}${evMark}${suffix}`);
 
     if (state.calib.mode === "smart_edit") {
       activePoly.forEach(([x, y], pIdx) => {
@@ -17922,3 +18074,432 @@ function bindCameraManagementHub() {
     saveCameraConfigFromWizard(true);
   });
 }
+
+/* ==================== SPOT MULTI-TAG FILTER & FIGMA DIRECT-CLICK POPOVER ==================== */
+
+const DEFAULT_SPOT_TAG_CATALOG_CLIENT = [
+  { code: "ev_charging", label: "新能源充电", short_badge: "⚡" },
+  { code: "rentable", label: "对外招租", short_badge: "🤝" },
+  { code: "private", label: "产权固定位", short_badge: "🔒" },
+  { code: "large_friendly", label: "宽体大车位", short_badge: "🚙" },
+  { code: "accessible", label: "无障碍车位", short_badge: "♿" },
+  { code: "visitor", label: "访客临停", short_badge: "访" },
+];
+
+function getSpotTagCatalogClient() {
+  const cat = state.overview?.spot_tag_catalog;
+  return Array.isArray(cat) && cat.length ? cat : DEFAULT_SPOT_TAG_CATALOG_CLIENT;
+}
+
+function getAllPlacedOverviewSpots(ovData) {
+  const data = ovData || state.overview;
+  if (!data) return [];
+  if (state.siteMap?.editMode && Array.isArray(state.siteMap.draftSpots)) {
+    return state.siteMap.draftSpots;
+  }
+  const out = [];
+  (data.zones || []).forEach((z) => {
+    (z.spots || []).forEach((sp) => {
+      if (sp.map_placed === false || sp.map_x == null || sp.map_y == null) return;
+      out.push({ ...sp, zone_id: sp.zone_id || z.zone_id, zone_name: sp.zone_name || z.name });
+    });
+  });
+  return out;
+}
+
+function syncSpotTagFilterCounts(ovData) {
+  const spots = getAllPlacedOverviewSpots(ovData);
+  let evTotal = 0;
+  let evFree = 0;
+  let rentCnt = 0;
+  let privCnt = 0;
+  let wideCnt = 0;
+
+  spots.forEach((sp) => {
+    const tags = Array.isArray(sp.tags) ? sp.tags : [];
+    const isEv = Boolean(sp.is_ev || tags.includes("ev_charging"));
+    if (isEv) {
+      evTotal += 1;
+      const effSt = getEffectiveSpotStatusClient(sp);
+      if (effSt === "FREE" && !sp.is_private_reserved && sp.camera_id !== "UNASSIGNED") {
+        evFree += 1;
+      }
+    }
+    if (sp.is_rentable || tags.includes("rentable")) rentCnt += 1;
+    if (tags.includes("private")) privCnt += 1;
+    if (tags.includes("large_friendly")) wideCnt += 1;
+  });
+
+  const setTxt = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+  setTxt("tagCountAll", String(spots.length));
+  setTxt("tagCountEv", evTotal > 0 ? `余${evFree}/${evTotal}` : "0");
+  setTxt("tagCountRent", String(rentCnt));
+  setTxt("tagCountPriv", String(privCnt));
+  setTxt("tagCountWide", String(wideCnt));
+
+  const activeFilter = state.siteMap?.tagFilter || "all";
+  document.querySelectorAll("#spotTagFilterPills .tag-filter-pill").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.tagFilter === activeFilter);
+  });
+}
+
+function positionSpotTagPopover(clientX, clientY) {
+  const pop = document.getElementById("spotTagPopover");
+  if (!pop) return;
+  const vw = window.innerWidth || 1280;
+  const vh = window.innerHeight || 800;
+  const popRect = pop.getBoundingClientRect();
+  const pw = popRect.width || 356;
+  const ph = popRect.height || 380;
+
+  let left = (clientX || vw / 2) + 18;
+  if (left + pw + 12 > vw) {
+    left = Math.max(12, (clientX || vw / 2) - pw - 18);
+  }
+  let top = (clientY || vh / 2) - Math.min(90, ph * 0.25);
+  top = Math.max(14, Math.min(vh - ph - 14, top));
+
+  pop.style.left = `${Math.round(left)}px`;
+  pop.style.top = `${Math.round(top)}px`;
+}
+
+function syncSpotTagPopoverDrawersAndPills() {
+  const catalog = getSpotTagCatalogClient();
+  const builtinCodes = new Set(catalog.map((c) => c.code));
+  const draftTags = state.tagPopover.draftTags || [];
+
+  const gridEl = document.getElementById("spotTagBuiltinGrid");
+  if (gridEl) {
+    const iconFor = {
+      ev_charging: "⚡",
+      rentable: "🤝",
+      private: "🔒",
+      large_friendly: "🚙",
+      accessible: "♿",
+      visitor: "访",
+    };
+    gridEl.innerHTML = catalog
+      .map((item) => {
+        const isOn = draftTags.includes(item.code);
+        const ic = iconFor[item.code] || item.short_badge || "🏷️";
+        return `
+          <button type="button" class="stp-tag-btn ${isOn ? "is-on" : ""}" data-tag-code="${escapeHtml(item.code)}" title="${escapeHtml(item.description || item.label)}">
+            <span>${ic} ${escapeHtml(item.label)}</span>
+            <span class="stp-tag-check">${isOn ? "✓" : ""}</span>
+          </button>
+        `;
+      })
+      .join("");
+  }
+
+  const customChipsEl = document.getElementById("spotTagCustomChips");
+  if (customChipsEl) {
+    const customs = draftTags.filter((t) => !builtinCodes.has(t));
+    customChipsEl.innerHTML = customs
+      .map(
+        (ct) => `
+        <span class="stp-custom-chip">
+          #${escapeHtml(ct)}
+          <button type="button" data-remove-custom-tag="${escapeHtml(ct)}" aria-label="移除标签">✕</button>
+        </span>
+      `
+      )
+      .join("");
+  }
+
+  const evDrawer = document.getElementById("spotTagEvDrawer");
+  if (evDrawer) {
+    evDrawer.classList.toggle("hidden", !draftTags.includes("ev_charging"));
+  }
+  const rentDrawer = document.getElementById("spotTagRentalDrawer");
+  if (rentDrawer) {
+    rentDrawer.classList.toggle("hidden", !draftTags.includes("rentable"));
+  }
+}
+
+function openSpotTagPopover(spotIds, clientX, clientY) {
+  const allSpots = getAllPlacedOverviewSpots();
+  const cleanIds = [...new Set((spotIds || []).filter(Boolean))];
+  const targetSpots = allSpots.filter((s) => cleanIds.includes(s.spot_id));
+  if (!targetSpots.length) return;
+
+  const first = targetSpots[0];
+  let initialTags;
+  if (targetSpots.length === 1) {
+    initialTags = [...(Array.isArray(first.tags) ? first.tags : [])];
+    if (first.is_ev && !initialTags.includes("ev_charging")) initialTags.unshift("ev_charging");
+  } else {
+    // Multi-select: pre-check tags shared across all selected spots
+    const firstTags = Array.isArray(first.tags) ? first.tags : [];
+    initialTags = firstTags.filter((t) =>
+      targetSpots.every((sp) => (sp.tags || []).includes(t) || (t === "ev_charging" && sp.is_ev))
+    );
+  }
+
+  state.tagPopover.open = true;
+  state.tagPopover.spotIds = targetSpots.map((s) => s.spot_id);
+  state.tagPopover.draftTags = initialTags;
+  state.tagPopover.anchorX = clientX || window.innerWidth * 0.55;
+  state.tagPopover.anchorY = clientY || window.innerHeight * 0.42;
+
+  const eyebrowEl = document.getElementById("spotTagPopoverEyebrow");
+  const titleEl = document.getElementById("spotTagPopoverTitle");
+  const stPillEl = document.getElementById("spotTagPopoverStatusPill");
+  const sameGrpBtn = document.getElementById("btnSelectSameGroupInTagPopover");
+
+  const stLabels = { FREE: "空闲可停", OCCUPIED: "已停车辆", BLOCKED: "占道禁停", UNKNOWN: "待接入" };
+  if (targetSpots.length === 1) {
+    const grpTitle = first.group_name || first.zone_name || first.group_code || "小区车位";
+    if (eyebrowEl) eyebrowEl.textContent = grpTitle;
+    if (titleEl) titleEl.textContent = `${first.label} 号车位`;
+    const effSt = getEffectiveSpotStatusClient(first);
+    if (stPillEl) {
+      stPillEl.textContent = stLabels[effSt] || effSt;
+      stPillEl.className = `stp-status-pill st-${effSt}`;
+      stPillEl.hidden = false;
+    }
+  } else {
+    if (eyebrowEl) eyebrowEl.textContent = "Shift 多选 · 批量精细化改标";
+    if (titleEl) titleEl.textContent = `已选 ${targetSpots.length} 个车位`;
+    if (stPillEl) {
+      stPillEl.textContent = "批量同步";
+      stPillEl.className = "stp-status-pill";
+      stPillEl.hidden = false;
+    }
+  }
+
+  if (sameGrpBtn) {
+    const grpKey = first.group_code || first.zone_id || "";
+    const grpCount = grpKey
+      ? allSpots.filter((s) => (first.group_code ? s.group_code === first.group_code : s.zone_id === first.zone_id)).length
+      : 0;
+    sameGrpBtn.hidden = grpCount <= 1 || grpCount === targetSpots.length;
+    if (!sameGrpBtn.hidden) {
+      sameGrpBtn.textContent = `同排全选(${grpCount})`;
+    }
+  }
+
+  const meta = first.tag_meta || {};
+  const setVal = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.value = v || "";
+  };
+  setVal("spotTagChargerInput", meta.charger_power || "");
+  setVal("spotTagRentalWindowInput", meta.rental_window || "");
+  setVal("spotTagRentalPriceInput", meta.rental_price || "");
+  setVal("spotTagRentalContactInput", meta.rental_contact || "");
+  setVal("spotTagNoteInput", meta.note || "");
+  setVal("spotTagCustomInput", "");
+
+  const autoBadge = document.getElementById("spotTagEvAutoBadge");
+  if (autoBadge) {
+    autoBadge.classList.toggle("hidden", !meta.ev_auto_detected);
+  }
+
+  syncSpotTagPopoverDrawersAndPills();
+
+  const pop = document.getElementById("spotTagPopover");
+  if (pop) {
+    pop.classList.remove("hidden");
+    positionSpotTagPopover(state.tagPopover.anchorX, state.tagPopover.anchorY);
+  }
+  if (state.overview) renderAbstractSvgMap(state.overview);
+}
+
+function closeSpotTagPopover() {
+  if (!state.tagPopover?.open) return;
+  state.tagPopover.open = false;
+  state.tagPopover.spotIds = [];
+  const pop = document.getElementById("spotTagPopover");
+  pop?.classList.add("hidden");
+  if (state.overview) renderAbstractSvgMap(state.overview);
+}
+
+function handleBrowseSpotTagClick(spotId, additive, clientX, clientY) {
+  if (!spotId) return;
+  let nextIds;
+  if (additive && state.tagPopover?.open && Array.isArray(state.tagPopover.spotIds)) {
+    const cur = new Set(state.tagPopover.spotIds);
+    if (cur.has(spotId) && cur.size > 1) cur.delete(spotId);
+    else cur.add(spotId);
+    nextIds = [...cur];
+  } else {
+    nextIds = [spotId];
+  }
+  openSpotTagPopover(nextIds, clientX, clientY);
+}
+
+async function saveSpotTagPopoverChanges() {
+  const ids = state.tagPopover?.spotIds || [];
+  if (!ids.length) return;
+
+  const nextTags = [...(state.tagPopover.draftTags || [])];
+  const hasEv = nextTags.includes("ev_charging");
+  const hasRent = nextTags.includes("rentable");
+  const tagMeta = {
+    charger_power: hasEv ? (document.getElementById("spotTagChargerInput")?.value || "").trim() : "",
+    rental_window: hasRent ? (document.getElementById("spotTagRentalWindowInput")?.value || "").trim() : "",
+    rental_price: hasRent ? (document.getElementById("spotTagRentalPriceInput")?.value || "").trim() : "",
+    rental_contact: hasRent ? (document.getElementById("spotTagRentalContactInput")?.value || "").trim() : "",
+    note: (document.getElementById("spotTagNoteInput")?.value || "").trim(),
+  };
+
+  // Update Edit Mode draftSpots in memory if Edit Mode is currently active
+  if (state.siteMap?.editMode && Array.isArray(state.siteMap.draftSpots)) {
+    state.siteMap.draftSpots.forEach((sp) => {
+      if (ids.includes(sp.spot_id)) {
+        sp.tags = [...nextTags];
+        sp.tag_meta = { ...(sp.tag_meta || {}), ...tagMeta };
+        sp.is_ev = hasEv;
+        sp.is_rentable = hasRent;
+      }
+    });
+  }
+
+  // Persist immediately to SQLite for all existing DB spots
+  const persistedIds = ids.filter((sid) => !String(sid).startsWith("NEW_"));
+  const saveBtn = document.getElementById("btnSaveSpotTags");
+  if (saveBtn) saveBtn.disabled = true;
+  try {
+    if (persistedIds.length > 0) {
+      await api("/api/spots/tags", {
+        method: "POST",
+        body: JSON.stringify({
+          spot_ids: persistedIds,
+          tags: nextTags,
+          tag_meta: tagMeta,
+        }),
+      });
+    }
+    closeSpotTagPopover();
+    if (!state.siteMap?.editMode) {
+      await refreshOverview();
+    } else {
+      syncSpotTagFilterCounts(state.overview);
+      renderAbstractSvgMap(state.overview);
+    }
+    const summary = nextTags.length
+      ? `已更新 ${ids.length} 个车位标签`
+      : `已清空 ${ids.length} 个车位标签`;
+    showAppleToast(`🏷️ ${summary}`);
+  } catch (err) {
+    showAppleToast(`保存标签失败：${err.message}`, "error");
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
+}
+
+function bindSpotTagPopoverAndFilters() {
+  document.getElementById("spotTagFilterPills")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".tag-filter-pill");
+    if (!btn) return;
+    const nextFilter = btn.dataset.tagFilter || "all";
+    state.siteMap.tagFilter =
+      state.siteMap.tagFilter === nextFilter && nextFilter !== "all" ? "all" : nextFilter;
+    syncSpotTagFilterCounts(state.overview);
+    if (state.overview) renderAbstractSvgMap(state.overview);
+  });
+
+  document.getElementById("btnEditSelectedSpotTags")?.addEventListener("click", (ev) => {
+    const sel = getSelectedSpots();
+    const targets = sel.length ? sel : getActiveGroupSpots();
+    if (!targets.length) {
+      showAppleToast("请先在画布点选或框选至少 1 个车位", "warn");
+      return;
+    }
+    const rect = ev.currentTarget.getBoundingClientRect();
+    openSpotTagPopover(
+      targets.map((s) => s.spot_id),
+      rect.left - 370,
+      rect.top
+    );
+  });
+
+  document.getElementById("spotTagBuiltinGrid")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".stp-tag-btn");
+    if (!btn) return;
+    const code = btn.dataset.tagCode;
+    if (!code) return;
+    const cur = state.tagPopover.draftTags || [];
+    const idx = cur.indexOf(code);
+    if (idx >= 0) cur.splice(idx, 1);
+    else cur.push(code);
+    state.tagPopover.draftTags = cur;
+    syncSpotTagPopoverDrawersAndPills();
+  });
+
+  const addCustomTagFromInput = () => {
+    const inp = document.getElementById("spotTagCustomInput");
+    if (!inp) return;
+    const val = inp.value.trim().replace(/^[#＃]+/, "").slice(0, 16);
+    if (!val) return;
+    if (!state.tagPopover.draftTags.includes(val)) {
+      state.tagPopover.draftTags.push(val);
+    }
+    inp.value = "";
+    syncSpotTagPopoverDrawersAndPills();
+  };
+
+  document.getElementById("btnAddCustomSpotTag")?.addEventListener("click", addCustomTagFromInput);
+  document.getElementById("spotTagCustomInput")?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      addCustomTagFromInput();
+    }
+  });
+
+  document.getElementById("spotTagCustomChips")?.addEventListener("click", (ev) => {
+    const rmBtn = ev.target.closest("[data-remove-custom-tag]");
+    if (!rmBtn) return;
+    const targetTag = rmBtn.dataset.removeCustomTag;
+    state.tagPopover.draftTags = (state.tagPopover.draftTags || []).filter((t) => t !== targetTag);
+    syncSpotTagPopoverDrawersAndPills();
+  });
+
+  document.getElementById("spotTagPopover")?.addEventListener("click", (ev) => {
+    const presetBtn = ev.target.closest(".stp-preset-chip");
+    if (!presetBtn) return;
+    const wrap = presetBtn.closest("[data-target-input]");
+    const inputId = wrap?.dataset?.targetInput;
+    const inp = inputId ? document.getElementById(inputId) : null;
+    if (inp) {
+      inp.value = presetBtn.dataset.val || "";
+      inp.focus();
+    }
+  });
+
+  document.getElementById("btnSelectSameGroupInTagPopover")?.addEventListener("click", () => {
+    const allSpots = getAllPlacedOverviewSpots();
+    const first = allSpots.find((s) => s.spot_id === state.tagPopover.spotIds?.[0]);
+    if (!first) return;
+    const grpIds = allSpots
+      .filter((s) => (first.group_code ? s.group_code === first.group_code : s.zone_id === first.zone_id))
+      .map((s) => s.spot_id);
+    if (grpIds.length) {
+      openSpotTagPopover(grpIds, state.tagPopover.anchorX, state.tagPopover.anchorY);
+    }
+  });
+
+  document.getElementById("btnClearSpotTags")?.addEventListener("click", () => {
+    state.tagPopover.draftTags = [];
+    ["spotTagChargerInput", "spotTagRentalWindowInput", "spotTagRentalPriceInput", "spotTagRentalContactInput", "spotTagNoteInput"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.value = "";
+    });
+    syncSpotTagPopoverDrawersAndPills();
+  });
+
+  document.getElementById("btnCloseSpotTagPopover")?.addEventListener("click", closeSpotTagPopover);
+  document.getElementById("btnCancelSpotTagPopover")?.addEventListener("click", closeSpotTagPopover);
+  document.getElementById("btnSaveSpotTags")?.addEventListener("click", saveSpotTagPopoverChanges);
+
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && state.tagPopover?.open) {
+      closeSpotTagPopover();
+    }
+  });
+}
+

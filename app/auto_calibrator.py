@@ -1850,7 +1850,7 @@ class ReferenceAutoCalibrator:
         )
         raw_dividers: List[Tuple[float, float]] = []
         if lines is not None:
-            for seg in lines[:, 0]:
+            for seg in np.asarray(lines).reshape(-1, 4):
                 x1, y1, x2, y2 = float(seg[0]), float(seg[1] + r0), float(seg[2]), float(seg[3] + r0)
                 dy = y2 - y1
                 dx = x2 - x1

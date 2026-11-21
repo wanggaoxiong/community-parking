@@ -2,6 +2,7 @@ import datetime
 import heapq
 import json
 import math
+import random
 import re
 import sqlite3
 import threading
@@ -929,6 +930,73 @@ class Database:
                     vehicle_type TEXT NOT NULL DEFAULT 'standard',
                     voice_lang TEXT NOT NULL DEFAULT 'zh-CN',
                     updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ad_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ad_campaigns (
+                    campaign_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    subtitle TEXT NOT NULL DEFAULT '',
+                    advertiser_name TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT 'car_wash',
+                    billing_model TEXT NOT NULL DEFAULT 'CPS',
+                    unit_price REAL NOT NULL DEFAULT 0.0,
+                    priority_tier INTEGER NOT NULL DEFAULT 2,
+                    weight INTEGER NOT NULL DEFAULT 5,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    placements_json TEXT NOT NULL DEFAULT '{}',
+                    creative_json TEXT NOT NULL DEFAULT '{}',
+                    targeting_json TEXT NOT NULL DEFAULT '{}',
+                    partner_token TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ad_daily_stats (
+                    campaign_id TEXT NOT NULL,
+                    stat_date TEXT NOT NULL,
+                    platform TEXT NOT NULL DEFAULT 'desktop_web',
+                    surface TEXT NOT NULL DEFAULT '18790_mobile',
+                    impressions INTEGER NOT NULL DEFAULT 0,
+                    unique_visitors INTEGER NOT NULL DEFAULT 0,
+                    audio_plays INTEGER NOT NULL DEFAULT 0,
+                    video_views INTEGER NOT NULL DEFAULT 0,
+                    clicks INTEGER NOT NULL DEFAULT 0,
+                    calls INTEGER NOT NULL DEFAULT 0,
+                    copies INTEGER NOT NULL DEFAULT 0,
+                    navigations INTEGER NOT NULL DEFAULT 0,
+                    coupons_issued INTEGER NOT NULL DEFAULT 0,
+                    coupons_redeemed INTEGER NOT NULL DEFAULT 0,
+                    leads_submitted INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (campaign_id, stat_date, platform, surface)
+                );
+
+                CREATE TABLE IF NOT EXISTS ad_coupons (
+                    coupon_code TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'issued',
+                    unit_id TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL DEFAULT '',
+                    issued_at REAL NOT NULL,
+                    redeemed_at REAL,
+                    redeem_note TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS ad_leads (
+                    lead_id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL,
+                    contact_phone TEXT NOT NULL,
+                    contact_name TEXT NOT NULL DEFAULT '',
+                    unit_id TEXT NOT NULL DEFAULT '',
+                    vehicle_type TEXT NOT NULL DEFAULT '',
+                    remark TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
                 );
                 """
             )
@@ -6490,6 +6558,341 @@ class Database:
             "spots": self.list_spots(),
             "site_map": self.get_site_map(include_backdrop=False),
         }
+
+    # ------------------------------------------------------------------
+    # Ad Operations, Coupons, Leads & Daily Reconciliation Stats
+    # ------------------------------------------------------------------
+
+    def get_ad_settings(self) -> Dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value_json FROM ad_settings WHERE setting_key = 'global'"
+            ).fetchone()
+            if not row or not row["value_json"]:
+                return {}
+            try:
+                parsed = json.loads(row["value_json"])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+
+    def save_ad_settings(self, settings: Dict[str, Any]) -> None:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ad_settings (setting_key, value_json, updated_at)
+                VALUES ('global', ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (json.dumps(settings, ensure_ascii=False), now),
+            )
+
+    @staticmethod
+    def _row_to_ad_campaign(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        d["enabled"] = bool(d.get("enabled"))
+        for col_json, out_key in (
+            ("placements_json", "placements"),
+            ("creative_json", "creative"),
+            ("targeting_json", "targeting"),
+        ):
+            raw = d.pop(col_json, "{}")
+            try:
+                parsed = json.loads(raw) if raw else {}
+                d[out_key] = parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                d[out_key] = {}
+        return d
+
+    def list_ad_campaigns(self, only_enabled: bool = False) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM ad_campaigns"
+        if only_enabled:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY priority_tier ASC, weight DESC, updated_at DESC"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql).fetchall()
+            return [self._row_to_ad_campaign(r) for r in rows]
+
+    def get_ad_campaign(self, campaign_id: str) -> Optional[Dict[str, Any]]:
+        cid = str(campaign_id or "").strip()
+        if not cid:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM ad_campaigns WHERE campaign_id = ?", (cid,)
+            ).fetchone()
+            return self._row_to_ad_campaign(row) if row else None
+
+    def upsert_ad_campaign(self, camp: Dict[str, Any]) -> Dict[str, Any]:
+        now = time.time()
+        cid = str(camp["campaign_id"]).strip()
+        with self._lock, self._connect() as conn:
+            prev = conn.execute(
+                "SELECT created_at FROM ad_campaigns WHERE campaign_id = ?", (cid,)
+            ).fetchone()
+            created_at = float(prev["created_at"]) if prev else now
+            conn.execute(
+                """
+                INSERT INTO ad_campaigns (
+                    campaign_id, title, subtitle, advertiser_name, category, billing_model,
+                    unit_price, priority_tier, weight, enabled,
+                    placements_json, creative_json, targeting_json, partner_token,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id) DO UPDATE SET
+                    title = excluded.title,
+                    subtitle = excluded.subtitle,
+                    advertiser_name = excluded.advertiser_name,
+                    category = excluded.category,
+                    billing_model = excluded.billing_model,
+                    unit_price = excluded.unit_price,
+                    priority_tier = excluded.priority_tier,
+                    weight = excluded.weight,
+                    enabled = excluded.enabled,
+                    placements_json = excluded.placements_json,
+                    creative_json = excluded.creative_json,
+                    targeting_json = excluded.targeting_json,
+                    partner_token = excluded.partner_token,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cid,
+                    str(camp["title"]),
+                    str(camp.get("subtitle") or ""),
+                    str(camp.get("advertiser_name") or ""),
+                    str(camp.get("category") or "car_wash"),
+                    str(camp.get("billing_model") or "CPS"),
+                    float(camp.get("unit_price") or 0.0),
+                    int(camp.get("priority_tier") or 2),
+                    int(camp.get("weight") or 5),
+                    1 if camp.get("enabled", True) else 0,
+                    json.dumps(camp.get("placements") or {}, ensure_ascii=False),
+                    json.dumps(camp.get("creative") or {}, ensure_ascii=False),
+                    json.dumps(camp.get("targeting") or {}, ensure_ascii=False),
+                    str(camp.get("partner_token") or ""),
+                    created_at,
+                    now,
+                ),
+            )
+            saved_row = conn.execute(
+                "SELECT * FROM ad_campaigns WHERE campaign_id = ?", (cid,)
+            ).fetchone()
+            return self._row_to_ad_campaign(saved_row)
+
+    def delete_ad_campaign(self, campaign_id: str) -> bool:
+        cid = str(campaign_id or "").strip()
+        if not cid:
+            return False
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM ad_campaigns WHERE campaign_id = ?", (cid,))
+            conn.execute("DELETE FROM ad_daily_stats WHERE campaign_id = ?", (cid,))
+            return cur.rowcount > 0
+
+    def increment_ad_daily_stats(
+        self,
+        campaign_id: str,
+        stat_date: str,
+        platform: str,
+        surface: str,
+        deltas: Dict[str, int],
+    ) -> None:
+        allowed_cols = {
+            "impressions",
+            "unique_visitors",
+            "audio_plays",
+            "video_views",
+            "clicks",
+            "calls",
+            "copies",
+            "navigations",
+            "coupons_issued",
+            "coupons_redeemed",
+            "leads_submitted",
+        }
+        clean_deltas = {k: int(v) for k, v in deltas.items() if k in allowed_cols and int(v) != 0}
+        if not clean_deltas:
+            return
+        ins_cols = ["campaign_id", "stat_date", "platform", "surface"] + list(clean_deltas.keys())
+        placeholders = ", ".join("?" for _ in ins_cols)
+        upd_clause = ", ".join(f"{col} = ad_daily_stats.{col} + excluded.{col}" for col in clean_deltas.keys())
+        vals = [campaign_id, stat_date, platform, surface] + list(clean_deltas.values())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO ad_daily_stats ({', '.join(ins_cols)})
+                VALUES ({placeholders})
+                ON CONFLICT(campaign_id, stat_date, platform, surface) DO UPDATE SET
+                    {upd_clause}
+                """,
+                vals,
+            )
+
+    def get_ad_stats_by_campaign(self, days: int = 30) -> Dict[str, Dict[str, Any]]:
+        cutoff = (datetime.date.today() - datetime.timedelta(days=max(1, days) - 1)).isoformat()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ad_daily_stats WHERE stat_date >= ?", (cutoff,)
+            ).fetchall()
+
+        agg: Dict[str, Dict[str, Any]] = {}
+        metric_keys = (
+            "impressions",
+            "unique_visitors",
+            "audio_plays",
+            "video_views",
+            "clicks",
+            "calls",
+            "copies",
+            "navigations",
+            "coupons_issued",
+            "coupons_redeemed",
+            "leads_submitted",
+        )
+        for r in rows:
+            cid = str(r["campaign_id"])
+            bucket = agg.get(cid)
+            if bucket is None:
+                bucket = {k: 0 for k in metric_keys}
+                bucket["_dates"] = set()
+                bucket["by_platform"] = {}
+                agg[cid] = bucket
+            for k in metric_keys:
+                bucket[k] += int(r[k] or 0)
+            if (int(r["impressions"] or 0) + int(r["audio_plays"] or 0) + int(r["clicks"] or 0)) > 0:
+                bucket["_dates"].add(str(r["stat_date"]))
+            plat = str(r["platform"] or "web")
+            p_rec = bucket["by_platform"].setdefault(plat, {"impressions": 0, "clicks": 0})
+            p_rec["impressions"] += int(r["impressions"] or 0) + int(r["audio_plays"] or 0)
+            p_rec["clicks"] += int(r["clicks"] or 0)
+
+        for bucket in agg.values():
+            bucket["active_days"] = len(bucket.pop("_dates"))
+        return agg
+
+    def list_ad_daily_rows(self, campaign_id: str, days: int = 30) -> List[Dict[str, Any]]:
+        cutoff = (datetime.date.today() - datetime.timedelta(days=max(1, days) - 1)).isoformat()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT stat_date,
+                       SUM(impressions) AS impressions,
+                       SUM(unique_visitors) AS unique_visitors,
+                       SUM(audio_plays) AS audio_plays,
+                       SUM(video_views) AS video_views,
+                       SUM(clicks) AS clicks,
+                       SUM(coupons_issued) AS coupons_issued,
+                       SUM(coupons_redeemed) AS coupons_redeemed,
+                       SUM(leads_submitted) AS leads_submitted
+                FROM ad_daily_stats
+                WHERE campaign_id = ? AND stat_date >= ?
+                GROUP BY stat_date
+                ORDER BY stat_date DESC
+                """,
+                (campaign_id, cutoff),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def create_ad_coupon(
+        self,
+        coupon_code: str,
+        campaign_id: str,
+        unit_id: str = "",
+        platform: str = "",
+        issued_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        ts = float(issued_at if issued_at is not None else time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO ad_coupons (
+                    coupon_code, campaign_id, status, unit_id, platform, issued_at, redeemed_at, redeem_note
+                ) VALUES (?, ?, 'issued', ?, ?, ?, NULL, '')
+                """,
+                (coupon_code, campaign_id, unit_id, platform, ts),
+            )
+            row = conn.execute(
+                "SELECT * FROM ad_coupons WHERE coupon_code = ?", (coupon_code,)
+            ).fetchone()
+            return dict(row)
+
+    def get_ad_coupon(self, coupon_code: str) -> Optional[Dict[str, Any]]:
+        code = str(coupon_code or "").strip().upper()
+        if not code:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM ad_coupons WHERE coupon_code = ?", (code,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def mark_ad_coupon_redeemed(self, coupon_code: str, note: str = "") -> Dict[str, Any]:
+        code = str(coupon_code or "").strip().upper()
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE ad_coupons SET status = 'redeemed', redeemed_at = ?, redeem_note = ? WHERE coupon_code = ?",
+                (now, note, code),
+            )
+            row = conn.execute(
+                "SELECT * FROM ad_coupons WHERE coupon_code = ?", (code,)
+            ).fetchone()
+            return dict(row)
+
+    def list_ad_coupons(self, campaign_id: str = "", limit: int = 30) -> List[Dict[str, Any]]:
+        lim = max(1, min(200, int(limit or 30)))
+        with self._lock, self._connect() as conn:
+            if campaign_id:
+                rows = conn.execute(
+                    "SELECT * FROM ad_coupons WHERE campaign_id = ? ORDER BY issued_at DESC LIMIT ?",
+                    (campaign_id, lim),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM ad_coupons ORDER BY issued_at DESC LIMIT ?", (lim,)
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def create_ad_lead(
+        self,
+        campaign_id: str,
+        contact_phone: str,
+        contact_name: str = "",
+        unit_id: str = "",
+        vehicle_type: str = "",
+        remark: str = "",
+        platform: str = "",
+        created_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        ts = float(created_at if created_at is not None else time.time())
+        lead_id = f"LD_{int(ts * 1000)}_{random.randint(100, 999)}"
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ad_leads (
+                    lead_id, campaign_id, contact_phone, contact_name, unit_id, vehicle_type, remark, platform, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (lead_id, campaign_id, contact_phone, contact_name, unit_id, vehicle_type, remark, platform, ts),
+            )
+            row = conn.execute("SELECT * FROM ad_leads WHERE lead_id = ?", (lead_id,)).fetchone()
+            return dict(row)
+
+    def list_ad_leads(self, campaign_id: str = "", limit: int = 30) -> List[Dict[str, Any]]:
+        lim = max(1, min(200, int(limit or 30)))
+        with self._lock, self._connect() as conn:
+            if campaign_id:
+                rows = conn.execute(
+                    "SELECT * FROM ad_leads WHERE campaign_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (campaign_id, lim),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM ad_leads ORDER BY created_at DESC LIMIT ?", (lim,)
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     def reset_seed_data(self) -> None:
         with self._lock, self._connect() as conn:

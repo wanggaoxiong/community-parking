@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+from app.ad_operations import detect_client_platform
 from app.config import BASE_DIR, DATA_DIR, config_manager
 from app.spot_tags import (
     SPOT_TAG_CATALOG,
@@ -2248,6 +2249,39 @@ class VoiceGatewayService:
         )
         eff_lang = str(brief.get("voice_lang") or "zh-CN")
 
+        ads_mgr = getattr(self.ctx, "ads", None)
+        matched_ad = (
+            ads_mgr.match_ad_for_question(
+                clean_q,
+                unit_id=str(brief.get("unit_id") or ""),
+                vehicle_type=str(brief.get("vehicle_type") or "sedan"),
+                total_effective_free=int(brief.get("total_effective_free") or 0),
+            )
+            if ads_mgr is not None
+            else None
+        )
+        if matched_ad and ads_mgr is not None:
+            ads_mgr.record_event(
+                campaign_id=str(matched_ad["campaign_id"]),
+                event_type="impression",
+                platform="ios_siri" if channel == "siri" else channel,
+                surface="18791_ai_ask",
+                client_ip=client_ip,
+                external_uid=external_uid or "ask",
+                unit_id=str(brief.get("unit_id") or ""),
+                vehicle_type=str(brief.get("vehicle_type") or "sedan"),
+            )
+
+        def _build_partner_tip(ad_item: Dict[str, Any]) -> str:
+            offer = str(ad_item.get("offer_value") or ad_item.get("subtitle") or "").strip()
+            dist = str(ad_item.get("distance_hint") or ad_item.get("nav_address") or "").strip()
+            parts = [f"为您推荐周边合作商户「{ad_item['title']}」"]
+            if offer:
+                parts.append(offer)
+            if dist:
+                parts.append(dist)
+            return "，".join(parts) + "。"
+
         # Handle general "特色/标签车位空余汇总" question deterministically when user asks about all tags
         asking_all_tags_summary = (
             not detected_tag
@@ -2272,32 +2306,41 @@ class VoiceGatewayService:
                 "question": clean_q,
                 "answer": sum_ans,
                 "speech_text": self.format_repeated_speech(sum_ans, rep_s, voice_lang=eff_lang),
+                "matched_ad": matched_ad,
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
             }
 
         if not vg_cfg.get("llm_qa_enabled", True):
+            det_ans = brief["single_text"]
+            if matched_ad and eff_lang != "en-US":
+                det_ans = f"{det_ans} {_build_partner_tip(matched_ad)}"
+            rep_det = int(repeat) if repeat is not None else 1
             return {
                 **brief,
                 "engine": "deterministic_only",
                 "question": clean_q,
-                "answer": brief["single_text"],
+                "answer": det_ans,
+                "speech_text": self.format_repeated_speech(det_ans, rep_det, voice_lang=eff_lang),
+                "matched_ad": matched_ad,
             }
 
         # Zero-false-positive pre-shield only for unmistakable prompt-injection / code-generation abuse;
-        # everyday conversational parking/route/EV/rental/tag questions always flow smoothly.
+        # everyday conversational parking/route/EV/rental/tag/car-life questions always flow smoothly.
         q_low = clean_q.lower()
         has_parking_intent = bool(
             inline_unit
             or detected_tag
+            or matched_ad
             or any(
                 kw in clean_q
                 for kw in (
                     "车位", "停车", "空位", "停哪", "号楼", "单元", "大门", "怎么走", "倒车",
                     "SUV", "小车", "电瓶", "挪车", "新能源", "充电", "电桩", "电车", "绿牌",
                     "招租", "出租", "包月", "月租", "共享", "宽体", "无障碍", "轮椅", "访客", "产权", "标签",
+                    "洗车", "保养", "修车", "补胎", "车险", "加油", "生鲜", "便利店", "周边", "优惠",
                 )
             )
-            or any(kw in q_low for kw in ("park", "spot", "stall", "unit", "building", "gate", "ev", "charg", "rent"))
+            or any(kw in q_low for kw in ("park", "spot", "stall", "unit", "building", "gate", "ev", "charg", "rent", "wash"))
         )
         is_blatant_abuse = any(
             sig in q_low
@@ -2410,17 +2453,25 @@ class VoiceGatewayService:
         if not tag_ctx_lines:
             tag_ctx_lines.append("- 当前暂未单独标记新能源充电或对外招租等特色标签车位。")
 
+        partner_ctx_block = ""
+        if matched_ad:
+            partner_ctx_block = (
+                "\n- 关联社区合作车主服务（若车主询问相关服务或院内满位，可自然顺带推荐一句）："
+                f"{matched_ad['title']}（{matched_ad.get('offer_value') or ''} {matched_ad.get('subtitle') or ''}，"
+                f"{matched_ad.get('distance_hint') or matched_ad.get('nav_address') or ''}）"
+            )
+
         sys_prompt = (
             f"你是「{comm_name}」车载免手语音寻位助手，正在为开车的业主提供自然亲切的实时停车引导。\n"
             "【回答铁律】\n"
             f"1. {lang_persona_rule}适合车载语音直接朗读（控制在 2~3 句话、90 字以内，不要使用 Markdown 星号、列表符号或代码块）。\n"
             "2. 严禁播报任何具体车位编号或字母数字代码（例如绝对不要说 10LH2-02、5BV7-01、02号车位、Spot 02 等），开车时听编号费劲且无意义；只需要清楚告诉车主：目前剩余几个车位（若询问新能源充电、对外招租、宽体、无障碍等标签车位，务必明确播报该标签车位共几个、当前净余几个、推荐哪个停车带、步行约多少米，以及公开的充电功率或招租时段/月租说明）。\n"
             "3. 严格依据下方实时车位数据作答，宁少勿多，绝不编造空车位。\n"
-            "4. 若用户提问与本场所停车、车位、充电、招租、楼栋步行路线无关，请礼貌用一句话说明你仅提供实时寻位服务，并顺带播报当前总剩余车位数。\n\n"
+            "4. 若用户提问与本场所停车、车位、充电、招租、周边车主服务、楼栋步行路线无关，请礼貌用一句话说明你仅提供实时寻位服务，并顺带播报当前总剩余车位数。\n\n"
             f"【实时态势数据】\n"
             f"- 车主目标目的地：{brief['unit_name']}\n"
             + (
-                f"- 车主当前指定查询标签：{brief['tag_label']}（净余 {brief['tag_effective_free']}/{brief['tag_total_spots']} 位）\n"
+                f"- 车主当前指定查询标签：{brief['tag_label']}（净余 {brief['tag_effective_free']} / {brief['tag_total_spots']} 位）\n"
                 if detected_tag
                 else ""
             )
@@ -2430,6 +2481,7 @@ class VoiceGatewayService:
             + "\n".join(tag_ctx_lines)
             + "\n- 可选停车带实时余位：\n"
             + "\n".join(zone_lines)
+            + partner_ctx_block
         )
 
         llm_ans, llm_err = self._call_custom_llm_text(
@@ -2439,12 +2491,18 @@ class VoiceGatewayService:
             max_tokens=220,
         )
         if not llm_ans:
+            fb_ans = brief["single_text"]
+            if matched_ad and eff_lang != "en-US":
+                fb_ans = f"{fb_ans} {_build_partner_tip(matched_ad)}"
+            rep_fb = int(repeat) if repeat is not None else 1
             return {
                 **brief,
                 "engine": "fallback_deterministic",
                 "fallback_reason": llm_err or "llm_unavailable",
                 "question": clean_q,
-                "answer": brief["single_text"],
+                "answer": fb_ans,
+                "speech_text": self.format_repeated_speech(fb_ans, rep_fb, voice_lang=eff_lang),
+                "matched_ad": matched_ad,
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
             }
 
@@ -2463,6 +2521,7 @@ class VoiceGatewayService:
             "question": clean_q,
             "answer": clean_ans,
             "speech_text": self.format_repeated_speech(clean_ans, rep_out, voice_lang=eff_lang),
+            "matched_ad": matched_ad,
             "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
@@ -5047,6 +5106,90 @@ class VoiceGatewayService:
         lg_drv = "Drive" if is_en else "行车"
         lg_wlk = "Walk" if is_en else "步行"
         lg_tip = "Pinch to zoom · Tap stall" if is_en else "双指缩放 · 点车位看状态"
+
+        # Inline Quick Look-safe Car-Owner Welfare / Sponsor Slot (zero external network needed!)
+        hud_ad_html_both = ""
+        hud_ad_html_map = ""
+        ads_mgr = getattr(self.ctx, "ads", None)
+        if ads_mgr is not None:
+            siri_ad_sel = ads_mgr.select_for_siri_execution(
+                unit_id=str(brief.get("unit_id") or ""),
+                vehicle_type=str(brief.get("vehicle_type") or "sedan"),
+                total_effective_free=tot_free,
+                include_voice_tail=False,
+            )
+            hud_ad = siri_ad_sel.get("hud_ad")
+            if hud_ad:
+                surf_name = "siri_hud_map" if is_map_only else "siri_hud_both"
+                ads_mgr.record_event(
+                    campaign_id=str(hud_ad["campaign_id"]),
+                    event_type="impression",
+                    platform="ios_siri",
+                    surface=surf_name,
+                    external_uid=external_uid or "ios_siri_hud",
+                    unit_id=str(brief.get("unit_id") or ""),
+                    vehicle_type=str(brief.get("vehicle_type") or "sedan"),
+                )
+                vg_cfg_h = config_manager.get().get("voice_gateway", {})
+                pub_v_url = str(vg_cfg_h.get("public_voice_url") or request_base_url or "").strip().rstrip("/")
+                ws_id_cur = getattr(self.ctx, "workspace_id", "default")
+                ws_prefix = f"/w/{quote(ws_id_cur)}" if ws_id_cur != "default" else ""
+                redir_href = f"{pub_v_url}{ws_prefix}/r/{quote(str(hud_ad['campaign_id']))}?platform=ios_siri&surface={surf_name}"
+                thumb_b64 = str(hud_ad.get("hud_thumb_data_url") or "")
+                icon_str = _esc(hud_ad.get("icon") or "🎁")
+                thumb_el = (
+                    f'<img class="ad-thumb" src="{_esc(thumb_b64)}" alt="" />'
+                    if thumb_b64.startswith("data:image/")
+                    else f'<span class="ad-ic">{icon_str}</span>'
+                )
+                badge_lbl = _esc(hud_ad.get("badge_text") or "车主福利")
+                ad_title = _esc(hud_ad.get("title") or "")
+                ad_sub = _esc(hud_ad.get("subtitle") or hud_ad.get("terms_note") or "")
+                offer_pill = (
+                    f'<span class="ad-offer">{_esc(hud_ad["offer_value"])}</span>'
+                    if hud_ad.get("offer_value")
+                    else ""
+                )
+                dist_txt = _esc(hud_ad.get("distance_hint") or hud_ad.get("nav_address") or "")
+                phone_val = str(hud_ad.get("phone") or "").strip()
+                cta_lbl = _esc(hud_ad.get("cta_text") or "查看详情")
+
+                action_btns = []
+                if phone_val:
+                    action_btns.append(f'<a class="ad-btn ad-btn-ghost" href="tel:{_esc(phone_val)}">📞 拨号</a>')
+                if hud_ad.get("action_type") == "coupon":
+                    cp_ev = ads_mgr.record_event(
+                        campaign_id=str(hud_ad["campaign_id"]),
+                        event_type="issue_coupon",
+                        platform="ios_siri",
+                        surface=surf_name,
+                        external_uid=external_uid or "ios_siri_hud",
+                        unit_id=str(brief.get("unit_id") or ""),
+                    )
+                    c_code = _esc((cp_ev.get("coupon") or {}).get("coupon_code") or "VIP-8888")
+                    action_btns.append(f'<span class="ad-code">核销码：{c_code}</span>')
+                if hud_ad.get("action_type") in ("url", "map_nav") or hud_ad.get("nav_name"):
+                    action_btns.append(f'<a class="ad-btn" href="{_esc(redir_href)}">{cta_lbl} ↗</a>')
+                actions_html = f'<div class="ad-actions">{"".join(action_btns)}</div>' if action_btns else ""
+
+                if is_map_only:
+                    hud_ad_html_map = f"""<details class="ad-micro">
+      <summary><span class="ad-tag">{badge_lbl}</span><span class="ad-m-ttl">{ad_title}</span>{offer_pill}</summary>
+      <div class="ad-m-body">{ad_sub}{(' · ' + dist_txt) if dist_txt else ''}{actions_html}</div>
+    </details>"""
+                else:
+                    hud_ad_html_both = f"""<section class="ad-card">
+    <div class="ad-main">
+      {thumb_el}
+      <div class="ad-copy">
+        <div class="ad-top"><span class="ad-tag">{badge_lbl}</span>{offer_pill}{f'<span class="ad-dist">{dist_txt}</span>' if dist_txt else ''}</div>
+        <div class="ad-ttl">{ad_title}</div>
+        {f'<div class="ad-sub">{ad_sub}</div>' if ad_sub else ''}
+      </div>
+    </div>
+    {actions_html}
+  </section>"""
+
         return f"""<!doctype html>
 <html lang="{'en' if is_en else 'zh-CN'}">
 <head>
@@ -5077,6 +5220,26 @@ body{{margin:0;padding:12px;background:var(--bg);color:var(--text);font-family:-
 .dot{{display:inline-flex;align-items:center;gap:4px;font-weight:600}}
 .dot i{{width:8px;height:8px;border-radius:2px;display:inline-block}}
 #spTip{{font-weight:600;color:var(--text)}}
+.ad-card{{background:linear-gradient(145deg,#ffffff,#f8fafc);border:1px solid var(--line);border-radius:15px;padding:11px 13px;display:flex;flex-direction:column;gap:8px;box-shadow:0 2px 10px rgba(0,0,0,0.035)}}
+.ad-main{{display:flex;align-items:center;gap:10px}}
+.ad-thumb{{width:48px;height:48px;border-radius:10px;object-fit:cover;flex-shrink:0;border:1px solid var(--line)}}
+.ad-ic{{width:40px;height:40px;border-radius:10px;background:rgba(0,113,227,0.08);display:inline-flex;align-items:center;justify-content:center;font-size:19px;flex-shrink:0}}
+.ad-copy{{flex:1;min-width:0}}
+.ad-top{{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:2px}}
+.ad-tag{{font-size:10.5px;font-weight:700;padding:1.5px 6px;border-radius:5px;background:rgba(0,113,227,0.1);color:#0071e3}}
+.ad-offer{{font-size:10.5px;font-weight:800;padding:1.5px 6px;border-radius:5px;background:rgba(245,158,11,0.14);color:#b45309}}
+.ad-dist{{font-size:11px;color:var(--muted)}}
+.ad-ttl{{font-size:13.5px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.ad-sub{{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.ad-actions{{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}}
+.ad-btn{{text-decoration:none;font-size:12px;font-weight:700;padding:5px 11px;border-radius:999px;background:#0071e3;color:#fff}}
+.ad-btn-ghost{{background:#f1f5f9;color:#1e293b}}
+.ad-code{{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;font-weight:700;padding:4px 9px;border-radius:7px;background:#fef3c7;color:#92400e;border:1px dashed #f59e0b}}
+.ad-micro{{border-top:1px solid var(--line);background:#fcfcfd;padding:6px 12px;font-size:11.5px}}
+.ad-micro summary{{list-style:none;display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600}}
+.ad-micro summary::-webkit-details-marker{{display:none}}
+.ad-m-ttl{{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}}
+.ad-m-body{{margin-top:6px;color:var(--muted);display:flex;flex-direction:column;gap:6px}}
 </style>
 </head>
 <body>
@@ -5093,7 +5256,9 @@ body{{margin:0;padding:12px;background:var(--bg);color:var(--text);font-family:-
       </div>
       <span id="spTip">{lg_tip}</span>
     </div>
+    {hud_ad_html_map}
   </section>
+  {hud_ad_html_both}
 </div>
 <script>
 document.querySelectorAll('.sp').forEach(function(el){{
@@ -5658,6 +5823,11 @@ def make_voice_http_handler(root_ctx: Any):
                     )
                     return
 
+                from app.server import try_handle_public_ad_get
+
+                if try_handle_public_ad_get(self, ctx, path, qs, default_surface="18791_voice"):
+                    return
+
                 if path == "/api/voice/status":
                     units = ctx.db.list_units()
                     metrics = vg.get_gateway_metrics()
@@ -5678,6 +5848,15 @@ def make_voice_http_handler(root_ctx: Any):
                         units=units,
                         selected_unit_id=def_uid_st,
                     )
+                    ads_mgr_st = getattr(ctx, "ads", None)
+                    ads_18791_st = (
+                        ads_mgr_st.select_for_voice_18791(
+                            unit_id=str(def_uid_st),
+                            total_effective_free=sum(int(z.get("effective_free") or 0) for z in st_zones),
+                        )
+                        if ads_mgr_st is not None
+                        else {"enabled": False, "live_capsule": None, "portal_items": []}
+                    )
                     self._send_json(
                         {
                             "ok": True,
@@ -5690,6 +5869,7 @@ def make_voice_http_handler(root_ctx: Any):
                             "voice_languages": voice_langs,
                             "spot_tag_catalog": SPOT_TAG_CATALOG,
                             "tag_availability": tag_avail_st,
+                            "ads": ads_18791_st,
                             "units": units,
                             "auth_required": bool(metrics.get("token_required")),
                             "authorized": bool(is_auth),
@@ -5749,13 +5929,78 @@ def make_voice_http_handler(root_ctx: Any):
                         voice_lang=eff_req_lang,
                         tag_filter=tag_flt,
                     )
+                    ads_mgr_b = getattr(ctx, "ads", None)
+                    ua_b = str(self.headers.get("User-Agent") or "")
                     if fmt not in ("card", "display", "text", "txt", "plain", "speech"):
                         vg.prewarm_tts_async(res.get("unit_id"), res.get("voice_lang"), vtype or "sedan")
                     if fmt in ("card", "display"):
-                        self._send_text(res["display_text"])
+                        card_out = str(res["display_text"])
+                        if ads_mgr_b is not None and str(res.get("voice_lang") or "zh-CN") != "en-US":
+                            siri_card_sel = ads_mgr_b.select_for_siri_execution(
+                                unit_id=str(res.get("unit_id") or ""),
+                                vehicle_type=str(res.get("vehicle_type") or "sedan"),
+                                tag_filter=str(res.get("tag_filter") or ""),
+                                total_effective_free=int(res.get("total_effective_free") or 0),
+                                include_voice_tail=False,
+                            )
+                            c_ad = siri_card_sel.get("hud_ad")
+                            if c_ad:
+                                ads_mgr_b.record_event(
+                                    campaign_id=str(c_ad["campaign_id"]),
+                                    event_type="impression",
+                                    platform=detect_client_platform(ua_b) if ua_b else "ios_siri",
+                                    surface="siri_text_card",
+                                    client_ip=self._client_ip(),
+                                    user_agent=ua_b,
+                                    external_uid=uid,
+                                    unit_id=str(res.get("unit_id") or ""),
+                                )
+                                offer_sfx = f"（{c_ad['offer_value']}）" if c_ad.get("offer_value") else ""
+                                phone_sfx = f" · ☎️{c_ad['phone']}" if c_ad.get("phone") else ""
+                                card_out = (
+                                    f"{card_out}\n──────────\n"
+                                    f"🎁 {c_ad.get('badge_text') or '车主福利'}：{c_ad['title']}{offer_sfx}{phone_sfx}"
+                                )
+                        self._send_text(card_out)
                     elif fmt in ("text", "txt", "plain", "speech"):
-                        self._send_text(res["speech_text"])
+                        sp_out = str(res["speech_text"])
+                        if ads_mgr_b is not None and str(res.get("voice_lang") or "zh-CN") != "en-US":
+                            siri_sp_sel = ads_mgr_b.select_for_siri_execution(
+                                unit_id=str(res.get("unit_id") or ""),
+                                vehicle_type=str(res.get("vehicle_type") or "sedan"),
+                                tag_filter=str(res.get("tag_filter") or ""),
+                                total_effective_free=int(res.get("total_effective_free") or 0),
+                                include_voice_tail=True,
+                            )
+                            vt_ad = siri_sp_sel.get("voice_tail_ad")
+                            vt_txt = str(siri_sp_sel.get("voice_tail_text") or "").strip()
+                            if vt_ad and vt_txt:
+                                ads_mgr_b.record_event(
+                                    campaign_id=str(vt_ad["campaign_id"]),
+                                    event_type="audio_play",
+                                    platform=detect_client_platform(ua_b) if ua_b else "ios_siri",
+                                    surface="voice_tail",
+                                    client_ip=self._client_ip(),
+                                    user_agent=ua_b,
+                                    external_uid=uid,
+                                    unit_id=str(res.get("unit_id") or ""),
+                                )
+                                pass1 = f"{res['single_text']} {vt_txt}"
+                                sp_out = vg.format_repeated_speech(
+                                    pass1,
+                                    int(res.get("repeat") or 1),
+                                    repeat_core=str(res.get("repeat_text") or ""),
+                                    voice_lang=str(res.get("voice_lang") or "zh-CN"),
+                                )
+                        self._send_text(sp_out)
                     else:
+                        if ads_mgr_b is not None:
+                            res["ads"] = ads_mgr_b.select_for_voice_18791(
+                                unit_id=str(res.get("unit_id") or ""),
+                                vehicle_type=str(res.get("vehicle_type") or "sedan"),
+                                tag_filter=str(res.get("tag_filter") or ""),
+                                total_effective_free=int(res.get("total_effective_free") or 0),
+                            )
                         self._send_json(res)
                     return
 
@@ -5788,6 +6033,36 @@ def make_voice_http_handler(root_ctx: Any):
                             tag_filter=tag_flt,
                         )
                         tts_text = str(br_tts["speech_text"] if rep > 1 else br_tts["single_text"])
+                        ads_mgr_t = getattr(ctx, "ads", None)
+                        if ads_mgr_t is not None and eff_t_lang != "en-US":
+                            siri_t_sel = ads_mgr_t.select_for_siri_execution(
+                                unit_id=str(br_tts.get("unit_id") or ""),
+                                vehicle_type=str(br_tts.get("vehicle_type") or "sedan"),
+                                tag_filter=str(br_tts.get("tag_filter") or ""),
+                                total_effective_free=int(br_tts.get("total_effective_free") or 0),
+                                include_voice_tail=True,
+                            )
+                            vt_ad_t = siri_t_sel.get("voice_tail_ad")
+                            vt_txt_t = str(siri_t_sel.get("voice_tail_text") or "").strip()
+                            if vt_ad_t and vt_txt_t:
+                                ua_t = str(self.headers.get("User-Agent") or "")
+                                ads_mgr_t.record_event(
+                                    campaign_id=str(vt_ad_t["campaign_id"]),
+                                    event_type="audio_play",
+                                    platform=detect_client_platform(ua_t),
+                                    surface="voice_tail_mp3",
+                                    client_ip=self._client_ip(),
+                                    user_agent=ua_t,
+                                    external_uid=uid,
+                                    unit_id=str(br_tts.get("unit_id") or ""),
+                                )
+                                pass1_t = f"{br_tts['single_text']} {vt_txt_t}"
+                                tts_text = vg.format_repeated_speech(
+                                    pass1_t,
+                                    rep,
+                                    repeat_core=str(br_tts.get("repeat_text") or ""),
+                                    voice_lang=eff_t_lang,
+                                )
 
                     mp3_bytes = vg.synthesize_tts_mp3(tts_text, voice_lang=eff_t_lang)
                     if not mp3_bytes:
@@ -6174,6 +6449,12 @@ code{{display:block;background:#0f172a;padding:10px;border-radius:8px;word-break
             qs = parse_qs(parsed.query)
             path, ctx = self._resolve_ws(parsed.path, qs)
             vg: VoiceGatewayService = ctx.voice_gateway
+
+            if path in ("/api/public/ad-event", "/api/public/ad-partner-redeem"):
+                from app.server import try_handle_public_ad_post
+
+                try_handle_public_ad_post(self, ctx, path, qs=qs, default_surface="18791_voice")
+                return
 
             try:
                 body = self._read_small_json()

@@ -56,6 +56,10 @@
         </button>
         <button class="tab-btn" data-tab="calibrate" role="tab">空间标定</button>
         <button class="tab-btn" data-tab="lab" role="tab">抓拍测试</button>
+        <button class="tab-btn" data-tab="ads" role="tab">
+          推广与运营
+          <span id="navAdsCountBadge" class="nav-pill-count hidden">0</span>
+        </button>
       </nav>
 
       <div class="header-actions">
@@ -1545,6 +1549,163 @@
         <div id="camHubCardsGrid" class="cam-hub-cards-grid"></div>
       </div>
     </section>
+
+    <!-- ==================== TAB 6: AD OPERATIONS, MULTI-SURFACE PLACEMENT & RECONCILIATION ==================== -->
+    <section id="tab-ads" class="tab-panel">
+      <div class="gov-shell ads-ops-shell">
+        <div class="bento-card gov-hero-card ads-hero-card">
+          <div class="gov-hero-top">
+            <div>
+              <span class="eyebrow">双端差异化版面 · 4D 场景精准触发 · IAB 防刷去重 · 合作商透明对账单</span>
+              <h2>社区车主服务与广告运营中心</h2>
+              <p class="gov-hero-sub">
+                统一编排 <code>:18790</code> 视觉寻位页、<code>:18791</code> 车主生活橱窗、Siri/小艺快捷指令执行后版面（含平面图 HUD、文字卡与首遍语音冠名），覆盖 CPT/CPM/CPC/CPA/CPS 全合作结算模式。
+              </p>
+            </div>
+            <div class="gov-hero-cta">
+              <button id="btnAdsSeedDemos" class="btn-apple btn-apple-secondary btn-apple-sm" type="button" title="一键载入洗车CPS券、新能源快充、满位周边地库、晚市生鲜4个典型样板">
+                ✨ 载入行业样板
+              </button>
+              <button id="btnAdsExportCsv" class="btn-apple btn-apple-secondary btn-apple-sm" type="button">
+                📥 导出对账 CSV
+              </button>
+              <button id="btnAdsCreateCampaign" class="btn-apple btn-apple-primary btn-apple-sm" type="button">
+                ＋ 新建推广计划
+              </button>
+            </div>
+          </div>
+
+          <!-- Global Safety & Quiet Hours Strip -->
+          <div class="ads-global-bar">
+            <label class="apple-check">
+              <input type="checkbox" id="adsMasterSwitch" checked />
+              <span>启用全站商业化与物业通知展示（关闭后所有端口瞬间恢复零推广纯净态）</span>
+            </label>
+            <div class="ads-global-right">
+              <label class="apple-check" title="仅对勾选了语音尾缀的计划生效，且严格限制仅第1遍播报附带，第2遍复诵绝不重复">
+                <input type="checkbox" id="adsVoiceTailSwitch" checked />
+                <span>允许首遍语音冠名尾缀</span>
+              </label>
+              <div class="ads-quiet-pill">
+                <span>🌙 夜间免打扰</span>
+                <input type="text" id="adsQuietHoursInput" value="22:00-07:30" maxlength="16" aria-label="语音免打扰时段" />
+              </div>
+              <select id="adsStatsDaysSelect" class="ads-days-select" aria-label="对账统计周期">
+                <option value="7">近 7 天对账</option>
+                <option value="30" selected>近 30 天对账</option>
+                <option value="90">近 90 天对账</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- 5-Tile Apple Bento Reconciliation KPI Strip -->
+          <div class="ads-kpi-strip">
+            <div class="gov-kpi-tile is-static ads-kpi-highlight">
+              <span class="kpi-label">应收预估结算总额</span>
+              <strong id="adsKpiRevenue" class="accent-blue">¥0.00</strong>
+              <span id="adsKpiActiveSub" class="kpi-sub">0 个在投计划</span>
+            </div>
+            <div class="gov-kpi-tile is-static">
+              <span class="kpi-label">去重有效曝光 (PV / 独立车主UV)</span>
+              <strong id="adsKpiExposure">0 / 0</strong>
+              <span id="adsKpiMediaSub" class="kpi-sub">语音播报 0 · 微视频 0</span>
+            </div>
+            <div class="gov-kpi-tile is-static">
+              <span class="kpi-label">有效互动点击 &amp; 点击率</span>
+              <strong id="adsKpiClicks">0</strong>
+              <span id="adsKpiCtrSub" class="kpi-sub">CTR 0.00%（已滤除连点）</span>
+            </div>
+            <div class="gov-kpi-tile is-static">
+              <span class="kpi-label">电子券发放 / 到店实锤核销</span>
+              <strong id="adsKpiCoupons" class="accent-green">0 / 0</strong>
+              <span class="kpi-sub">CPS 按实际到店核销记账</span>
+            </div>
+            <div class="gov-kpi-tile is-static">
+              <span class="kpi-label">CPA 预约线索 &amp; 电话咨询</span>
+              <strong id="adsKpiLeads">0</strong>
+              <span class="kpi-sub">车险/包月/保养精准留资</span>
+            </div>
+          </div>
+
+          <!-- Sub-view Switcher + Instant Coupon Redemption Desk -->
+          <div class="gov-toolbar ads-toolbar">
+            <div class="gov-view-seg" role="tablist" aria-label="广告运营视图">
+              <button type="button" class="gov-view-btn active" data-ads-pane="campaigns">
+                推广计划与结算台账
+              </button>
+              <button type="button" class="gov-view-btn" data-ads-pane="coupons">
+                领券与核销流水
+              </button>
+              <button type="button" class="gov-view-btn" data-ads-pane="leads">
+                CPA 车主预约线索
+              </button>
+            </div>
+
+            <div class="ads-redeem-desk">
+              <span class="ads-redeem-label">🎟️ 快速核销台：</span>
+              <input
+                type="text"
+                id="adsQuickRedeemInput"
+                placeholder="输入车主核销码 (如 XC-1121-8392)"
+                autocomplete="off"
+              />
+              <button type="button" id="btnAdsQuickRedeem" class="btn-apple btn-apple-tinted btn-apple-sm">
+                立即核销
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pane 1: Campaign Cards -->
+        <div id="adsPaneCampaigns" class="ads-pane">
+          <div id="adsCampaignsGrid" class="ads-campaigns-grid"></div>
+        </div>
+
+        <!-- Pane 2: Coupons Table -->
+        <div id="adsPaneCoupons" class="ads-pane hidden">
+          <div class="bento-card" style="padding:16px 18px;">
+            <div class="units-table-wrap" style="max-height:440px;">
+              <table class="units-manage-table">
+                <thead>
+                  <tr>
+                    <th>电子核销码</th>
+                    <th>所属推广计划</th>
+                    <th>状态</th>
+                    <th>目的地单元</th>
+                    <th>来源终端</th>
+                    <th>领券时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="adsCouponsTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pane 3: Leads Table -->
+        <div id="adsPaneLeads" class="ads-pane hidden">
+          <div class="bento-card" style="padding:16px 18px;">
+            <div class="units-table-wrap" style="max-height:440px;">
+              <table class="units-manage-table">
+                <thead>
+                  <tr>
+                    <th>联系电话</th>
+                    <th>车主称呼</th>
+                    <th>所属推广计划</th>
+                    <th>楼栋单元 / 车型</th>
+                    <th>需求备注</th>
+                    <th>来源终端</th>
+                    <th>提交时间</th>
+                  </tr>
+                </thead>
+                <tbody id="adsLeadsTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <!-- ==================== APPLE SHEET MODAL: AZURE AI FOUNDRY SETTINGS ==================== -->
@@ -2581,8 +2742,269 @@
     </div>
   </div>
 
+  <!-- ==================== APPLE STUDIO MODAL: AD CAMPAIGN EDITOR & LIVE MULTI-SURFACE SIMULATOR ==================== -->
+  <div id="adCampaignModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="adCampaignModalTitle">
+    <div id="adCampaignModalBackdrop" class="modal-backdrop"></div>
+    <div class="modal-sheet modal-sheet-ad-studio">
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow">双端口差异化展位 · 快捷指令 4 形态覆盖 · CPT/CPM/CPC/CPA/CPS 结算配置</span>
+          <h2 id="adCampaignModalTitle">新建 / 编辑推广运营计划</h2>
+        </div>
+        <button id="btnCloseAdCampaignModal" class="icon-close-btn" type="button" aria-label="关闭">✕</button>
+      </div>
+
+      <div class="sheet-body ad-studio-body">
+        <!-- Quick Industry Template Strip -->
+        <div class="ad-preset-strip">
+          <span class="ad-preset-lbl">⚡ 行业高频模板一键填充：</span>
+          <div id="adIndustryPresetChips" class="ad-preset-chips"></div>
+        </div>
+
+        <div class="ad-studio-split">
+          <!-- LEFT COLUMN: FORM -->
+          <div class="ad-studio-form">
+            <input type="hidden" id="adFormCampaignId" />
+
+            <div class="ad-form-section">
+              <div class="ad-sec-title">1. 商务合作与结算模式</div>
+              <div class="field-grid-2">
+                <div class="field">
+                  <label for="adFormTitle">主标题（车主端展示）</label>
+                  <input type="text" id="adFormTitle" placeholder="如：南门匠心精洗 · 业主晚间普洗 ¥19.9" maxlength="64" />
+                </div>
+                <div class="field">
+                  <label for="adFormAdvertiser">合作商户 / 机构名称</label>
+                  <input type="text" id="adFormAdvertiser" placeholder="如：匠心车美养护中心(南门旁)" maxlength="64" />
+                </div>
+              </div>
+              <div class="field" style="margin-top:8px;">
+                <label for="adFormSubtitle">副标题 / 权益简述</label>
+                <input type="text" id="adFormSubtitle" placeholder="如：含全车泡沫精洗+内饰吸尘，出示专属核销码即享" maxlength="140" />
+              </div>
+              <div class="field-grid-4" style="margin-top:8px;">
+                <div class="field">
+                  <label for="adFormCategory">行业场景分类</label>
+                  <select id="adFormCategory"></select>
+                </div>
+                <div class="field">
+                  <label for="adFormBilling">对账计费模式</label>
+                  <select id="adFormBilling">
+                    <option value="CPS">🎟️ CPS 按到店核销分润</option>
+                    <option value="CPT">📅 CPT 按天/包月买断</option>
+                    <option value="CPM">👁️ CPM 按千次有效触达</option>
+                    <option value="CPC">👆 CPC 按去重有效点击</option>
+                    <option value="CPA">📞 CPA 按留资/拨号线索</option>
+                    <option value="PUBLIC">📢 物业免费公益通知</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="adFormUnitPrice" id="adFormUnitPriceLabel">结算单价 (¥)</label>
+                  <input type="number" id="adFormUnitPrice" value="5" min="0" step="0.1" />
+                </div>
+                <div class="field">
+                  <label for="adFormTier">瀑布流优先级</label>
+                  <select id="adFormTier">
+                    <option value="1">Tier 1 · 紧急/置顶优先</option>
+                    <option value="2" selected>Tier 2 · 周边合作直客</option>
+                    <option value="3">Tier 3 · 联盟余量兜底</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div class="ad-form-section">
+              <div class="ad-sec-title">2. 跨端口差异化版面与快捷指令投递</div>
+              <div class="field-grid-2">
+                <div class="ad-surface-card">
+                  <label class="apple-check">
+                    <input type="checkbox" id="adFormP18790Enabled" checked />
+                    <strong>📱 :18790 交互态势平面图页</strong>
+                  </label>
+                  <select id="adFormP18790Layout" style="margin-top:6px;">
+                    <option value="capsule">极简实况胶囊条 (推荐 · 零遮挡)</option>
+                    <option value="card">精品图文特权卡 (含缩略海报)</option>
+                    <option value="video">静音内联微视频 (iOS/微信免全屏)</option>
+                    <option value="carousel">多商户轮播展位</option>
+                  </select>
+                </div>
+                <div class="ad-surface-card">
+                  <label class="apple-check">
+                    <input type="checkbox" id="adFormP18791Enabled" checked />
+                    <strong>🎙️ :18791 语音台与车主生活橱窗</strong>
+                  </label>
+                  <select id="adFormP18791Layout" style="margin-top:6px;">
+                    <option value="portal_card">车主生活橱窗图文卡 (推荐)</option>
+                    <option value="capsule">首屏实况轻量胶囊</option>
+                    <option value="video">橱窗静音微视频展位</option>
+                    <option value="ai_only">仅车主语音提问意图命中时弹出</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="ad-surface-card" style="margin-top:8px;">
+                <div class="field-grid-2">
+                  <label class="apple-check">
+                    <input type="checkbox" id="adFormSiriHudEnabled" checked />
+                    <span>⚡ 覆盖快捷指令执行后版面（文字+平面图 HUD / 仅平面图 / 仅文字卡）</span>
+                  </label>
+                  <label class="apple-check">
+                    <input type="checkbox" id="adFormAiRecEnabled" checked />
+                    <span>🤖 允许 AI 语音问答按车主意图顺带推荐</span>
+                  </label>
+                </div>
+                <div class="ad-voice-tail-row">
+                  <label class="apple-check">
+                    <input type="checkbox" id="adFormVoiceTailEnabled" />
+                    <span>🔊 追加纯语音首遍尾缀（仅第 1 遍播报附带，第 2 遍绝不重复）：</span>
+                  </label>
+                  <input type="text" id="adFormVoiceTailText" placeholder="≤28字，如：顺路提示，南门匠心精洗今晚特惠十九块九。" maxlength="28" />
+                </div>
+              </div>
+            </div>
+
+            <div class="ad-form-section">
+              <div class="ad-sec-title">3. 创意视觉、转化动作与跨端导航</div>
+              <div class="field-grid-4">
+                <div class="field">
+                  <label for="adFormBadgeText">角标文案</label>
+                  <input type="text" id="adFormBadgeText" value="业主专享" maxlength="14" />
+                </div>
+                <div class="field">
+                  <label for="adFormOfferValue">高亮利益点</label>
+                  <input type="text" id="adFormOfferValue" placeholder="如 ¥19.9 / 7折" maxlength="18" />
+                </div>
+                <div class="field">
+                  <label for="adFormActionType">点击转化动作</label>
+                  <select id="adFormActionType">
+                    <option value="coupon">🎟️ 生成电子核销码 (Apple Wallet风)</option>
+                    <option value="lead_form">📝 3秒极简预约留资单 (CPA)</option>
+                    <option value="map_nav">🧭 跨平台地图导航 (高德/苹果/微信)</option>
+                    <option value="call">📞 一键拨打商户电话</option>
+                    <option value="copy">💬 一键复制管家微信号</option>
+                    <option value="url">🔗 跳转外部活动链接 (UTM归因)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="adFormCtaText">按钮文案</label>
+                  <input type="text" id="adFormCtaText" value="领券立减" maxlength="14" />
+                </div>
+              </div>
+
+              <div class="field-grid-3" style="margin-top:8px;">
+                <div class="field">
+                  <label for="adFormCouponPrefix">核销码前缀 (CPS)</label>
+                  <input type="text" id="adFormCouponPrefix" value="XC" maxlength="4" />
+                </div>
+                <div class="field">
+                  <label for="adFormPhone">联系电话 (可选)</label>
+                  <input type="text" id="adFormPhone" placeholder="如 13800138000" maxlength="32" />
+                </div>
+                <div class="field">
+                  <label for="adFormWechat">商户/管家微信号 (可选)</label>
+                  <input type="text" id="adFormWechat" placeholder="如 xiaoqu_wash" maxlength="48" />
+                </div>
+              </div>
+
+              <div class="field-grid-3" style="margin-top:8px;">
+                <div class="field">
+                  <label for="adFormDistance">LBS 距离提示</label>
+                  <input type="text" id="adFormDistance" placeholder="如 距南门 80m" maxlength="24" />
+                </div>
+                <div class="field">
+                  <label for="adFormNavName">地图导航目的地名称</label>
+                  <input type="text" id="adFormNavName" placeholder="如 匠心车美养护中心" maxlength="48" />
+                </div>
+                <div class="field">
+                  <label for="adFormTargetUrl">活动外链 URL (可选)</label>
+                  <input type="url" id="adFormTargetUrl" placeholder="https://..." maxlength="400" />
+                </div>
+              </div>
+
+              <div class="field-grid-2" style="margin-top:8px;">
+                <div class="field">
+                  <label>海报缩略图（自动压缩至内存安全尺寸，Siri Quick Look 离线可见）</label>
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <input type="file" id="adFormImageFile" accept="image/*" style="font-size:12px;" />
+                    <button type="button" id="btnAdClearImage" class="btn-apple btn-apple-ghost btn-apple-xs">清除图片</button>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="adFormVideoUrl">静音微视频 MP4 地址（用于微视频版面，选填）</label>
+                  <input type="url" id="adFormVideoUrl" placeholder="https://.../promo.mp4" maxlength="400" />
+                </div>
+              </div>
+            </div>
+
+            <div class="ad-form-section">
+              <div class="ad-sec-title">4. 4D 场景精准定向规则（车位态 × 车型标签 × 时段季节 × 楼栋大门）</div>
+              <div class="field-grid-3">
+                <div class="field">
+                  <label for="adFormTriggerMode">车位态势触发条件</label>
+                  <select id="adFormTriggerMode">
+                    <option value="always">常态展示 (按权重公平轮播)</option>
+                    <option value="when_full">🔥 仅全区满位时紧急弹出 (周边地库首选)</option>
+                    <option value="when_tag">⚡ 仅筛选匹配车型/车位标签时展示</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="adFormTimeWindows">投放时段窗 (留空全天)</label>
+                  <input type="text" id="adFormTimeWindows" placeholder="如 16:30-21:30, 07:00-09:30" />
+                </div>
+                <div class="field">
+                  <label for="adFormUnits">定向楼栋/单元 (留空全小区)</label>
+                  <input type="text" id="adFormUnits" placeholder="如 5, 6, 8-1" />
+                </div>
+              </div>
+              <div class="field-grid-3" style="margin-top:8px;">
+                <div class="field">
+                  <label>定向车型（不勾选则全车型）</label>
+                  <div class="ad-inline-checks">
+                    <label><input type="checkbox" name="adVehChk" value="ev" /> ⚡新能源</label>
+                    <label><input type="checkbox" name="adVehChk" value="sedan" /> 轿车</label>
+                    <label><input type="checkbox" name="adVehChk" value="suv" /> SUV</label>
+                    <label><input type="checkbox" name="adVehChk" value="compact" /> 小车</label>
+                  </div>
+                </div>
+                <div class="field">
+                  <label>关联车位标签（命中加权）</label>
+                  <div class="ad-inline-checks">
+                    <label><input type="checkbox" name="adTagChk" value="ev_charging" /> ⚡充电位</label>
+                    <label><input type="checkbox" name="adTagChk" value="rentable" /> 🤝招租位</label>
+                    <label><input type="checkbox" name="adTagChk" value="wide_body" /> 🚙宽体位</label>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="adFormAccentColor">品牌主题色</label>
+                  <input type="color" id="adFormAccentColor" value="#0071E3" style="height:34px;padding:2px 4px;" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- RIGHT COLUMN: LIVE MULTI-SURFACE SIMULATOR -->
+          <div class="ad-studio-preview">
+            <div class="ad-prev-tabs">
+              <button type="button" class="ad-prev-tab active" data-prev-mode="18790">📱 :18790 态势页</button>
+              <button type="button" class="ad-prev-tab" data-prev-mode="18791">🎙️ :18791 橱窗</button>
+              <button type="button" class="ad-prev-tab" data-prev-mode="siri">⚡ 快捷指令执行后</button>
+            </div>
+            <div id="adLivePreviewPhone" class="ad-phone-frame"></div>
+          </div>
+        </div>
+
+        <p id="adModalFeedback" class="feedback-note"></p>
+      </div>
+
+      <div class="sheet-footer">
+        <button id="btnCancelAdCampaignModal" class="btn-apple btn-apple-ghost" type="button">取消</button>
+        <button id="btnSaveAdCampaignModal" class="btn-apple btn-apple-primary" type="button">保存并发布推广计划</button>
+      </div>
+    </div>
+  </div>
+
   <div id="appleToastHost" class="apple-toast-host" aria-live="polite"></div>
 
-  <script src="/app.js?v=20260420h"></script>
+  <script src="/app.js?v=20260421a"></script>
 </body>
 </html>

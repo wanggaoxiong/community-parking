@@ -121,6 +121,9 @@
           </div>
         </div>
 
+        <!-- 实况页极简车主礼遇胶囊条（无在投计划时隐藏，零遮挡） -->
+        <div id="vgLiveAdCapsule" class="vg-live-ad-capsule hidden" role="region" aria-label="社区车主服务提示"></div>
+
         <!-- 原生内联实时动态交互态势图（支持单指上下滑页面、双指缩放、点楼栋秒切单元） -->
         <div class="vg-map-stage" id="vgMapStage">
           <svg
@@ -198,6 +201,7 @@
               </div>
             </div>
             <p id="vgAnswerText" class="vg-answer-body"></p>
+            <div id="vgAiPartnerCard" class="vg-ai-partner-card hidden"></div>
           </div>
         </div>
 
@@ -403,7 +407,38 @@
           </div>
         </div>
       </div>
+
+      <!-- 差异化车主生活精选橱窗（支持图文特权卡、静音内联微视频、洗车/超充/车险/晚市生鲜） -->
+      <div id="vgLifeShowcaseCard" class="vg-card vg-life-showcase hidden" aria-label="社区车主生活精选橱窗">
+        <div class="vg-ai-head">
+          <div>
+            <h2>社区车主生活精选橱窗</h2>
+            <p>周边合作精洗、超充、车险、生鲜与满位地库专属权益</p>
+          </div>
+          <span class="vg-subtle-tag vg-tag-accent">业主专享</span>
+        </div>
+        <div id="vgLifeShowcaseGrid" class="vg-life-grid"></div>
+      </div>
     </section>
+  </div>
+
+  <!-- 车主权益领券 / 预约 / 跨平台地图导航弹窗 -->
+  <div id="vgAdModal" class="vg-ad-modal hidden" role="dialog" aria-modal="true" aria-labelledby="vgAdModalTitle">
+    <div id="vgAdModalBackdrop" class="vg-ad-backdrop"></div>
+    <div class="vg-ad-sheet">
+      <div class="vg-ad-sheet-head">
+        <div>
+          <span id="vgAdModalAdv" class="vg-ad-adv">社区合作商户</span>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:2px;">
+            <strong id="vgAdModalTitle">车主专享权益</strong>
+            <span id="vgAdModalOffer" class="vg-ad-offer hidden"></span>
+          </div>
+        </div>
+        <button type="button" id="vgCloseAdModalBtn" class="vg-ad-close" aria-label="关闭">✕</button>
+      </div>
+      <p id="vgAdModalSub" class="vg-ad-sub"></p>
+      <div id="vgAdModalBody" class="vg-ad-body"></div>
+    </div>
   </div>
 
   <div id="vgToast" class="vg-toast hidden" role="status" aria-live="polite"></div>

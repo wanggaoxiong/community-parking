@@ -1990,6 +1990,9 @@
         ? `备选 ${alts[0].display_name} 余${alts[0].effective_free}`
         : "";
 
+      if (data.ads) {
+        renderVoiceAdSurfaces(data.ads);
+      }
       refreshVoiceMap();
       updateSpeakBtnUI();
       if (speakAfterFetch && (state.latestSingleText || state.latestSpeech)) {
@@ -2056,6 +2059,7 @@
       if (emptyHint) emptyHint.classList.add("hidden");
       el("vgAnswerCard").classList.remove("hidden");
       el("vgAnswerText").textContent = state.latestAnswer;
+      renderAiMatchedAdCard(data.matched_ad || null);
 
       const eng = data.engine || data.source || "";
       const srcLabel =
@@ -2975,6 +2979,318 @@
     }
 
     setupSpeechRecognition();
+    bindVoiceAdSurfaces();
+  }
+
+  // ==================== :18791 Car-Owner Life Showcase, Contextual AI Card & Wallet Sheet ====================
+  const vgAdState = {
+    byId: {},
+    impressedIds: new Set(),
+    videoViewedIds: new Set(),
+    issuedCoupons: {},
+    activeCid: "",
+    visitorFp: (() => {
+      try {
+        const k = "cp_vg_vfp_v1";
+        let v = localStorage.getItem(k);
+        if (!v) {
+          v = "v_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+          localStorage.setItem(k, v);
+        }
+        return v;
+      } catch (_e) {
+        return "v_anon";
+      }
+    })(),
+  };
+
+  function escHtmlAd(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  async function postVoiceAdEvent(campaignId, eventType, surface = "18791_web", extra = {}) {
+    if (!campaignId) return null;
+    try {
+      const u = applyWsParam(new URL("/api/public/ad-event", window.location.origin));
+      const res = await fetch(u.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          campaign_id: campaignId,
+          event_type: eventType,
+          surface,
+          visitor_fp: vgAdState.visitorFp,
+          unit_id: state.unitId || "",
+          vehicle_type: state.vehicle || "sedan",
+          ...extra,
+        }),
+      });
+      return await res.json();
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function trackVoiceImpressionOnce(campaignId, surface) {
+    const key = `${campaignId}|${surface}`;
+    if (!campaignId || vgAdState.impressedIds.has(key)) return;
+    vgAdState.impressedIds.add(key);
+    setTimeout(() => {
+      if (!document.hidden) {
+        postVoiceAdEvent(campaignId, "impression", surface);
+      }
+    }, 1000);
+  }
+
+  function renderVoiceAdSurfaces(ads) {
+    const capEl = el("vgLiveAdCapsule");
+    const showEl = el("vgLifeShowcaseCard");
+    const gridEl = el("vgLifeShowcaseGrid");
+    if (!ads || !ads.enabled) {
+      if (capEl) capEl.classList.add("hidden");
+      if (showEl) showEl.classList.add("hidden");
+      return;
+    }
+
+    const liveCap = ads.live_capsule;
+    if (capEl) {
+      if (liveCap) {
+        vgAdState.byId[liveCap.campaign_id] = liveCap;
+        const accent = liveCap.accent_color || "#0071e3";
+        capEl.innerHTML = `
+          <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+            <span class="vg-ad-badge" style="background:${escHtmlAd(accent)}1A;color:${escHtmlAd(accent)}">${escHtmlAd(liveCap.badge_text || "车主礼遇")}</span>
+            ${liveCap.offer_value ? `<span class="vg-ad-offer">${escHtmlAd(liveCap.offer_value)}</span>` : ""}
+            <span style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtmlAd(liveCap.title)}</span>
+          </div>
+          <span style="font-size:12px;font-weight:700;color:${escHtmlAd(accent)};flex-shrink:0;">${escHtmlAd(liveCap.cta_text || "详情")} ›</span>`;
+        capEl.dataset.cid = liveCap.campaign_id;
+        capEl.classList.remove("hidden");
+        trackVoiceImpressionOnce(liveCap.campaign_id, "18791_live_capsule");
+      } else {
+        capEl.classList.add("hidden");
+      }
+    }
+
+    const items = Array.isArray(ads.portal_items) ? ads.portal_items : [];
+    if (showEl && gridEl) {
+      if (!items.length) {
+        showEl.classList.add("hidden");
+      } else {
+        items.forEach((it) => {
+          vgAdState.byId[it.campaign_id] = it;
+        });
+        gridEl.innerHTML = items
+          .map((it) => {
+            const accent = it.accent_color || "#0071e3";
+            let mediaHtml = "";
+            if (it.layout === "video" && it.video_url) {
+              mediaHtml = `<div class="vg-life-media"><video src="${escHtmlAd(it.video_url)}" autoplay muted loop playsinline webkit-playsinline preload="metadata" data-vg-vid="${escHtmlAd(it.campaign_id)}"></video></div>`;
+            } else if (it.image_data_url || it.hud_thumb_data_url) {
+              mediaHtml = `<div class="vg-life-media"><img src="${escHtmlAd(it.image_data_url || it.hud_thumb_data_url)}" alt="" /></div>`;
+            }
+            return `<article class="vg-life-item" data-vg-ad="${escHtmlAd(it.campaign_id)}">
+              ${mediaHtml}
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <span class="vg-ad-badge" style="background:${escHtmlAd(accent)}1A;color:${escHtmlAd(accent)}">${escHtmlAd(it.badge_text || it.category_label)}</span>
+                ${it.offer_value ? `<span class="vg-ad-offer">${escHtmlAd(it.offer_value)}</span>` : ""}
+                ${it.distance_hint ? `<span style="font-size:11px;color:#6e6e73;margin-left:auto;">${escHtmlAd(it.distance_hint)}</span>` : ""}
+              </div>
+              <strong style="font-size:13.5px;line-height:1.35;">${escHtmlAd(it.title)}</strong>
+              ${it.subtitle ? `<span style="font-size:12px;color:#6e6e73;line-height:1.4;">${escHtmlAd(it.subtitle)}</span>` : ""}
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;padding-top:4px;">
+                <span style="font-size:11px;color:#6e6e73;">${escHtmlAd(it.advertiser_name)}</span>
+                <span style="font-size:12px;font-weight:700;color:${escHtmlAd(accent)}">${escHtmlAd(it.cta_text || "立即领取")} ›</span>
+              </div>
+            </article>`;
+          })
+          .join("");
+        showEl.classList.remove("hidden");
+        gridEl.querySelectorAll("video[data-vg-vid]").forEach((v) => {
+          v.play().catch(() => {});
+          v.addEventListener("timeupdate", () => {
+            const cid = v.getAttribute("data-vg-vid");
+            if (v.currentTime >= 2.0 && cid && !vgAdState.videoViewedIds.has(cid)) {
+              vgAdState.videoViewedIds.add(cid);
+              postVoiceAdEvent(cid, "video_view", "18791_showcase");
+            }
+          });
+        });
+      }
+    }
+  }
+
+  function renderAiMatchedAdCard(ad) {
+    const box = el("vgAiPartnerCard");
+    if (!box) return;
+    if (!ad) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    vgAdState.byId[ad.campaign_id] = ad;
+    const accent = ad.accent_color || "#0071e3";
+    box.innerHTML = `
+      <div style="min-width:0;">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span class="vg-ad-badge" style="background:${escHtmlAd(accent)}1A;color:${escHtmlAd(accent)}">${escHtmlAd(ad.badge_text || "关联合作服务")}</span>
+          ${ad.offer_value ? `<span class="vg-ad-offer">${escHtmlAd(ad.offer_value)}</span>` : ""}
+        </div>
+        <div style="font-size:13px;font-weight:700;margin-top:4px;">${escHtmlAd(ad.title)}</div>
+        <div style="font-size:11.5px;color:#6e6e73;">${escHtmlAd(ad.distance_hint || ad.advertiser_name || "")}</div>
+      </div>
+      <span class="vg-btn vg-btn-primary vg-btn-sm">${escHtmlAd(ad.cta_text || "领券/导航")}</span>`;
+    box.dataset.cid = ad.campaign_id;
+    box.classList.remove("hidden");
+  }
+
+  function openVoiceMerchantNav(ad) {
+    const dest = String(ad.nav_name || ad.advertiser_name || ad.title || "").trim();
+    const enc = encodeURIComponent(dest || "周边商户");
+    const hasCoords = typeof ad.nav_lat === "number" && typeof ad.nav_lon === "number";
+    const ua = navigator.userAgent || "";
+    const isWeChat = /MicroMessenger/i.test(ua);
+    const isIOS = /iPhone|iPad|iPod/i.test(ua);
+    const isAndroid = /Android/i.test(ua);
+    postVoiceAdEvent(ad.campaign_id, "navigate", "18791_modal");
+
+    const amapWeb = hasCoords
+      ? `https://uri.amap.com/marker?position=${ad.nav_lon},${ad.nav_lat}&name=${enc}&src=community_parking`
+      : `https://uri.amap.com/search?keyword=${enc}&src=community_parking`;
+    if (isWeChat) {
+      window.location.href = amapWeb;
+      return;
+    }
+    if (isIOS) {
+      window.location.href = `maps://?q=${enc}${hasCoords ? `&ll=${ad.nav_lat},${ad.nav_lon}` : ""}`;
+      return;
+    }
+    if (isAndroid) {
+      const scheme = hasCoords
+        ? `androidamap://viewMap?sourceApplication=CommunityParking&poiname=${enc}&lat=${ad.nav_lat}&lon=${ad.nav_lon}&dev=0`
+        : `androidamap://poi?sourceApplication=CommunityParking&keywords=${enc}&dev=0`;
+      const t0 = Date.now();
+      window.location.href = scheme;
+      setTimeout(() => {
+        if (!document.hidden && Date.now() - t0 < 2100) window.open(amapWeb, "_blank", "noopener");
+      }, 1250);
+      return;
+    }
+    window.open(amapWeb, "_blank", "noopener");
+  }
+
+  async function openVoiceAdModal(ad, surface = "18791_web") {
+    const modal = el("vgAdModal");
+    if (!modal || !ad) return;
+    vgAdState.activeCid = ad.campaign_id;
+    postVoiceAdEvent(ad.campaign_id, "click", surface);
+
+    el("vgAdModalAdv").textContent =
+      (ad.advertiser_name || "社区合作商户") + (ad.distance_hint ? ` · ${ad.distance_hint}` : "");
+    el("vgAdModalTitle").textContent = ad.title || "";
+    const offerEl = el("vgAdModalOffer");
+    offerEl.textContent = ad.offer_value || "";
+    offerEl.classList.toggle("hidden", !ad.offer_value);
+    el("vgAdModalSub").textContent = ad.subtitle || ad.terms_note || "";
+
+    const body = el("vgAdModalBody");
+    const btns = [];
+    if (ad.nav_name || ad.nav_address || ad.action_type === "map_nav") {
+      btns.push(`<button type="button" class="vg-btn vg-btn-primary vg-btn-sm" data-vg-act="nav">🧭 地图导航前往</button>`);
+    }
+    if (ad.phone) {
+      btns.push(`<a class="vg-btn vg-btn-soft vg-btn-sm" href="tel:${escHtmlAd(ad.phone)}" data-vg-act="call">📞 拨号咨询</a>`);
+    }
+    if (ad.wechat_id) {
+      btns.push(`<button type="button" class="vg-btn vg-btn-soft vg-btn-sm" data-vg-act="copy-wx" data-wx="${escHtmlAd(ad.wechat_id)}">💬 复制微信</button>`);
+    }
+    if (ad.action_type === "url" && ad.redirect_path) {
+      const rUrl = applyWsParam(new URL(ad.redirect_path, window.location.origin));
+      rUrl.searchParams.set("surface", surface);
+      btns.push(`<a class="vg-btn vg-btn-primary vg-btn-sm" href="${escHtmlAd(rUrl.toString())}" target="_blank" rel="noopener">🔗 ${escHtmlAd(ad.cta_text || "打开活动")}</a>`);
+    }
+
+    let primaryHtml = "";
+    if (ad.action_type === "coupon") {
+      const cCode = vgAdState.issuedCoupons[ad.campaign_id] || "生成专属券码中…";
+      primaryHtml = `<div class="vg-wallet-box">
+        <div>
+          <div style="font-size:11px;color:#92400e;font-weight:600;">到店出示核销码即享业主价</div>
+          <code id="vgCouponCodeTxt">${escHtmlAd(cCode)}</code>
+        </div>
+        <button type="button" class="vg-btn vg-btn-primary vg-btn-sm" data-vg-act="copy-code">复制券码</button>
+      </div>`;
+    } else if (ad.action_type === "lead_form") {
+      primaryHtml = `<div style="display:flex;gap:8px;">
+        <input type="tel" id="vgLeadPhoneInp" class="vg-input vg-input-sm" placeholder="输入手机号享专属优惠报价" maxlength="18" />
+        <button type="button" class="vg-btn vg-btn-primary vg-btn-sm" data-vg-act="submit-lead">${escHtmlAd(ad.cta_text || "预约")}</button>
+      </div>
+      <div id="vgLeadFeedback" style="font-size:12px;font-weight:600;"></div>`;
+    }
+
+    body.innerHTML = `${primaryHtml}${btns.length ? `<div style="display:flex;gap:8px;flex-wrap:wrap;">${btns.join("")}</div>` : ""}`;
+    modal.classList.remove("hidden");
+
+    if (ad.action_type === "coupon" && !vgAdState.issuedCoupons[ad.campaign_id]) {
+      const res = await postVoiceAdEvent(ad.campaign_id, "issue_coupon", surface);
+      const code = res?.coupon?.coupon_code || "VIP-8888";
+      vgAdState.issuedCoupons[ad.campaign_id] = code;
+      const codeNode = el("vgCouponCodeTxt");
+      if (codeNode) codeNode.textContent = code;
+    }
+  }
+
+  function bindVoiceAdSurfaces() {
+    el("vgLiveAdCapsule")?.addEventListener("click", (ev) => {
+      const cid = ev.currentTarget.dataset.cid;
+      if (cid && vgAdState.byId[cid]) openVoiceAdModal(vgAdState.byId[cid], "18791_live_capsule");
+    });
+    el("vgAiPartnerCard")?.addEventListener("click", (ev) => {
+      const cid = ev.currentTarget.dataset.cid;
+      if (cid && vgAdState.byId[cid]) openVoiceAdModal(vgAdState.byId[cid], "18791_ai_ask");
+    });
+    el("vgLifeShowcaseGrid")?.addEventListener("click", (ev) => {
+      const card = ev.target.closest("[data-vg-ad]");
+      if (!card) return;
+      const cid = card.getAttribute("data-vg-ad");
+      if (cid && vgAdState.byId[cid]) openVoiceAdModal(vgAdState.byId[cid], "18791_showcase");
+    });
+    const closeAd = () => el("vgAdModal")?.classList.add("hidden");
+    el("vgCloseAdModalBtn")?.addEventListener("click", closeAd);
+    el("vgAdModalBackdrop")?.addEventListener("click", closeAd);
+
+    el("vgAdModalBody")?.addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("[data-vg-act]");
+      if (!btn) return;
+      const act = btn.getAttribute("data-vg-act");
+      const ad = vgAdState.byId[vgAdState.activeCid];
+      if (!ad) return;
+
+      if (act === "nav") {
+        openVoiceMerchantNav(ad);
+      } else if (act === "call") {
+        postVoiceAdEvent(ad.campaign_id, "call", "18791_modal");
+      } else if (act === "copy-wx") {
+        copyToClipboard(btn.getAttribute("data-wx") || "", "✅ 已复制商户微信号");
+        postVoiceAdEvent(ad.campaign_id, "copy", "18791_modal");
+      } else if (act === "copy-code") {
+        copyToClipboard(el("vgCouponCodeTxt")?.textContent || "", "✅ 已复制专属核销码");
+      } else if (act === "submit-lead") {
+        const phone = String(el("vgLeadPhoneInp")?.value || "").trim();
+        const fb = el("vgLeadFeedback");
+        const res = await postVoiceAdEvent(ad.campaign_id, "submit_lead", "18791_modal", {
+          lead: { phone, unit_id: state.unitId || "", vehicle_type: state.vehicle || "sedan" },
+        });
+        if (fb) {
+          fb.style.color = res?.ok ? "#047857" : "#c81e1e";
+          fb.textContent = res?.ok ? "✅ 已提交预约，专属顾问将尽快致电" : (res?.error || "请输入有效手机号");
+        }
+      }
+    });
   }
 
   async function init() {

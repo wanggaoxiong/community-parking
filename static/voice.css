@@ -1318,6 +1318,193 @@ body {
   color: #047857;
 }
 
+/* ==================== :18791 Differentiated Car-Owner Life Showcase & Contextual Ad Surfaces ==================== */
+.vg-live-ad-capsule {
+  padding: 6px 11px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(0, 113, 227, 0.06), rgba(248, 250, 252, 0.96));
+  border: 1px solid rgba(0, 113, 227, 0.16);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.vg-live-ad-capsule.hidden,
+.vg-life-showcase.hidden,
+.vg-ai-partner-card.hidden,
+.vg-ad-modal.hidden {
+  display: none !important;
+}
+
+.vg-ad-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 6.5px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.vg-ad-offer {
+  font-size: 10.5px;
+  font-weight: 800;
+  padding: 2px 6.5px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.16);
+  color: #b45309;
+  white-space: nowrap;
+}
+
+.vg-ad-offer.hidden {
+  display: none !important;
+}
+
+.vg-ai-partner-card {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid rgba(0, 113, 227, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.vg-life-showcase {
+  margin-top: 12px;
+  padding: 15px 16px;
+}
+
+.vg-life-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.vg-life-item {
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.vg-life-item:hover {
+  background: #ffffff;
+  border-color: rgba(0, 113, 227, 0.32);
+}
+
+.vg-life-media {
+  width: 100%;
+  height: 112px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0f172a;
+}
+
+.vg-life-media img,
+.vg-life-media video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.vg-ad-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 950;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 12px;
+}
+
+.vg-ad-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.36);
+  backdrop-filter: blur(4px);
+}
+
+.vg-ad-sheet {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 480px);
+  background: #ffffff;
+  border-radius: 20px;
+  padding: 16px;
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.22);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vg-ad-sheet-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vg-ad-adv {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.vg-ad-close {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: #eef2f6;
+  color: var(--text);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.vg-ad-sub {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.vg-ad-body {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.vg-wallet-box {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #fffbeb, #fef3c7);
+  border: 1px dashed #f59e0b;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vg-wallet-box code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px;
+  font-weight: 800;
+  color: #92400e;
+}
+
 @media (max-width: 500px) {
   .vg-sub-controls {
     flex-wrap: wrap;

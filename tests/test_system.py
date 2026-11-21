@@ -7674,6 +7674,384 @@ class CommunityParkingSystemTests(unittest.TestCase):
                 s.shutdown()
                 s.server_close()
 
+    def test_ad_operations_4d_targeting_waterfall_and_all_5_billing_settlement_models(self) -> None:
+        """4D targeting (when_full, EV, time window, unit), anti-spam dedup, and CPT/CPM/CPC/CPA/CPS/PUBLIC settlement."""
+        import datetime as _dt
+        import time as _time
+        from app.ad_operations import AdOperationsManager
+
+        mgr = AdOperationsManager(self.db, workspace_id_getter=lambda: "default")
+
+        # 1) Create campaigns covering all 5 commercial billing models + PUBLIC notice
+        wash_cps = mgr.save_campaign(
+            {
+                "campaign_id": "AD_WASH_CPS",
+                "title": "南门匠心精洗 ¥19.9",
+                "advertiser_name": "匠心车美",
+                "category": "car_wash",
+                "billing_model": "CPS",
+                "unit_price": 6.0,
+                "priority_tier": 2,
+                "creative": {"action_type": "coupon", "coupon_prefix": "XC", "offer_value": "¥19.9"},
+            }
+        )
+        ev_cpc = mgr.save_campaign(
+            {
+                "campaign_id": "AD_EV_CPC",
+                "title": "北门超充服务费5折",
+                "advertiser_name": "阳光超充",
+                "category": "ev_charge",
+                "billing_model": "CPC",
+                "unit_price": 1.5,
+                "priority_tier": 2,
+                "targeting": {"trigger_mode": "when_tag", "vehicle_types": ["ev"], "spot_tags": ["ev_charging"]},
+            }
+        )
+        full_cpt = mgr.save_campaign(
+            {
+                "campaign_id": "AD_FULL_CPT",
+                "title": "满位可停隔壁万科地库夜间¥10封顶",
+                "advertiser_name": "万科中心地库",
+                "category": "overflow_parking",
+                "billing_model": "CPT",
+                "unit_price": 30.0,
+                "priority_tier": 2,
+                "targeting": {"trigger_mode": "when_full"},
+            }
+        )
+        fresh_cpm = mgr.save_campaign(
+            {
+                "campaign_id": "AD_FRESH_CPM",
+                "title": "晚7点后生鲜全场7折",
+                "advertiser_name": "邻里鲜生",
+                "category": "fresh_food",
+                "billing_model": "CPM",
+                "unit_price": 50.0,
+                "priority_tier": 2,
+                "targeting": {"time_windows": ["16:30-21:30"], "units": ["8"]},
+            }
+        )
+        ins_cpa = mgr.save_campaign(
+            {
+                "campaign_id": "AD_INS_CPA",
+                "title": "车险续保返¥300保养卡",
+                "advertiser_name": "人保社区直营",
+                "category": "insurance",
+                "billing_model": "CPA",
+                "unit_price": 40.0,
+                "priority_tier": 3,
+                "creative": {"action_type": "lead_form"},
+            }
+        )
+        pub_notice = mgr.save_campaign(
+            {
+                "campaign_id": "AD_PROP_PUB",
+                "title": "周六园林修枝温馨提示",
+                "advertiser_name": "物业服务中心",
+                "category": "property_notice",
+                "billing_model": "PUBLIC",
+                "unit_price": 99.0,  # Must be forced to 0.0 for PUBLIC
+                "priority_tier": 1,
+            }
+        )
+        self.assertEqual(pub_notice["unit_price"], 0.0)
+
+        # 2) Verify 4D targeting & waterfall selection
+        dt_morning = _dt.datetime(2026, 5, 10, 10, 0)
+        dt_evening = _dt.datetime(2026, 5, 10, 18, 30)
+
+        # Regular fuel car at 10:00 with free spots=5 -> full_cpt, ev_cpc, fresh_cpm must all be filtered out!
+        sel_morning = mgr.select_for_mobile_18790(
+            unit_id="3-1", vehicle_type="sedan", total_effective_free=5, now_dt=dt_morning
+        )
+        m_ids = [i["campaign_id"] for i in sel_morning["items"]]
+        self.assertEqual(m_ids[0], "AD_PROP_PUB")  # Tier 1 PUBLIC notice first
+        self.assertIn("AD_WASH_CPS", m_ids)
+        self.assertNotIn("AD_FULL_CPT", m_ids)
+        self.assertNotIn("AD_EV_CPC", m_ids)
+        self.assertNotIn("AD_FRESH_CPM", m_ids)
+
+        # Full lot (`total_effective_free=0`) -> `AD_FULL_CPT` promoted to urgent Tier 0 ahead of everything!
+        sel_full = mgr.select_for_mobile_18790(
+            unit_id="3-1", vehicle_type="sedan", total_effective_free=0, now_dt=dt_morning
+        )
+        self.assertEqual(sel_full["primary"]["campaign_id"], "AD_FULL_CPT")
+
+        # EV driver (`tag_filter="ev_charging"`) at 18:30 going to Building 8 (`8-1`) -> matches EV + evening fresh!
+        mgr.update_settings({"max_carousel_items": 6})
+        sel_ev_eve = mgr.select_for_mobile_18790(
+            unit_id="8-1",
+            vehicle_type="ev",
+            tag_filter="ev_charging",
+            total_effective_free=3,
+            now_dt=dt_evening,
+        )
+        ev_ids = [i["campaign_id"] for i in sel_ev_eve["items"]]
+        self.assertIn("AD_EV_CPC", ev_ids)
+        self.assertIn("AD_FRESH_CPM", ev_ids)
+
+        # 3) Anti-spam deduplication + settlement math across all billing models
+        base_ts = _time.time() - 600.0
+        r1 = mgr.record_event("AD_WASH_CPS", "impression", client_ip="10.0.0.8", user_agent="iPhone", now_ts=base_ts)
+        r2 = mgr.record_event("AD_WASH_CPS", "impression", client_ip="10.0.0.8", user_agent="iPhone", now_ts=base_ts + 10.0)
+        self.assertFalse(r1["deduplicated"])
+        self.assertTrue(r2["deduplicated"])  # Within 30s anti-polling window!
+
+        c1 = mgr.record_event("AD_EV_CPC", "click", client_ip="10.0.0.8", user_agent="iPhone", now_ts=base_ts)
+        c2 = mgr.record_event("AD_EV_CPC", "click", client_ip="10.0.0.8", user_agent="iPhone", now_ts=base_ts + 25.0)
+        self.assertFalse(c1["deduplicated"])
+        self.assertTrue(c2["deduplicated"])  # Within 60s anti-rapid-tap window!
+
+        # CPS: issue coupon & redeem
+        cp_res = mgr.record_event("AD_WASH_CPS", "issue_coupon", client_ip="10.0.0.9", unit_id="8-1", now_ts=base_ts + 40.0)
+        code = cp_res["coupon"]["coupon_code"]
+        self.assertTrue(code.startswith("XC-"))
+        red_res = mgr.redeem_coupon(code, note="店长核销")
+        self.assertFalse(red_res["already_redeemed"])
+
+        # CPA: submit lead + call
+        mgr.record_event(
+            "AD_INS_CPA",
+            "submit_lead",
+            client_ip="10.0.0.11",
+            lead_payload={"phone": "13812345678", "name": "王先生", "unit_id": "8-1"},
+            now_ts=base_ts + 60.0,
+        )
+        mgr.record_event("AD_INS_CPA", "call", client_ip="10.0.0.12", now_ts=base_ts + 70.0)
+
+        # CPM: 200 impressions + 50 audio plays = 250 exposures -> 0.25 * ¥50 = ¥12.50
+        for idx_i in range(200):
+            mgr.record_event("AD_FRESH_CPM", "impression", external_uid=f"u_{idx_i}", now_ts=base_ts + 100.0 + idx_i)
+        for idx_a in range(50):
+            mgr.record_event("AD_FRESH_CPM", "audio_play", external_uid=f"a_{idx_a}", now_ts=base_ts + 320.0 + idx_a)
+
+        ov = mgr.build_admin_overview(days=30)
+        by_cid = {c["campaign_id"]: c["stats"] for c in ov["campaigns"]}
+        self.assertAlmostEqual(by_cid["AD_WASH_CPS"]["estimated_amount"], 6.0)    # 1 redeemed * ¥6
+        self.assertAlmostEqual(by_cid["AD_EV_CPC"]["estimated_amount"], 1.5)      # 1 deduped click * ¥1.5
+        self.assertAlmostEqual(by_cid["AD_FULL_CPT"]["estimated_amount"], 30.0)   # 1 active day * ¥30
+        self.assertAlmostEqual(by_cid["AD_FRESH_CPM"]["estimated_amount"], 12.5)  # 250 / 1000 * ¥50
+        self.assertAlmostEqual(by_cid["AD_INS_CPA"]["estimated_amount"], 80.0)    # (1 lead + 1 call) * ¥40
+        self.assertAlmostEqual(by_cid["AD_PROP_PUB"]["estimated_amount"], 0.0)    # Free public notice
+
+        csv_txt = mgr.export_reconciliation_csv(days=30)
+        self.assertTrue(csv_txt.startswith("\ufeff"))
+        self.assertIn("匠心车美", csv_txt)
+        self.assertIn("80.00", csv_txt)
+
+    def test_ad_surfaces_across_8790_18790_18791_and_siri_4_execution_modes(self) -> None:
+        """End-to-end 3-port ad delivery + Siri Quick Look HUD (both/map), Text Card, Pass-1 Voice Tail, and Partner Portal."""
+        import io
+        import urllib.error
+        from PIL import Image
+        from app.server import create_http_server, create_mobile_http_server
+
+        ctx = ParkingAppContext(database=self.db)
+        adm_srv = create_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        mob_srv = create_mobile_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        voice_srv = create_voice_http_server(host="127.0.0.1", port=0, ctx=ctx)
+        a_port = adm_srv.server_address[1]
+        m_port = mob_srv.server_address[1]
+        v_port = voice_srv.server_address[1]
+
+        for s in (adm_srv, mob_srv, voice_srv):
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+
+        try:
+            # Generate a 1000x800 poster image to verify RAM compression + offline Quick Look `hud_thumb_data_url`
+            poster_buf = io.BytesIO()
+            Image.new("RGB", (1000, 800), (14, 116, 144)).save(poster_buf, format="PNG")
+            poster_b64 = "data:image/png;base64," + base64.b64encode(poster_buf.getvalue()).decode("ascii")
+
+            # Disable quiet hours so test runs deterministically at any clock hour
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"http://127.0.0.1:{a_port}/api/ads/settings",
+                    data=json.dumps(
+                        {"ads_enabled": True, "voice_tail_master_enabled": True, "default_quiet_hours": "03:00-03:05"}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ),
+                timeout=5,
+            ).close()
+
+            camp_payload = {
+                "campaign_id": "AD_E2E_WASH",
+                "title": "南门匠心精洗 · 业主专享 ¥19.9",
+                "subtitle": "全车泡沫精洗+吸尘",
+                "advertiser_name": "匠心车美南门店",
+                "category": "car_wash",
+                "billing_model": "CPS",
+                "unit_price": 5.0,
+                "placements": {
+                    "p18790_enabled": True,
+                    "p18790_layout": "card",
+                    "p18791_web_enabled": True,
+                    "p18791_layout": "portal_card",
+                    "siri_hud_enabled": True,
+                    "ai_recommend_enabled": True,
+                    "voice_tail_enabled": True,
+                    "voice_tail_text": "顺路提示，南门匠心精洗今晚特惠十九块九。",
+                    "voice_quiet_hours": "03:00-03:05",
+                },
+                "creative": {
+                    "badge_text": "业主专享",
+                    "offer_value": "¥19.9",
+                    "action_type": "coupon",
+                    "cta_text": "领券立减",
+                    "coupon_prefix": "JX",
+                    "phone": "13800138000",
+                    "target_url": "https://merchant.example.com/wash-offer",
+                    "image_data_url": poster_b64,
+                },
+            }
+            req_save = urllib.request.Request(
+                f"http://127.0.0.1:{a_port}/api/ads/campaigns",
+                data=json.dumps(camp_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_save, timeout=8) as r_sv:
+                sv_data = json.loads(r_sv.read().decode("utf-8"))
+            self.assertTrue(sv_data["ok"])
+            partner_token = sv_data["campaign"]["partner_token"]
+            self.assertTrue(partner_token)
+            self.assertTrue(sv_data["campaign"]["creative"]["hud_thumb_data_url"].startswith("data:image/jpeg;base64,"))
+
+            # 1) :18790 `/api/mobile/overview` exposes sanitized public ad & preserves 403 on admin POSTs
+            with urllib.request.urlopen(f"http://127.0.0.1:{m_port}/api/mobile/overview?unit=8-1", timeout=5) as r_mov:
+                mov_data = json.loads(r_mov.read().decode("utf-8"))
+            self.assertTrue(mov_data["ads"]["enabled"])
+            mob_ad = mov_data["ads"]["primary"]
+            self.assertEqual(mob_ad["campaign_id"], "AD_E2E_WASH")
+            self.assertNotIn("partner_token", mob_ad)
+            self.assertNotIn("unit_price", mob_ad)
+
+            with self.assertRaises(urllib.error.HTTPError) as cm_403:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{m_port}/api/config",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    ),
+                    timeout=5,
+                )
+            self.assertEqual(cm_403.exception.code, 403)
+
+            # 2) Siri Execution Mode A & B: Quick Look `hud.html` (`view=both` & `view=map`)
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/hud/live.html?unit=8-1&view=both&uid=siri_u1", timeout=5
+            ) as r_hb:
+                hb_html = r_hb.read().decode("utf-8")
+            self.assertIn('class="ad-card"', hb_html)
+            self.assertIn("data:image/jpeg;base64,", hb_html)
+            self.assertIn("核销码：JX-", hb_html)
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/hud/live.html?unit=8-1&view=map&uid=siri_u2", timeout=5
+            ) as r_hm:
+                hm_html = r_hm.read().decode("utf-8")
+            self.assertIn('class="ad-micro"', hm_html)
+
+            # 3) Siri Execution Mode C: Text Card (`/api/voice/brief?format=card`)
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{v_port}/api/voice/brief?unit=8-1&format=card&uid=siri_u3", timeout=5
+            ) as r_card:
+                card_txt = r_card.read().decode("utf-8")
+            self.assertIn("🎁 业主专享：南门匠心精洗", card_txt)
+
+            # 4) Siri Execution Mode D: Speech (`format=speech&repeat=2`) -> Pass 1 has tail, Pass 2 NEVER repeats tail!
+            with patch.object(ctx.ads, "select_for_siri_execution", wraps=ctx.ads.select_for_siri_execution):
+                # Force non-quiet window check via settings update
+                ctx.ads.update_settings({"default_quiet_hours": ""})
+                camp_cur = ctx.db.get_ad_campaign("AD_E2E_WASH")
+                camp_cur["placements"]["voice_quiet_hours"] = "03:01-03:02"
+                ctx.db.upsert_ad_campaign(camp_cur)
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{v_port}/api/voice/brief?unit=8-1&repeat=2&format=speech&uid=siri_u4",
+                    timeout=5,
+                ) as r_sp:
+                    sp_txt = r_sp.read().decode("utf-8")
+                self.assertEqual(sp_txt.count("南门匠心精洗今晚特惠十九块九"), 1, f"Tail must play ONCE only: {sp_txt}")
+
+            # 5) Contextual AI Voice Q&A on `:18791` (`/api/voice/ask`)
+            config_manager.update({"voice_gateway": {"llm_qa_enabled": False}})
+            req_ask = urllib.request.Request(
+                f"http://127.0.0.1:{v_port}/api/voice/ask",
+                data=json.dumps({"question": "请问小区门口洗车有什么优惠吗？", "unit": "8-1"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_ask, timeout=5) as r_ask:
+                ask_res = json.loads(r_ask.read().decode("utf-8"))
+            self.assertIsNotNone(ask_res.get("matched_ad"))
+            self.assertEqual(ask_res["matched_ad"]["campaign_id"], "AD_E2E_WASH")
+            self.assertIn("南门匠心精洗", ask_res["answer"])
+
+            # 6) UTM Redirect `/r/<id>` + Public Coupon Claim on `:18790` + Partner Reconciliation & Redemption!
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            opener_noredir = urllib.request.build_opener(_NoRedirect)
+            with self.assertRaises(urllib.error.HTTPError) as cm_302:
+                opener_noredir.open(f"http://127.0.0.1:{m_port}/r/AD_E2E_WASH?surface=18790_test", timeout=5)
+            self.assertEqual(cm_302.exception.code, 302)
+            loc_hdr = cm_302.exception.headers.get("Location") or ""
+            self.assertIn("utm_source=community_parking", loc_hdr)
+            self.assertIn("utm_campaign=AD_E2E_WASH", loc_hdr)
+
+            # Issue coupon from `:18790`
+            req_cp = urllib.request.Request(
+                f"http://127.0.0.1:{m_port}/api/public/ad-event",
+                data=json.dumps(
+                    {"campaign_id": "AD_E2E_WASH", "event_type": "issue_coupon", "visitor_fp": "owner_801", "unit_id": "8-1"}
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_cp, timeout=5) as r_cp:
+                cp_json = json.loads(r_cp.read().decode("utf-8"))
+            issued_code = cp_json["coupon"]["coupon_code"]
+            self.assertTrue(issued_code.startswith("JX-"))
+
+            # Wrong partner token -> 403
+            with self.assertRaises(urllib.error.HTTPError) as cm_bad_pt:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{m_port}/api/public/ad-partner-report?campaign_id=AD_E2E_WASH&token=wrong",
+                    timeout=5,
+                )
+            self.assertEqual(cm_bad_pt.exception.code, 403)
+
+            # Merchant redeems coupon via `:18790` `/api/public/ad-partner-redeem` using valid `partner_token`
+            req_red = urllib.request.Request(
+                f"http://127.0.0.1:{m_port}/api/public/ad-partner-redeem?campaign_id=AD_E2E_WASH&token={partner_token}",
+                data=json.dumps({"coupon_code": issued_code}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_red, timeout=5) as r_red:
+                red_json = json.loads(r_red.read().decode("utf-8"))
+            self.assertTrue(red_json["ok"])
+            self.assertFalse(red_json["already_redeemed"])
+
+            # Verify transparent partner report HTML & JSON reflect the redeemed coupon + CPS revenue!
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{m_port}/partner-report?campaign_id=AD_E2E_WASH&token={partner_token}",
+                timeout=5,
+            ) as r_phtml:
+                p_html = r_phtml.read().decode("utf-8")
+            self.assertIn("实时透明对账与核销台", p_html)
+            self.assertIn(issued_code, p_html)
+            self.assertIn("✅ 已核销", p_html)
+        finally:
+            for s in (adm_srv, mob_srv, voice_srv):
+                s.shutdown()
+                s.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

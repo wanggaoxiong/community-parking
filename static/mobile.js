@@ -1914,6 +1914,7 @@
 
       renderMobileTagFilterBar(data);
       renderGuidanceStrip(data);
+      renderMobileAdSlot(data);
       renderFloorPlanSvg();
 
       const rec = data.recommendation;
@@ -2391,6 +2392,351 @@
           populateVoiceSelectOptions();
         };
       }
+    }
+    bindMobileAdControls();
+  }
+
+  // ==================== Differentiated :18790 Ad Slot, IAB >=1s Viewability & Wallet Sheet ====================
+  const adState = {
+    items: [],
+    activeIdx: 0,
+    activeSig: "",
+    impressedIds: new Set(),
+    videoViewedIds: new Set(),
+    viewTimer: null,
+    observer: null,
+    issuedCoupons: {},
+    visitorFp: (() => {
+      try {
+        const k = "cp_mob_vfp_v1";
+        let v = localStorage.getItem(k);
+        if (!v) {
+          v = "m_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+          localStorage.setItem(k, v);
+        }
+        return v;
+      } catch (_e) {
+        return "m_anon";
+      }
+    })(),
+  };
+
+  async function postMobileAdEvent(campaignId, eventType, extra = {}) {
+    if (!campaignId) return null;
+    try {
+      const resp = await fetch(appendWorkspaceQuery("/api/public/ad-event"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          campaign_id: campaignId,
+          event_type: eventType,
+          surface: "18790_mobile",
+          visitor_fp: adState.visitorFp,
+          unit_id: state.unitId || "",
+          vehicle_type: state.vehicleType || "sedan",
+          ...extra,
+        }),
+      });
+      return await resp.json();
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function openCrossPlatformMerchantNav(ad) {
+    const destName = String(ad.nav_name || ad.advertiser_name || ad.title || "").trim();
+    const encName = encodeURIComponent(destName || "周边商户");
+    const hasCoords = typeof ad.nav_lat === "number" && typeof ad.nav_lon === "number";
+    const ua = navigator.userAgent || "";
+    const isWeChat = /MicroMessenger/i.test(ua);
+    const isIOS = /iPhone|iPad|iPod/i.test(ua);
+    const isAndroid = /Android/i.test(ua);
+
+    postMobileAdEvent(ad.campaign_id, "navigate");
+
+    const amapWeb = hasCoords
+      ? `https://uri.amap.com/marker?position=${ad.nav_lon},${ad.nav_lat}&name=${encName}&src=community_parking`
+      : `https://uri.amap.com/search?keyword=${encName}&src=community_parking`;
+
+    // Inside WeChat WebView, custom URL schemes are blocked — open mobile H5 map directly!
+    if (isWeChat) {
+      window.location.href = amapWeb;
+      return;
+    }
+    if (isIOS) {
+      const ll = hasCoords ? `&ll=${ad.nav_lat},${ad.nav_lon}` : "";
+      window.location.href = `maps://?q=${encName}${ll}`;
+      return;
+    }
+    if (isAndroid) {
+      const scheme = hasCoords
+        ? `androidamap://viewMap?sourceApplication=CommunityParking&poiname=${encName}&lat=${ad.nav_lat}&lon=${ad.nav_lon}&dev=0`
+        : `androidamap://poi?sourceApplication=CommunityParking&keywords=${encName}&dev=0`;
+      const t0 = Date.now();
+      window.location.href = scheme;
+      setTimeout(() => {
+        if (!document.hidden && Date.now() - t0 < 2100) {
+          window.open(amapWeb, "_blank", "noopener");
+        }
+      }, 1250);
+      return;
+    }
+    window.open(amapWeb, "_blank", "noopener");
+  }
+
+  function observeAdViewability(slotEl, campaignId) {
+    if (!slotEl || !campaignId || adState.impressedIds.has(campaignId)) return;
+    if (adState.viewTimer) {
+      clearTimeout(adState.viewTimer);
+      adState.viewTimer = null;
+    }
+    if (adState.observer) {
+      adState.observer.disconnect();
+    }
+    if (typeof IntersectionObserver === "undefined") {
+      adState.impressedIds.add(campaignId);
+      postMobileAdEvent(campaignId, "impression");
+      return;
+    }
+    adState.observer = new IntersectionObserver(
+      (entries) => {
+        const ent = entries[0];
+        if (ent && ent.isIntersecting && ent.intersectionRatio >= 0.5) {
+          if (!adState.viewTimer) {
+            adState.viewTimer = setTimeout(() => {
+              if (!adState.impressedIds.has(campaignId) && !document.hidden) {
+                adState.impressedIds.add(campaignId);
+                postMobileAdEvent(campaignId, "impression");
+              }
+            }, 1000);
+          }
+        } else if (adState.viewTimer) {
+          clearTimeout(adState.viewTimer);
+          adState.viewTimer = null;
+        }
+      },
+      { threshold: [0.5] }
+    );
+    adState.observer.observe(slotEl);
+  }
+
+  function renderMobileAdSlot(data) {
+    const slot = document.getElementById("mobileAdSlot");
+    if (!slot) return;
+    const adsObj = data && data.ads;
+    const items = adsObj && adsObj.enabled && Array.isArray(adsObj.items) ? adsObj.items : [];
+    if (!items.length) {
+      slot.hidden = true;
+      slot.innerHTML = "";
+      adState.items = [];
+      adState.activeSig = "";
+      return;
+    }
+    adState.items = items;
+    if (adState.activeIdx >= items.length) adState.activeIdx = 0;
+    const cur = items[adState.activeIdx] || items[0];
+    const sig = `${items.map((i) => i.campaign_id).join(",")}|${adState.activeIdx}|${cur.layout}|${cur.title}`;
+    slot.hidden = false;
+    if (sig === adState.activeSig) return;
+    adState.activeSig = sig;
+
+    const accent = cur.accent_color || "#0071E3";
+    const badgeStyle = `background:${escapeHtml(accent)}1A;color:${escapeHtml(accent)}`;
+    const offerPill = cur.offer_value
+      ? `<span class="m-ad-offer-pill">${escapeHtml(cur.offer_value)}</span>`
+      : "";
+    const dotsHtml =
+      items.length > 1
+        ? `<span class="m-ad-dots">${items
+            .map(
+              (_, idx) =>
+                `<button type="button" class="m-ad-dot ${idx === adState.activeIdx ? "is-active" : ""}" data-ad-idx="${idx}" aria-label="切换推荐 ${idx + 1}"></button>`
+            )
+            .join("")}</span>`
+        : "";
+
+    if (cur.layout === "capsule" && items.length === 1) {
+      slot.innerHTML = `
+        <button type="button" class="m-ad-capsule" data-open-ad="${escapeHtml(cur.campaign_id)}">
+          <span class="m-ad-cap-left">
+            <span class="m-ad-badge" style="${badgeStyle}">${escapeHtml(cur.badge_text || "业主礼遇")}</span>
+            ${offerPill}
+            <span class="m-ad-cap-title">${escapeHtml(cur.title)}</span>
+          </span>
+          <span class="m-ad-cap-cta" style="color:${escapeHtml(accent)}">${escapeHtml(cur.cta_text || "查看")} ›</span>
+        </button>`;
+    } else {
+      let mediaHtml = "";
+      if (cur.layout === "video" && cur.video_url) {
+        mediaHtml = `<div class="m-ad-video-wrap">
+          <video src="${escapeHtml(cur.video_url)}" autoplay muted loop playsinline webkit-playsinline preload="metadata" data-vid-cid="${escapeHtml(cur.campaign_id)}"></video>
+        </div>`;
+      } else if (cur.image_data_url || cur.hud_thumb_data_url) {
+        mediaHtml = `<img class="m-ad-thumb" src="${escapeHtml(cur.image_data_url || cur.hud_thumb_data_url)}" alt="" />`;
+      }
+      slot.innerHTML = `
+        <div class="m-ad-rich-card" data-open-ad="${escapeHtml(cur.campaign_id)}">
+          ${mediaHtml}
+          <div class="m-ad-rich-copy">
+            <div style="display:flex;align-items:center;gap:5px;">
+              <span class="m-ad-badge" style="${badgeStyle}">${escapeHtml(cur.badge_text || "业主礼遇")}</span>
+              ${offerPill}
+              ${cur.distance_hint ? `<span style="font-size:10.5px;color:#6e6e73;">${escapeHtml(cur.distance_hint)}</span>` : ""}
+              ${dotsHtml}
+            </div>
+            <div class="m-ad-cap-title" style="margin-top:3px;">${escapeHtml(cur.title)}</div>
+            ${cur.subtitle ? `<div class="m-ad-rich-sub">${escapeHtml(cur.subtitle)}</div>` : ""}
+          </div>
+          <span class="m-ad-cap-cta" style="color:${escapeHtml(accent)}">${escapeHtml(cur.cta_text || "详情")} ›</span>
+        </div>`;
+
+      const vid = slot.querySelector("video[data-vid-cid]");
+      if (vid) {
+        vid.play().catch(() => {});
+        vid.addEventListener("timeupdate", () => {
+          const vcid = vid.getAttribute("data-vid-cid");
+          if (vid.currentTime >= 2.0 && vcid && !adState.videoViewedIds.has(vcid)) {
+            adState.videoViewedIds.add(vcid);
+            postMobileAdEvent(vcid, "video_view");
+          }
+        });
+      }
+    }
+
+    observeAdViewability(slot, cur.campaign_id);
+  }
+
+  async function openMobileAdSheet(ad) {
+    const sheet = document.getElementById("mobileAdSheet");
+    const spotSheet = document.getElementById("mobileSpotSheet");
+    if (!sheet || !ad) return;
+    if (spotSheet) spotSheet.hidden = true;
+
+    postMobileAdEvent(ad.campaign_id, "click");
+
+    document.getElementById("mobAdSheetAdv").textContent =
+      (ad.advertiser_name || "社区合作服务") + (ad.distance_hint ? ` · ${ad.distance_hint}` : "");
+    document.getElementById("mobAdSheetTitle").textContent = ad.title || "";
+    const offerEl = document.getElementById("mobAdSheetOffer");
+    if (offerEl) {
+      offerEl.hidden = !ad.offer_value;
+      offerEl.textContent = ad.offer_value || "";
+    }
+    document.getElementById("mobAdSheetSub").textContent = ad.subtitle || ad.terms_note || "";
+
+    const body = document.getElementById("mobAdSheetBody");
+    const btns = [];
+    if (ad.nav_name || ad.nav_address || ad.action_type === "map_nav") {
+      btns.push(`<button type="button" class="m-ss-action-btn" data-ad-sheet-act="nav">🧭 地图导航前往</button>`);
+    }
+    if (ad.phone) {
+      btns.push(`<a class="m-ss-action-btn m-ad-btn-ghost" href="tel:${escapeHtml(ad.phone)}" data-ad-sheet-act="call">📞 拨打电话</a>`);
+    }
+    if (ad.wechat_id) {
+      btns.push(`<button type="button" class="m-ss-action-btn m-ad-btn-ghost" data-ad-sheet-act="copy-wx" data-wx="${escapeHtml(ad.wechat_id)}">💬 复制微信</button>`);
+    }
+    if (ad.action_type === "url" && ad.redirect_path) {
+      const rHref = appendWorkspaceQuery(`${ad.redirect_path}?surface=18790_sheet`);
+      btns.push(`<a class="m-ss-action-btn" href="${escapeHtml(rHref)}" target="_blank" rel="noopener">🔗 ${escapeHtml(ad.cta_text || "打开活动页")}</a>`);
+    }
+
+    let primaryBlock = "";
+    if (ad.action_type === "coupon") {
+      const cachedCode = adState.issuedCoupons[ad.campaign_id];
+      primaryBlock = `
+        <div class="m-wallet-ticket" id="mobWalletBox">
+          <div>
+            <div style="font-size:11px;color:#92400e;font-weight:600;">到店出示专属核销码即享优惠</div>
+            <code id="mobCouponCodeTxt">${escapeHtml(cachedCode || "正在生成专属券码…")}</code>
+          </div>
+          <button type="button" class="m-ss-action-btn" data-ad-sheet-act="copy-code">复制券码</button>
+        </div>`;
+    } else if (ad.action_type === "lead_form") {
+      primaryBlock = `
+        <div class="m-lead-row">
+          <input type="tel" id="mobLeadPhoneInput" class="m-lead-input" placeholder="输入手机号享专属报价" maxlength="18" />
+          <button type="button" class="m-ss-action-btn" data-ad-sheet-act="submit-lead">${escapeHtml(ad.cta_text || "立即预约")}</button>
+        </div>
+        <div id="mobLeadFeedback" style="font-size:11.5px;color:#047857;font-weight:600;"></div>`;
+    }
+
+    body.innerHTML = `${primaryBlock}${btns.length ? `<div class="m-ad-btn-row">${btns.join("")}</div>` : ""}`;
+    sheet.dataset.activeCid = ad.campaign_id;
+    sheet.hidden = false;
+
+    if (ad.action_type === "coupon" && !adState.issuedCoupons[ad.campaign_id]) {
+      const res = await postMobileAdEvent(ad.campaign_id, "issue_coupon");
+      const code = res && res.coupon && res.coupon.coupon_code ? res.coupon.coupon_code : "VIP-8888";
+      adState.issuedCoupons[ad.campaign_id] = code;
+      const codeEl = document.getElementById("mobCouponCodeTxt");
+      if (codeEl) codeEl.textContent = code;
+    }
+  }
+
+  function bindMobileAdControls() {
+    const slot = document.getElementById("mobileAdSlot");
+    const sheet = document.getElementById("mobileAdSheet");
+    const closeBtn = document.getElementById("btnCloseMobAdSheet");
+    if (closeBtn && sheet) {
+      closeBtn.addEventListener("click", () => {
+        sheet.hidden = true;
+      });
+    }
+    if (slot) {
+      slot.addEventListener("click", (ev) => {
+        const dot = ev.target.closest("[data-ad-idx]");
+        if (dot) {
+          ev.stopPropagation();
+          adState.activeIdx = Number(dot.getAttribute("data-ad-idx") || 0);
+          adState.activeSig = "";
+          renderMobileAdSlot(state.overview);
+          return;
+        }
+        const card = ev.target.closest("[data-open-ad]");
+        if (!card) return;
+        const cid = card.getAttribute("data-open-ad");
+        const ad = adState.items.find((i) => i.campaign_id === cid) || adState.items[0];
+        if (ad) openMobileAdSheet(ad);
+      });
+    }
+    if (sheet) {
+      sheet.addEventListener("click", async (ev) => {
+        const btn = ev.target.closest("[data-ad-sheet-act]");
+        if (!btn) return;
+        const act = btn.getAttribute("data-ad-sheet-act");
+        const cid = sheet.dataset.activeCid || "";
+        const ad = adState.items.find((i) => i.campaign_id === cid);
+        if (!ad) return;
+
+        if (act === "nav") {
+          openCrossPlatformMerchantNav(ad);
+        } else if (act === "call") {
+          postMobileAdEvent(cid, "call");
+        } else if (act === "copy-wx") {
+          const wx = btn.getAttribute("data-wx") || "";
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(wx).catch(() => {});
+          }
+          postMobileAdEvent(cid, "copy");
+          btn.textContent = "✅ 已复制微信";
+        } else if (act === "copy-code") {
+          const code = document.getElementById("mobCouponCodeTxt")?.textContent || "";
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(code).catch(() => {});
+          }
+          btn.textContent = "✅ 已复制";
+        } else if (act === "submit-lead") {
+          const phone = String(document.getElementById("mobLeadPhoneInput")?.value || "").trim();
+          const fb = document.getElementById("mobLeadFeedback");
+          const res = await postMobileAdEvent(cid, "submit_lead", {
+            lead: { phone, unit_id: state.unitId || "", vehicle_type: state.vehicleType || "sedan" },
+          });
+          if (fb) {
+            fb.style.color = res && res.ok ? "#047857" : "#c81e1e";
+            fb.textContent = res && res.ok ? "✅ 预约成功，专属顾问将尽快联系您" : (res?.error || "请输入有效手机号");
+          }
+        }
+      });
     }
   }
 

@@ -363,11 +363,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindCalibrationConsole();
   bindTestLab();
   bindCameraManagementHub();
+  bindAdsOperationsConsole();
   syncMapWorkspaceLayout();
   drawSyntheticDemoLotOnCalibCanvas();
   try {
     await refreshWorkspacesCatalog();
     await refreshOverview();
+    refreshAdsDashboard().catch(() => {});
   } catch (err) {
     console.error("Initial overview refresh failed:", err);
   }
@@ -402,6 +404,7 @@ function switchMainTab(tabName) {
   }
   if (resolved === "calibrate") renderCalibCanvas();
   if (resolved === "lab" && !state.lab.busy) refreshLabCameraHint();
+  if (resolved === "ads") refreshAdsDashboard();
 }
 
 function showAppleToast(message, tone = "success", durationMs = 3800) {
@@ -18600,4 +18603,689 @@ function bindSpotTagPopoverAndFilters() {
     }
   });
 }
+
+/* ==================== TAB 6: AD OPERATIONS, MULTI-SURFACE STUDIO & RECONCILIATION ==================== */
+state.ads = {
+  dashboard: null,
+  activePane: "campaigns",
+  previewMode: "18790",
+  draftImageDataUrl: "",
+};
+
+async function refreshAdsDashboard() {
+  const days = Number(document.getElementById("adsStatsDaysSelect")?.value || 30);
+  try {
+    const data = await api(`/api/ads/dashboard?days=${days}`);
+    state.ads.dashboard = data;
+    renderAdsDashboard(data);
+  } catch (err) {
+    console.warn("Ads dashboard load failed:", err);
+  }
+}
+
+function renderAdsDashboard(data) {
+  if (!data) return;
+  const sum = data.summary || {};
+  const settings = data.settings || {};
+  const campaigns = data.campaigns || [];
+
+  const navBadge = document.getElementById("navAdsCountBadge");
+  if (navBadge) {
+    const actCnt = Number(sum.campaigns_active || 0);
+    navBadge.textContent = String(actCnt);
+    navBadge.classList.toggle("hidden", actCnt <= 0);
+  }
+
+  const mSw = document.getElementById("adsMasterSwitch");
+  if (mSw) mSw.checked = settings.ads_enabled !== false;
+  const vSw = document.getElementById("adsVoiceTailSwitch");
+  if (vSw) vSw.checked = settings.voice_tail_master_enabled !== false;
+  const qInp = document.getElementById("adsQuietHoursInput");
+  if (qInp && document.activeElement !== qInp) {
+    qInp.value = settings.default_quiet_hours || "22:00-07:30";
+  }
+
+  const setTxt = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = v;
+  };
+  setTxt("adsKpiRevenue", `¥${Number(sum.estimated_revenue || 0).toFixed(2)}`);
+  setTxt("adsKpiActiveSub", `${sum.campaigns_active || 0} 个在投 / 共 ${sum.campaigns_total || 0} 个计划`);
+  setTxt("adsKpiExposure", `${sum.impressions || 0} / ${sum.unique_visitors || 0}`);
+  setTxt("adsKpiMediaSub", `语音播报 ${sum.audio_plays || 0} · 微视频 ${sum.video_views || 0}`);
+  setTxt("adsKpiClicks", `${sum.clicks || 0}`);
+  setTxt("adsKpiCtrSub", `CTR ${Number(sum.ctr_pct || 0).toFixed(2)}%（已滤除连点）`);
+  setTxt("adsKpiCoupons", `${sum.coupons_issued || 0} / ${sum.coupons_redeemed || 0}`);
+  setTxt("adsKpiLeads", `${(sum.leads_submitted || 0) + (sum.conversions || 0) - (sum.coupons_redeemed || 0)}`);
+
+  // Populate category select & preset chips inside modal
+  const catSel = document.getElementById("adFormCategory");
+  if (catSel && (!catSel.options.length || catSel.dataset.loaded !== "1")) {
+    catSel.innerHTML = (data.categories || [])
+      .map((c) => `<option value="${escapeHtml(c.code)}">${escapeHtml(c.label)}（${escapeHtml(c.group)}）</option>`)
+      .join("");
+    catSel.dataset.loaded = "1";
+  }
+  const presetBox = document.getElementById("adIndustryPresetChips");
+  if (presetBox && presetBox.dataset.loaded !== "1") {
+    presetBox.innerHTML = (data.industry_presets || [])
+      .map(
+        (p) =>
+          `<button type="button" class="apple-mini-pill-btn is-primary-tint" data-ad-preset="${escapeHtml(
+            p.preset_id
+          )}">${escapeHtml(p.name)}</button>`
+      )
+      .join("");
+    presetBox.dataset.loaded = "1";
+  }
+
+  renderAdsCampaignCards(campaigns);
+  renderAdsCouponsTable(data.recent_coupons || [], campaigns);
+  renderAdsLeadsTable(data.recent_leads || [], campaigns);
+}
+
+function renderAdsCampaignCards(campaigns) {
+  const grid = document.getElementById("adsCampaignsGrid");
+  if (!grid) return;
+  if (!campaigns.length) {
+    grid.innerHTML = `
+      <div class="bento-card" style="grid-column:1/-1;padding:28px 24px;text-align:center;">
+        <div style="font-size:28px;margin-bottom:6px;">📣</div>
+        <h3 style="margin:0 0 6px;font-size:16px;">当前暂无在投推广或物业通知</h3>
+        <p style="margin:0 0 14px;font-size:13px;color:#6e6e73;">
+          车主端 <code>:18790</code> 与 <code>:18791</code> 当前处于 100% 零推广纯净态。点击下方按钮可一键载入洗车 CPS 核销券、新能源快充、满位地库导引等样板体验全链路效果。
+        </p>
+        <div style="display:inline-flex;gap:10px;">
+          <button type="button" class="btn-apple btn-apple-secondary btn-apple-sm" id="btnEmptySeedAds">✨ 一键载入4个行业样板</button>
+          <button type="button" class="btn-apple btn-apple-primary btn-apple-sm" id="btnEmptyCreateAd">＋ 手动新建推广计划</button>
+        </div>
+      </div>`;
+    document.getElementById("btnEmptySeedAds")?.addEventListener("click", seedDemoAdCampaigns);
+    document.getElementById("btnEmptyCreateAd")?.addEventListener("click", () => openAdCampaignModal(null));
+    return;
+  }
+
+  const layoutLabelMap = {
+    capsule: "胶囊",
+    card: "图文卡",
+    video: "微视频",
+    carousel: "轮播",
+    portal_card: "生活橱窗",
+    ai_only: "仅AI意图",
+  };
+
+  grid.innerHTML = campaigns
+    .map((c) => {
+      const st = c.stats || {};
+      const pl = c.placements || {};
+      const tg = c.targeting || {};
+      const surfChips = [];
+      if (pl.p18790_enabled) surfChips.push(`:18790 ${layoutLabelMap[pl.p18790_layout] || "胶囊"}`);
+      if (pl.p18791_web_enabled) surfChips.push(`:18791 ${layoutLabelMap[pl.p18791_layout] || "橱窗"}`);
+      if (pl.siri_hud_enabled) surfChips.push("快捷指令版面");
+      if (pl.voice_tail_enabled) surfChips.push("🔊 首遍语音尾缀");
+
+      const tgChips = [];
+      if (tg.trigger_mode === "when_full") tgChips.push("🔥 满位触发");
+      else if (tg.trigger_mode === "when_tag") tgChips.push("🎯 标签/车型触发");
+      if ((tg.vehicle_types || []).includes("ev") || (tg.spot_tags || []).includes("ev_charging")) {
+        tgChips.push("⚡ 新能源定向");
+      }
+      if ((tg.time_windows || []).length) tgChips.push(`⏰ ${tg.time_windows.join(",")}`);
+      if ((tg.units || []).length) tgChips.push(`🏢 ${tg.units.join(",")}栋`);
+
+      return `
+      <article class="ad-camp-card ${c.enabled ? "" : "is-paused"}" data-cid="${escapeHtml(c.campaign_id)}">
+        <div class="ad-camp-top">
+          <div>
+            <div class="ad-camp-badges">
+              <span class="ad-tier-pill">T${c.priority_tier || 2}</span>
+              <span class="ad-billing-pill">${escapeHtml(c.billing_model)} ${
+        c.billing_model === "PUBLIC" ? "公益免费" : `¥${c.unit_price}`
+      }</span>
+              <span class="grp-zone-tag">${escapeHtml(c.creative?.offer_value || c.creative?.badge_text || "车主礼遇")}</span>
+            </div>
+            <h3 class="ad-camp-title" style="margin-top:6px;">${escapeHtml(c.title)}</h3>
+            <div class="ad-camp-adv">${escapeHtml(c.advertiser_name)} · ID: <code>${escapeHtml(c.campaign_id)}</code></div>
+          </div>
+          <button type="button" class="apple-mini-pill-btn ${c.enabled ? "is-primary-tint" : ""}" data-ad-act="toggle" data-cid="${escapeHtml(c.campaign_id)}">
+            ${c.enabled ? "● 投放中" : "⏸ 已暂停"}
+          </button>
+        </div>
+
+        <div class="ad-surface-chips">
+          ${surfChips.map((s) => `<span class="ad-surf-chip">${escapeHtml(s)}</span>`).join("")}
+          ${tgChips.map((t) => `<span class="ad-surf-chip is-target">${escapeHtml(t)}</span>`).join("")}
+        </div>
+
+        <div class="ad-metrics-row">
+          <div class="ad-metric-cell"><span>曝光 PV / UV</span><strong>${st.total_exposures || 0} / ${st.unique_visitors || 0}</strong></div>
+          <div class="ad-metric-cell"><span>有效点击 (${st.ctr_pct || 0}%)</span><strong>${st.clicks || 0}</strong></div>
+          <div class="ad-metric-cell"><span>领券 / 核销</span><strong>${st.coupons_issued || 0} / ${st.coupons_redeemed || 0}</strong></div>
+          <div class="ad-metric-cell"><span>留资 / 拨号</span><strong>${(st.leads_submitted || 0) + (st.calls || 0)}</strong></div>
+        </div>
+
+        <div class="ad-settlement-bar">
+          <span>${escapeHtml(st.settlement_formula || "")}</span>
+          <em>¥${Number(st.estimated_amount || 0).toFixed(2)}</em>
+        </div>
+
+        <div class="ad-camp-actions">
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button type="button" class="apple-mini-pill-btn is-primary-tint" data-ad-act="edit" data-cid="${escapeHtml(c.campaign_id)}">✏️ 编辑与预览</button>
+            <button type="button" class="apple-mini-pill-btn" data-ad-act="copy-partner" data-cid="${escapeHtml(c.campaign_id)}" title="复制免登录只读对账与店员输码核销链接发给合作商">🔗 合作商对账核销链接</button>
+          </div>
+          <button type="button" class="apple-mini-pill-btn is-danger" data-ad-act="delete" data-cid="${escapeHtml(c.campaign_id)}">删除</button>
+        </div>
+      </article>`;
+    })
+    .join("");
+}
+
+function renderAdsCouponsTable(coupons, campaigns) {
+  const tbody = document.getElementById("adsCouponsTableBody");
+  if (!tbody) return;
+  const campMap = Object.fromEntries((campaigns || []).map((c) => [c.campaign_id, c.title]));
+  if (!coupons.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#86868b;padding:18px;">暂无车主领券记录</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = coupons
+    .map((cp) => {
+      const dt = cp.issued_at ? new Date(cp.issued_at * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
+      const isRed = cp.status === "redeemed";
+      return `<tr>
+        <td><code>${escapeHtml(cp.coupon_code)}</code></td>
+        <td>${escapeHtml(campMap[cp.campaign_id] || cp.campaign_id)}</td>
+        <td>${isRed ? '<span style="color:#047857;font-weight:700;">✅ 已核销</span>' : '<span style="color:#b45309;font-weight:600;">⏳ 待到店</span>'}</td>
+        <td>${escapeHtml(cp.unit_id || "-")}</td>
+        <td>${escapeHtml(cp.platform || "-")}</td>
+        <td>${escapeHtml(dt)}</td>
+        <td>${
+          isRed
+            ? "-"
+            : `<button type="button" class="apple-mini-pill-btn is-primary-tint" data-redeem-code="${escapeHtml(
+                cp.coupon_code
+              )}">核销</button>`
+        }</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function renderAdsLeadsTable(leads, campaigns) {
+  const tbody = document.getElementById("adsLeadsTableBody");
+  if (!tbody) return;
+  const campMap = Object.fromEntries((campaigns || []).map((c) => [c.campaign_id, c.title]));
+  if (!leads.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#86868b;padding:18px;">暂无车主预约留资记录</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = leads
+    .map((ld) => {
+      const dt = ld.created_at ? new Date(ld.created_at * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
+      return `<tr>
+        <td><strong>${escapeHtml(ld.contact_phone)}</strong></td>
+        <td>${escapeHtml(ld.contact_name || "业主")}</td>
+        <td>${escapeHtml(campMap[ld.campaign_id] || ld.campaign_id)}</td>
+        <td>${escapeHtml(ld.unit_id || "-")} · ${escapeHtml(ld.vehicle_type || "sedan")}</td>
+        <td>${escapeHtml(ld.remark || "-")}</td>
+        <td>${escapeHtml(ld.platform || "-")}</td>
+        <td>${escapeHtml(dt)}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function collectAdFormDraft() {
+  const getVal = (id) => String(document.getElementById(id)?.value || "").trim();
+  const getChk = (id) => Boolean(document.getElementById(id)?.checked);
+  const vehs = Array.from(document.querySelectorAll('input[name="adVehChk"]:checked')).map((i) => i.value);
+  const tags = Array.from(document.querySelectorAll('input[name="adTagChk"]:checked')).map((i) => i.value);
+
+  return {
+    campaign_id: getVal("adFormCampaignId") || undefined,
+    title: getVal("adFormTitle") || "南门匠心精洗 · 业主晚间普洗 ¥19.9",
+    subtitle: getVal("adFormSubtitle"),
+    advertiser_name: getVal("adFormAdvertiser") || "社区合作商户",
+    category: getVal("adFormCategory") || "car_wash",
+    billing_model: getVal("adFormBilling") || "CPS",
+    unit_price: Number(getVal("adFormUnitPrice") || 0),
+    priority_tier: Number(getVal("adFormTier") || 2),
+    enabled: true,
+    placements: {
+      p18790_enabled: getChk("adFormP18790Enabled"),
+      p18790_layout: getVal("adFormP18790Layout") || "capsule",
+      p18791_web_enabled: getChk("adFormP18791Enabled"),
+      p18791_layout: getVal("adFormP18791Layout") || "portal_card",
+      siri_hud_enabled: getChk("adFormSiriHudEnabled"),
+      ai_recommend_enabled: getChk("adFormAiRecEnabled"),
+      voice_tail_enabled: getChk("adFormVoiceTailEnabled"),
+      voice_tail_text: getVal("adFormVoiceTailText"),
+    },
+    creative: {
+      badge_text: getVal("adFormBadgeText") || "业主专享",
+      offer_value: getVal("adFormOfferValue"),
+      action_type: getVal("adFormActionType") || "coupon",
+      cta_text: getVal("adFormCtaText") || "查看详情",
+      coupon_prefix: getVal("adFormCouponPrefix") || "CP",
+      phone: getVal("adFormPhone"),
+      wechat_id: getVal("adFormWechat"),
+      distance_hint: getVal("adFormDistance"),
+      nav_name: getVal("adFormNavName"),
+      target_url: getVal("adFormTargetUrl"),
+      video_url: getVal("adFormVideoUrl"),
+      accent_color: getVal("adFormAccentColor") || "#0071E3",
+      image_data_url: state.ads.draftImageDataUrl || "",
+    },
+    targeting: {
+      trigger_mode: getVal("adFormTriggerMode") || "always",
+      time_windows: getVal("adFormTimeWindows"),
+      units: getVal("adFormUnits"),
+      vehicle_types: vehs,
+      spot_tags: tags,
+    },
+  };
+}
+
+function populateAdForm(camp) {
+  const c = camp || {};
+  const pl = c.placements || {};
+  const cr = c.creative || {};
+  const tg = c.targeting || {};
+
+  const setV = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.value = v ?? "";
+  };
+  const setC = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = Boolean(v);
+  };
+
+  setV("adFormCampaignId", c.campaign_id || "");
+  setV("adFormTitle", c.title || "");
+  setV("adFormSubtitle", c.subtitle || "");
+  setV("adFormAdvertiser", c.advertiser_name || "");
+  setV("adFormCategory", c.category || "car_wash");
+  setV("adFormBilling", c.billing_model || "CPS");
+  setV("adFormUnitPrice", c.unit_price ?? 5);
+  setV("adFormTier", String(c.priority_tier || 2));
+
+  setC("adFormP18790Enabled", pl.p18790_enabled !== false);
+  setV("adFormP18790Layout", pl.p18790_layout || "capsule");
+  setC("adFormP18791Enabled", pl.p18791_web_enabled !== false);
+  setV("adFormP18791Layout", pl.p18791_layout || "portal_card");
+  setC("adFormSiriHudEnabled", pl.siri_hud_enabled !== false);
+  setC("adFormAiRecEnabled", pl.ai_recommend_enabled !== false);
+  setC("adFormVoiceTailEnabled", Boolean(pl.voice_tail_enabled));
+  setV("adFormVoiceTailText", pl.voice_tail_text || "");
+
+  setV("adFormBadgeText", cr.badge_text || "业主专享");
+  setV("adFormOfferValue", cr.offer_value || "");
+  setV("adFormActionType", cr.action_type || "coupon");
+  setV("adFormCtaText", cr.cta_text || "领券立减");
+  setV("adFormCouponPrefix", cr.coupon_prefix || "XC");
+  setV("adFormPhone", cr.phone || "");
+  setV("adFormWechat", cr.wechat_id || "");
+  setV("adFormDistance", cr.distance_hint || "");
+  setV("adFormNavName", cr.nav_name || "");
+  setV("adFormTargetUrl", cr.target_url || "");
+  setV("adFormVideoUrl", cr.video_url || "");
+  setV("adFormAccentColor", cr.accent_color || "#0071E3");
+  state.ads.draftImageDataUrl = cr.image_data_url || "";
+
+  setV("adFormTriggerMode", tg.trigger_mode || "always");
+  setV("adFormTimeWindows", (tg.time_windows || []).join(", "));
+  setV("adFormUnits", (tg.units || []).join(", "));
+
+  const vSet = new Set(tg.vehicle_types || []);
+  document.querySelectorAll('input[name="adVehChk"]').forEach((chk) => {
+    chk.checked = vSet.has(chk.value);
+  });
+  const tSet = new Set(tg.spot_tags || []);
+  document.querySelectorAll('input[name="adTagChk"]').forEach((chk) => {
+    chk.checked = tSet.has(chk.value);
+  });
+
+  renderAdStudioLivePreview();
+}
+
+function renderAdStudioLivePreview() {
+  const host = document.getElementById("adLivePreviewPhone");
+  if (!host) return;
+  const d = collectAdFormDraft();
+  const cr = d.creative;
+  const pl = d.placements;
+  const accent = cr.accent_color || "#0071E3";
+  const mode = state.ads.previewMode || "18790";
+
+  const badgeHtml = `<span style="font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:6px;background:${escapeHtml(
+    accent
+  )}1A;color:${escapeHtml(accent)};">${escapeHtml(cr.badge_text)}</span>`;
+  const offerHtml = cr.offer_value
+    ? `<span style="font-size:10.5px;font-weight:800;padding:2px 6px;border-radius:6px;background:#fef3c7;color:#b45309;">${escapeHtml(
+        cr.offer_value
+      )}</span>`
+    : "";
+
+  if (mode === "18790") {
+    const lay = pl.p18790_layout;
+    let slotHtml = "";
+    if (!pl.p18790_enabled) {
+      slotHtml = `<div style="padding:14px;text-align:center;color:#64748b;font-size:12px;">已关闭 :18790 展位</div>`;
+    } else if (lay === "capsule") {
+      slotHtml = `
+        <div style="background:#fff;border-radius:999px;padding:7px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px;box-shadow:0 2px 10px rgba(0,0,0,0.05);">
+          <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+            ${badgeHtml}
+            <span style="font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(
+              d.title
+            )}</span>
+          </div>
+          <span style="font-size:11.5px;font-weight:700;color:${escapeHtml(accent)};flex-shrink:0;">${escapeHtml(
+        cr.cta_text
+      )} ›</span>
+        </div>`;
+    } else {
+      const mediaPart =
+        lay === "video" && cr.video_url
+          ? `<div style="height:108px;border-radius:10px;background:#0f172a;color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;margin-bottom:8px;">🎬 静音内联微视频 (muted playsinline)</div>`
+          : cr.image_data_url
+          ? `<img src="${escapeHtml(
+              cr.image_data_url
+            )}" style="width:100%;height:104px;object-fit:cover;border-radius:10px;margin-bottom:8px;" alt="" />`
+          : "";
+      slotHtml = `
+        <div style="background:#fff;border-radius:16px;padding:11px 12px;box-shadow:0 4px 14px rgba(0,0,0,0.06);">
+          ${mediaPart}
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">${badgeHtml}${offerHtml}<span style="font-size:11px;color:#64748b;margin-left:auto;">${escapeHtml(
+        cr.distance_hint || ""
+      )}</span></div>
+          <div style="font-size:13.5px;font-weight:700;">${escapeHtml(d.title)}</div>
+          <div style="font-size:11.5px;color:#64748b;margin-top:2px;">${escapeHtml(d.subtitle || "")}</div>
+          <div style="margin-top:8px;display:flex;justify-content:flex-end;">
+            <span style="padding:4px 12px;border-radius:999px;background:${escapeHtml(
+              accent
+            )};color:#fff;font-size:11.5px;font-weight:700;">${escapeHtml(cr.cta_text)}</span>
+          </div>
+        </div>`;
+    }
+    host.innerHTML = `
+      <div style="background:#fff;border-radius:14px;padding:10px 12px;font-size:12px;">
+        <div style="font-weight:700;color:#0071E3;">📍 8号楼1单元 · 总余 5 位</div>
+        <div style="color:#16a34a;font-weight:600;margin-top:2px;">首选 6号楼左侧 · 步行 42 米</div>
+      </div>
+      ${slotHtml}
+      <div style="flex:1;border-radius:14px;background:#dbeafe44;border:1px dashed #94a3b8;display:flex;align-items:center;justify-content:center;font-size:12px;color:#475569;min-height:150px;">
+        🗺️ 实时交互车位平面图（零遮挡）
+      </div>`;
+  } else if (mode === "18791") {
+    host.innerHTML = `
+      <div style="background:#fff;border-radius:16px;padding:14px;text-align:center;">
+        <div style="width:46px;height:46px;border-radius:50%;background:#0071e3;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:20px;">🎙️</div>
+        <div style="font-size:13px;font-weight:700;margin-top:6px;">免手语音寻位工作台</div>
+      </div>
+      <div style="font-size:11.5px;font-weight:700;color:#475569;padding:0 4px;">🛍️ 社区车主生活精选橱窗 (${escapeHtml(
+        pl.p18791_layout
+      )})</div>
+      <div style="background:#fff;border-radius:15px;padding:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);">
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:5px;">${badgeHtml}${offerHtml}</div>
+        <div style="font-size:13.5px;font-weight:700;">${escapeHtml(d.title)}</div>
+        <div style="font-size:11.5px;color:#64748b;margin-top:3px;">${escapeHtml(d.subtitle || "")}</div>
+        <div style="margin-top:9px;display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:11px;color:#64748b;">${escapeHtml(cr.distance_hint || d.advertiser_name)}</span>
+          <span style="padding:4px 11px;border-radius:999px;background:${escapeHtml(
+            accent
+          )};color:#fff;font-size:11.5px;font-weight:700;">${escapeHtml(cr.cta_text)}</span>
+        </div>
+      </div>`;
+  } else {
+    host.innerHTML = `
+      <div style="font-size:11px;font-weight:700;color:#475569;">① 文字+平面图 / 仅平面图 (Quick Look 离线沙盒)</div>
+      <div style="background:#fff;border-radius:13px;padding:10px;border:1px solid #e2e8f0;">
+        <div style="display:flex;align-items:center;gap:6px;">${badgeHtml}${offerHtml}</div>
+        <div style="font-size:12.5px;font-weight:700;margin-top:4px;">${escapeHtml(d.title)}</div>
+        <div style="margin-top:6px;font-size:11px;color:#92400e;background:#fef3c7;display:inline-block;padding:2px 8px;border-radius:5px;font-family:monospace;">
+          核销码：${escapeHtml((cr.coupon_prefix || "XC").toUpperCase())}-1121-8392
+        </div>
+      </div>
+      <div style="font-size:11px;font-weight:700;color:#475569;">② 仅文字卡片弹窗尾部</div>
+      <div style="background:#fff;border-radius:12px;padding:9px 11px;font-size:11.5px;line-height:1.45;">
+        📍 8号楼1单元 · 首选 6号楼左侧余 3 位<br/>
+        ──────────<br/>
+        🎁 ${escapeHtml(cr.badge_text)}：${escapeHtml(d.title)}
+      </div>
+      <div style="font-size:11px;font-weight:700;color:#475569;">③ 纯语音静默播报 (仅首遍附带)</div>
+      <div style="background:#fff;border-radius:12px;padding:9px 11px;font-size:11.5px;color:${
+        pl.voice_tail_enabled ? "#047857" : "#94a3b8"
+      };">
+        ${
+          pl.voice_tail_enabled && pl.voice_tail_text
+            ? `🔊 “…步行约42米。${escapeHtml(pl.voice_tail_text)}”（第2遍复诵自动省略）`
+            : "🔇 当前未开启纯语音尾缀，保持零打扰纯车位播报"
+        }
+      </div>`;
+  }
+}
+
+function openAdCampaignModal(campaign = null) {
+  const modal = document.getElementById("adCampaignModal");
+  if (!modal) return;
+  document.getElementById("adModalFeedback").textContent = "";
+  document.getElementById("adCampaignModalTitle").textContent = campaign
+    ? `编辑推广计划 · ${campaign.title}`
+    : "新建推广运营计划";
+  if (campaign) {
+    populateAdForm(campaign);
+  } else {
+    const presets = state.ads.dashboard?.industry_presets || [];
+    populateAdForm(presets[0] ? { ...presets[0], campaign_id: "" } : null);
+  }
+  modal.classList.remove("hidden");
+}
+
+function closeAdCampaignModal() {
+  document.getElementById("adCampaignModal")?.classList.add("hidden");
+}
+
+async function seedDemoAdCampaigns() {
+  try {
+    const res = await api("/api/ads/seed-demos", { method: "POST", body: JSON.stringify({}) });
+    if (res?.dashboard) {
+      state.ads.dashboard = res.dashboard;
+      renderAdsDashboard(res.dashboard);
+    } else {
+      await refreshAdsDashboard();
+    }
+    showAppleToast("✨ 已载入 4 个典型车主生活与满位导引样板计划");
+  } catch (err) {
+    showAppleToast(`载入样板失败：${err.message}`, "error");
+  }
+}
+
+function bindAdsOperationsConsole() {
+  document.getElementById("btnAdsCreateCampaign")?.addEventListener("click", () => openAdCampaignModal(null));
+  document.getElementById("btnAdsSeedDemos")?.addEventListener("click", seedDemoAdCampaigns);
+  document.getElementById("btnAdsExportCsv")?.addEventListener("click", () => {
+    const days = Number(document.getElementById("adsStatsDaysSelect")?.value || 30);
+    const wsQ = state.currentWorkspaceId && state.currentWorkspaceId !== "default" ? `&ws=${encodeURIComponent(state.currentWorkspaceId)}` : "";
+    window.open(`/api/ads/export.csv?days=${days}${wsQ}`, "_blank");
+  });
+
+  document.getElementById("adsStatsDaysSelect")?.addEventListener("change", refreshAdsDashboard);
+
+  const pushGlobalSettings = async () => {
+    try {
+      await api("/api/ads/settings", {
+        method: "POST",
+        body: JSON.stringify({
+          ads_enabled: Boolean(document.getElementById("adsMasterSwitch")?.checked),
+          voice_tail_master_enabled: Boolean(document.getElementById("adsVoiceTailSwitch")?.checked),
+          default_quiet_hours: document.getElementById("adsQuietHoursInput")?.value || "22:00-07:30",
+        }),
+      });
+      showAppleToast("已同步更新全站广告运营与免打扰策略");
+    } catch (err) {
+      showAppleToast(`保存设置失败：${err.message}`, "error");
+    }
+  };
+  document.getElementById("adsMasterSwitch")?.addEventListener("change", pushGlobalSettings);
+  document.getElementById("adsVoiceTailSwitch")?.addEventListener("change", pushGlobalSettings);
+  document.getElementById("adsQuietHoursInput")?.addEventListener("change", pushGlobalSettings);
+
+  document.querySelectorAll("[data-ads-pane]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const pane = btn.dataset.adsPane;
+      state.ads.activePane = pane;
+      document.querySelectorAll("[data-ads-pane]").forEach((b) => b.classList.toggle("active", b === btn));
+      document.getElementById("adsPaneCampaigns")?.classList.toggle("hidden", pane !== "campaigns");
+      document.getElementById("adsPaneCoupons")?.classList.toggle("hidden", pane !== "coupons");
+      document.getElementById("adsPaneLeads")?.classList.toggle("hidden", pane !== "leads");
+    });
+  });
+
+  const doRedeemCode = async (rawCode) => {
+    const code = String(rawCode || "").trim().toUpperCase();
+    if (!code) return;
+    try {
+      const res = await api("/api/ads/coupons/redeem", {
+        method: "POST",
+        body: JSON.stringify({ coupon_code: code }),
+      });
+      showAppleToast(res.message || `核销完成：${code}`, res.already_redeemed ? "info" : "success");
+      const inp = document.getElementById("adsQuickRedeemInput");
+      if (inp) inp.value = "";
+      await refreshAdsDashboard();
+    } catch (err) {
+      showAppleToast(`核销失败：${err.message}`, "error");
+    }
+  };
+
+  document.getElementById("btnAdsQuickRedeem")?.addEventListener("click", () => {
+    doRedeemCode(document.getElementById("adsQuickRedeemInput")?.value);
+  });
+  document.getElementById("adsCouponsTableBody")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-redeem-code]");
+    if (btn) doRedeemCode(btn.dataset.redeemCode);
+  });
+
+  document.getElementById("adsCampaignsGrid")?.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("[data-ad-act]");
+    if (!btn) return;
+    const act = btn.dataset.adAct;
+    const cid = btn.dataset.cid;
+    const camp = (state.ads.dashboard?.campaigns || []).find((c) => c.campaign_id === cid);
+    if (!camp) return;
+
+    if (act === "edit") {
+      openAdCampaignModal(camp);
+    } else if (act === "toggle") {
+      try {
+        const res = await api("/api/ads/campaigns/toggle", {
+          method: "POST",
+          body: JSON.stringify({ campaign_id: cid }),
+        });
+        if (res?.dashboard) {
+          state.ads.dashboard = res.dashboard;
+          renderAdsDashboard(res.dashboard);
+        }
+        showAppleToast(res.campaign?.enabled ? "已恢复投放" : "已暂停投放");
+      } catch (err) {
+        showAppleToast(err.message, "error");
+      }
+    } else if (act === "copy-partner") {
+      const wsQ = state.currentWorkspaceId && state.currentWorkspaceId !== "default" ? `&ws=${encodeURIComponent(state.currentWorkspaceId)}` : "";
+      const url = `${window.location.origin}/partner-report?campaign_id=${encodeURIComponent(cid)}&token=${encodeURIComponent(camp.partner_token || "")}${wsQ}`;
+      try {
+        await navigator.clipboard.writeText(url);
+        showAppleToast("🔗 已复制合作商专属透明对账与核销链接");
+      } catch (_e) {
+        window.prompt("复制以下合作商实时对账与输码核销链接：", url);
+      }
+    } else if (act === "delete") {
+      if (!window.confirm(`确定删除推广计划「${camp.title}」吗？`)) return;
+      try {
+        const res = await api("/api/ads/campaigns/delete", {
+          method: "POST",
+          body: JSON.stringify({ campaign_id: cid }),
+        });
+        if (res?.dashboard) {
+          state.ads.dashboard = res.dashboard;
+          renderAdsDashboard(res.dashboard);
+        }
+        showAppleToast("已删除推广计划");
+      } catch (err) {
+        showAppleToast(err.message, "error");
+      }
+    }
+  });
+
+  // Modal controls
+  document.getElementById("btnCloseAdCampaignModal")?.addEventListener("click", closeAdCampaignModal);
+  document.getElementById("btnCancelAdCampaignModal")?.addEventListener("click", closeAdCampaignModal);
+  document.getElementById("adCampaignModalBackdrop")?.addEventListener("click", closeAdCampaignModal);
+
+  document.getElementById("adIndustryPresetChips")?.addEventListener("click", (ev) => {
+    const chip = ev.target.closest("[data-ad-preset]");
+    if (!chip) return;
+    const preset = (state.ads.dashboard?.industry_presets || []).find((p) => p.preset_id === chip.dataset.adPreset);
+    if (preset) {
+      const keepId = document.getElementById("adFormCampaignId")?.value || "";
+      populateAdForm({ ...preset, campaign_id: keepId });
+      showAppleToast(`已填充「${preset.name}」参数模板`);
+    }
+  });
+
+  document.querySelectorAll(".ad-prev-tab").forEach((t) => {
+    t.addEventListener("click", () => {
+      state.ads.previewMode = t.dataset.prevMode;
+      document.querySelectorAll(".ad-prev-tab").forEach((b) => b.classList.toggle("active", b === t));
+      renderAdStudioLivePreview();
+    });
+  });
+
+  document.getElementById("adCampaignModal")?.addEventListener("input", renderAdStudioLivePreview);
+  document.getElementById("adCampaignModal")?.addEventListener("change", renderAdStudioLivePreview);
+
+  document.getElementById("adFormImageFile")?.addEventListener("change", (ev) => {
+    const file = ev.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      state.ads.draftImageDataUrl = String(reader.result || "");
+      renderAdStudioLivePreview();
+    };
+    reader.readAsDataURL(file);
+  });
+
+  document.getElementById("btnAdClearImage")?.addEventListener("click", () => {
+    state.ads.draftImageDataUrl = "";
+    const f = document.getElementById("adFormImageFile");
+    if (f) f.value = "";
+    renderAdStudioLivePreview();
+  });
+
+  document.getElementById("btnSaveAdCampaignModal")?.addEventListener("click", async () => {
+    const fb = document.getElementById("adModalFeedback");
+    try {
+      const payload = collectAdFormDraft();
+      const res = await api("/api/ads/campaigns", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (res?.dashboard) {
+        state.ads.dashboard = res.dashboard;
+        renderAdsDashboard(res.dashboard);
+      } else {
+        await refreshAdsDashboard();
+      }
+      closeAdCampaignModal();
+      showAppleToast(`✅ 已保存并发布「${payload.title}」`);
+    } catch (err) {
+      if (fb) fb.textContent = `❌ ${err.message}`;
+    }
+  });
+}
+
 

@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from app.ad_operations import (
+    AD_BILLING_MODELS,
+    AD_CATEGORIES,
+    AD_INDUSTRY_PRESETS,
+    AdOperationsManager,
+    detect_client_platform,
+)
 from app.auto_calibrator import ReferenceAutoCalibrator
 from app.camera_ingestor import (
     CAMERA_PROTOCOL_SPECS,
@@ -234,6 +241,13 @@ def _build_mobile_overview_payload(
     total_ev_free = sum(int(z.get("ev_free") or 0) for z in zones_raw)
     total_rentable = sum(int(z.get("rentable_count") or 0) for z in zones_raw)
     ws_pub = ctx.get_public_workspace_profile(include_templates=False)
+    ads_payload = ctx.ads.select_for_mobile_18790(
+        unit_id=resolved_uid,
+        vehicle_type=vtype,
+        tag_filter=str(rec_raw.get("tag_filter") or ""),
+        entry_gate_id=str(entry_gate_id or ""),
+        total_effective_free=total_free,
+    )
 
     return {
         "workspace_id": ctx.workspace_id,
@@ -256,6 +270,7 @@ def _build_mobile_overview_payload(
         "active_locks": sanitized_locks,
         "site_map": smap_meta,
         "recommendation": sanitized_rec,
+        "ads": ads_payload,
         "ts": time.time(),
     }
 
@@ -324,6 +339,7 @@ class ParkingAppContext:
             vision_pipeline=self.vision,
             event_callback=self.push_event,
         )
+        self.ads = AdOperationsManager(self.db, workspace_id_getter=lambda: self.workspace_id)
         self.voice_gateway = VoiceGatewayService(self)
 
     def ensure_workspace_registry(self) -> WorkspaceRegistry:
@@ -516,6 +532,185 @@ class ParkingAppContext:
 app_ctx = ParkingAppContext()
 app_ctx.ensure_workspace_registry()
 
+MAX_PUBLIC_AD_BODY_BYTES = 16 * 1024
+
+
+def extract_handler_client_ip(handler: BaseHTTPRequestHandler) -> str:
+    for hdr in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
+        val = str(handler.headers.get(hdr) or "").strip()
+        if val:
+            return val.split(",")[0].strip()
+    return str(handler.client_address[0] or "127.0.0.1")
+
+
+def send_handler_html(handler: BaseHTTPRequestHandler, html_text: str, status: int = 200) -> None:
+    body = html_text.encode("utf-8")
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def send_handler_redirect(handler: BaseHTTPRequestHandler, target_url: str) -> None:
+    try:
+        handler.send_response(HTTPStatus.FOUND)
+        handler.send_header("Location", target_url)
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        handler.send_header("Content-Length", "0")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def try_handle_public_ad_get(
+    handler: BaseHTTPRequestHandler,
+    ctx: ParkingAppContext,
+    path: str,
+    qs: Dict[str, list[str]],
+    default_surface: str = "18790_mobile",
+) -> bool:
+    m_redir = re.match(r"^/r/([A-Za-z0-9_-]{2,48})$", path)
+    if m_redir:
+        cid = m_redir.group(1)
+        ua = str(handler.headers.get("User-Agent") or "")
+        plat = (qs.get("platform") or [""])[0].strip() or detect_client_platform(ua)
+        surf = (qs.get("surface") or [""])[0].strip() or default_surface
+        ext_uid = (qs.get("uid") or qs.get("fp") or [""])[0].strip()
+        target = ctx.ads.resolve_redirect_url(
+            campaign_id=cid,
+            surface=surf,
+            platform=plat,
+            client_ip=extract_handler_client_ip(handler),
+            user_agent=ua,
+            external_uid=ext_uid,
+        )
+        if not target:
+            handler._send_json({"ok": False, "error": "推广活动不存在或暂未配置跳转链接"}, 404)
+            return True
+        send_handler_redirect(handler, target)
+        return True
+
+    if path == "/partner-report":
+        cid = (qs.get("campaign_id") or qs.get("cid") or [""])[0].strip()
+        ptok = (qs.get("partner_token") or qs.get("pt") or qs.get("token") or [""])[0].strip()
+        days_raw = (qs.get("days") or ["30"])[0].strip()
+        days = int(days_raw) if days_raw.isdigit() else 30
+        try:
+            html_doc = ctx.ads.render_partner_report_html(
+                community_name=ctx.community_name(),
+                campaign_id=cid,
+                provided_token=ptok,
+                days=days,
+            )
+            send_handler_html(handler, html_doc, 200)
+        except (LookupError, PermissionError):
+            send_handler_html(
+                handler,
+                "<!doctype html><meta charset='utf-8'><title>对账凭证无效</title>"
+                "<body style='font-family:sans-serif;padding:32px;color:#334155'>"
+                "<h3>对账链接已失效或口令不匹配</h3><p>请联系社区运营管理员重新获取合作商专属对账链接。</p></body>",
+                403,
+            )
+        return True
+
+    if path == "/api/public/ad-partner-report":
+        cid = (qs.get("campaign_id") or qs.get("cid") or [""])[0].strip()
+        ptok = (qs.get("partner_token") or qs.get("pt") or qs.get("token") or [""])[0].strip()
+        days_raw = (qs.get("days") or ["30"])[0].strip()
+        days = int(days_raw) if days_raw.isdigit() else 30
+        try:
+            rep = ctx.ads.get_partner_report_payload(cid, ptok, days=days)
+            handler._send_json(rep)
+        except (LookupError, PermissionError) as exc:
+            handler._send_json({"ok": False, "error": str(exc)}, 403)
+        return True
+
+    return False
+
+
+def try_handle_public_ad_post(
+    handler: BaseHTTPRequestHandler,
+    ctx: ParkingAppContext,
+    path: str,
+    qs: Optional[Dict[str, list[str]]] = None,
+    default_surface: str = "18790_mobile",
+) -> bool:
+    if path not in ("/api/public/ad-event", "/api/public/ad-partner-redeem"):
+        return False
+
+    raw_len = handler.headers.get("Content-Length")
+    length = int(raw_len) if (raw_len and raw_len.strip().isdigit()) else 0
+    if length <= 0 or length > MAX_PUBLIC_AD_BODY_BYTES:
+        handler._send_json({"ok": False, "error": "请求体大小无效"}, 400)
+        return True
+    raw_bytes = handler.rfile.read(length)
+    try:
+        body = json.loads(raw_bytes.decode("utf-8"))
+        if not isinstance(body, dict):
+            raise ValueError("JSON object expected")
+    except Exception:
+        handler._send_json({"ok": False, "error": "无效 JSON 格式"}, 400)
+        return True
+
+    if path == "/api/public/ad-event":
+        ua = str(handler.headers.get("User-Agent") or "")
+        plat = str(body.get("platform") or "").strip() or detect_client_platform(ua)
+        surf = str(body.get("surface") or "").strip() or default_surface
+        ext_uid = str(body.get("visitor_fp") or body.get("uid") or "").strip()
+        lead_payload = body.get("lead") if isinstance(body.get("lead"), dict) else {
+            "phone": body.get("contact_phone") or body.get("phone") or "",
+            "name": body.get("contact_name") or body.get("name") or "",
+            "unit_id": body.get("unit_id") or "",
+            "vehicle_type": body.get("vehicle_type") or "",
+            "remark": body.get("remark") or "",
+        }
+        try:
+            res = ctx.ads.record_event(
+                campaign_id=str(body.get("campaign_id") or ""),
+                event_type=str(body.get("event_type") or body.get("event") or "impression"),
+                platform=plat,
+                surface=surf,
+                client_ip=extract_handler_client_ip(handler),
+                user_agent=ua,
+                external_uid=ext_uid,
+                unit_id=str(body.get("unit_id") or ""),
+                vehicle_type=str(body.get("vehicle_type") or "sedan"),
+                lead_payload=lead_payload,
+            )
+            handler._send_json(res, 200)
+        except ValueError as ve:
+            handler._send_json({"ok": False, "error": str(ve)}, 400)
+        return True
+
+    # /api/public/ad-partner-redeem (verify campaign's partner_token before redeeming!)
+    qs_map = qs or {}
+    cid = str(body.get("campaign_id") or (qs_map.get("campaign_id") or [""])[0]).strip()
+    ptok = str(
+        body.get("partner_token")
+        or body.get("token")
+        or (qs_map.get("partner_token") or qs_map.get("token") or [""])[0]
+    ).strip()
+    try:
+        ctx.ads.get_partner_report_payload(cid, ptok, days=1)
+        res = ctx.ads.redeem_coupon(
+            coupon_code=str(body.get("coupon_code") or ""),
+            note=str(body.get("note") or "商户对账页核销"),
+            partner_campaign_id=cid,
+        )
+        handler._send_json(res, 200)
+    except (LookupError, PermissionError) as exc:
+        handler._send_json({"ok": False, "error": str(exc)}, 403)
+    except ValueError as ve:
+        handler._send_json({"ok": False, "error": str(ve)}, 400)
+    return True
+
 
 def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
     class ParkingRequestHandler(BaseHTTPRequestHandler):
@@ -635,6 +830,9 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     self._send_json({"ok": True, "workspace_id": ctx.workspace_id, "ts": time.time()})
                     return
 
+                if try_handle_public_ad_get(self, ctx, path, qs, default_surface="8790_admin"):
+                    return
+
                 if path == "/api/workspaces":
                     reg = root_ctx.ensure_workspace_registry()
                     scoped_ws = (qs.get("scoped_ws") or [""])[0].strip() or None
@@ -673,6 +871,30 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
 
                 if path == "/api/spot-tags/catalog":
                     self._send_json({"ok": True, "catalog": SPOT_TAG_CATALOG})
+                    return
+
+                if path == "/api/ads/dashboard":
+                    days_raw = (qs.get("days") or ["30"])[0].strip()
+                    days = int(days_raw) if days_raw.isdigit() else 30
+                    self._send_json(ctx.ads.build_admin_overview(days=days))
+                    return
+
+                if path == "/api/ads/export.csv":
+                    days_raw = (qs.get("days") or ["30"])[0].strip()
+                    days = int(days_raw) if days_raw.isdigit() else 30
+                    cid_csv = (qs.get("campaign_id") or [""])[0].strip()
+                    csv_bytes = ctx.ads.export_reconciliation_csv(campaign_id=cid_csv, days=days).encode("utf-8")
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/csv; charset=utf-8")
+                    self.send_header(
+                        "Content-Disposition",
+                        f'attachment; filename="ad_reconciliation_{ctx.workspace_id}_{days}d.csv"',
+                    )
+                    self.send_header("Content-Length", str(len(csv_bytes)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(csv_bytes)
                     return
 
                 if path == "/api/overview":
@@ -2145,6 +2367,98 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     self._send_json(res, 200 if res.get("ok") else 400)
                     return
 
+                if path == "/api/ads/settings":
+                    body = self._read_json()
+                    saved_settings = ctx.ads.update_settings(body)
+                    self._send_json({"ok": True, "settings": saved_settings})
+                    return
+
+                if path == "/api/ads/campaigns":
+                    body = self._read_json()
+                    saved_camp = ctx.ads.save_campaign(body)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "campaign": saved_camp,
+                            "dashboard": ctx.ads.build_admin_overview(),
+                        }
+                    )
+                    return
+
+                if path == "/api/ads/campaigns/toggle":
+                    body = self._read_json()
+                    toggled = ctx.ads.toggle_campaign(
+                        str(body.get("campaign_id") or ""),
+                        enabled=body.get("enabled") if "enabled" in body else None,
+                    )
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "campaign": toggled,
+                            "dashboard": ctx.ads.build_admin_overview(),
+                        }
+                    )
+                    return
+
+                if path == "/api/ads/campaigns/delete":
+                    body = self._read_json()
+                    deleted = ctx.ads.delete_campaign(str(body.get("campaign_id") or ""))
+                    self._send_json(
+                        {
+                            "ok": deleted,
+                            "dashboard": ctx.ads.build_admin_overview(),
+                        },
+                        200 if deleted else 404,
+                    )
+                    return
+
+                if path == "/api/ads/campaigns/rotate-token":
+                    body = self._read_json()
+                    new_tok = ctx.ads.rotate_partner_token(str(body.get("campaign_id") or ""))
+                    if not new_tok:
+                        self._send_json({"ok": False, "error": "推广活动不存在"}, 404)
+                        return
+                    self._send_json({"ok": True, "partner_token": new_tok})
+                    return
+
+                if path == "/api/ads/coupons/redeem":
+                    body = self._read_json()
+                    res = ctx.ads.redeem_coupon(
+                        coupon_code=str(body.get("coupon_code") or ""),
+                        note=str(body.get("note") or "管理后台核销"),
+                        partner_campaign_id=str(body.get("campaign_id") or ""),
+                    )
+                    self._send_json(res, 200)
+                    return
+
+                if path == "/api/ads/seed-demos":
+                    body = self._read_json() if self.headers.get("Content-Length") else {}
+                    preset_ids = body.get("preset_ids") or [
+                        "wash_cps",
+                        "ev_charge_cpc",
+                        "full_lot_cpt",
+                        "fresh_evening_cpm",
+                    ]
+                    created_ids = []
+                    for pid in preset_ids:
+                        preset = next((p for p in AD_INDUSTRY_PRESETS if p["preset_id"] == pid), None)
+                        if preset:
+                            draft = {k: v for k, v in preset.items() if k not in ("preset_id", "name")}
+                            saved = ctx.ads.save_campaign(draft)
+                            created_ids.append(saved["campaign_id"])
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "created_ids": created_ids,
+                            "dashboard": ctx.ads.build_admin_overview(),
+                        }
+                    )
+                    return
+
+                if path in ("/api/public/ad-event", "/api/public/ad-partner-redeem"):
+                    try_handle_public_ad_post(self, ctx, path, qs=qs, default_surface="8790_admin")
+                    return
+
                 if path == "/api/reset":
                     ctx.db.reset_seed_data()
                     ctx.vision.clear_frame_cache()
@@ -2280,6 +2594,12 @@ def make_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     res = ctx.db.delete_camera(cam_id, spot_action=spot_action)
                     ctx.vision.clear_frame_cache(cam_id)
                     self._send_json({"ok": True, **res})
+                    return
+                m_ad_del = re.match(r"^/api/ads/campaigns/([^/]+)$", path)
+                if m_ad_del:
+                    cid_del = unquote(m_ad_del.group(1))
+                    deleted = ctx.ads.delete_campaign(cid_del)
+                    self._send_json({"ok": deleted}, 200 if deleted else 404)
                     return
                 self._send_json({"error": "Not found"}, 404)
             except ValueError as ve:
@@ -2432,6 +2752,12 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
             self.end_headers()
 
         def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            path, req_ws_id = extract_workspace_from_request(parsed.path, qs, self.headers)
+            ctx = root_ctx.resolve_workspace_context(req_ws_id)
+            if try_handle_public_ad_post(self, ctx, path, qs=qs, default_surface="18790_mobile"):
+                return
             self._reject_readonly()
 
         def do_PUT(self) -> None:
@@ -2467,6 +2793,9 @@ def make_mobile_http_handler(root_ctx: ParkingAppContext = app_ctx):
                     self._send_json(
                         {"ok": True, "role": "mobile_viewer", "workspace_id": ctx.workspace_id, "ts": time.time()}
                     )
+                    return
+
+                if try_handle_public_ad_get(self, ctx, path, qs, default_surface="18790_mobile"):
                     return
 
                 if path == "/api/mobile/workspace-auth":

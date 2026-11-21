@@ -137,6 +137,9 @@
           <span class="m-voice-state" id="voiceStatusBadge">自动播报已开启</span>
         </div>
       </div>
+
+      <!-- 社区车主福利 / 满位导引轻量展位（无在投计划时彻底隐藏，零空间占用） -->
+      <div id="mobileAdSlot" class="m-ad-slot" hidden role="region" aria-label="社区车主服务推荐"></div>
     </section>
 
     <!-- 实时态势平面图画布（支持单指平移、双指捏合缩放、点楼栋切目的地） -->
@@ -192,6 +195,22 @@
         </div>
         <div class="m-ss-tags" id="mobSheetTags"></div>
         <div class="m-ss-details" id="mobSheetDetails"></div>
+      </div>
+
+      <!-- 社区合作商户领券 / 预约 / 导航 Apple Wallet 风格浮层 -->
+      <div class="m-spot-sheet m-ad-sheet" id="mobileAdSheet" hidden role="dialog" aria-label="车主专享权益详情">
+        <div class="m-ss-head">
+          <div class="m-ss-titles">
+            <span class="m-ss-zone" id="mobAdSheetAdv">社区合作商户</span>
+            <div class="m-ss-title-row">
+              <strong id="mobAdSheetTitle">车主专享礼遇</strong>
+              <span class="m-ss-status" id="mobAdSheetOffer" hidden>特惠</span>
+            </div>
+          </div>
+          <button type="button" id="btnCloseMobAdSheet" class="m-ss-close" aria-label="关闭权益详情">✕</button>
+        </div>
+        <p class="m-ad-sheet-sub" id="mobAdSheetSub"></p>
+        <div id="mobAdSheetBody" class="m-ad-sheet-body"></div>
       </div>
 
       <!-- 底部悬浮胶囊图例 -->
